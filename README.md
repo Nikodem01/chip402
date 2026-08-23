@@ -25,7 +25,7 @@ Needs Node.js 22+ and `npm`. The Hedera SDK is installed **outside** the plugin 
 
 ```bash
 # from this checkout (until the GitHub repo is published)
-omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes
+omarchy plugin add /home/niko/Work/chip402 --enable --yes
 
 # one-time runtime + operator key
 ~/.config/omarchy/plugins/chip402/bin/chip402 setup --watch

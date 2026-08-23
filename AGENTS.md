@@ -1,7 +1,7 @@
 # Agent notes — chip402
 
 Omarchy plugin: spend-capped Hedera operator for local agents paying x402 invoices.
-Repo: `/home/niko/Work/omarchy-allowance`. Plugin id `chip402`.
+Repo: `/home/niko/Work/chip402`. Plugin id `chip402`.
 
 Do **not** open a GitHub repo, marketplace issue, or PR unless Nikodem explicitly asks.
 
@@ -82,4 +82,4 @@ node --test daemon/lib/*.test.mjs
 ./bin/chip402 fetch http://127.0.0.1:4403/secret
 ```
 
-Plugin is already installed from this checkout (`omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes`). After QML edits, the shell hot-reloads; if not: `omarchy-shell shell rescanPlugins`.
+Plugin is already installed from this checkout (`omarchy plugin add /home/niko/Work/chip402 --enable --yes`). After QML edits, the shell hot-reloads; if not: `omarchy-shell shell rescanPlugins`.
