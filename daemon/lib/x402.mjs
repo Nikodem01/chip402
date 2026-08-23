@@ -49,7 +49,7 @@ export function decodePaymentRequired(response, bodyText) {
 export function buildPaymentPayload({ requirement, resource, transaction }) {
   return {
     x402Version: 2,
-    resource: resource || { url: "", description: "Allowance payment", mimeType: "application/json" },
+    resource: resource || { url: "", description: "chip402 payment", mimeType: "application/json" },
     accepted: requirement,
     payload: { transaction },
   };
@@ -186,7 +186,7 @@ export async function payAndFetch({
 
   const resource = paymentRequired.resource || {
     url,
-    description: "Allowance payment",
+    description: "chip402 payment",
     mimeType: "application/json",
   };
   const paymentPayload = buildPaymentPayload({

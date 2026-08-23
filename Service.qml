@@ -31,7 +31,7 @@ Item {
   readonly property string pluginDir: pluginPath()
 
   property FileView stateFile: FileView {
-    path: Quickshell.env("HOME") + "/.local/state/omarchy-allowance/state.json"
+    path: Quickshell.env("HOME") + "/.local/state/chip402/state.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
@@ -115,7 +115,7 @@ Item {
 
   function pause() {
     paused = true
-    post("/pause", { paused: true }, "Allowance paused")
+    post("/pause", { paused: true }, "chip402 paused")
   }
 
   function resume() {
@@ -165,7 +165,7 @@ Item {
     actionStatus = "Writing operator key…"
     actionStatusTimer.restart()
     setupProcess.running = false
-    setupProcess.command = ["bash", "-lc", "exec node " + quote(pluginDir + "/bin/allowance") + " setup"]
+    setupProcess.command = ["bash", "-lc", "exec node " + quote(pluginDir + "/bin/chip402") + " setup"]
     setupProcess.running = true
   }
 
@@ -195,7 +195,7 @@ Item {
   Process {
     id: daemon
     running: true
-    command: ["bash", "-lc", "exec node " + root.quote(root.pluginDir + "/daemon/allowanced.mjs")]
+    command: ["bash", "-lc", "exec node " + root.quote(root.pluginDir + "/daemon/chip402d.mjs")]
     stdout: StdioCollector { waitForEnd: false }
     stderr: StdioCollector { waitForEnd: false }
     onRunningChanged: if (running) root.daemonUp = true

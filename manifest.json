@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "id": "nikodem.allowance",
-  "name": "Allowance",
+  "id": "nikodem.chip402",
+  "name": "chip402",
   "version": "1.0.0",
   "author": "Nikodem Dominiak",
   "license": "MIT",
-  "description": "Spend-capped Hedera wallet for local AI agents paying x402 invoices, with a bar kill switch.",
-  "homepage": "https://github.com/Nikodem01/omarchy-allowance",
+  "description": "Pocket-money chips for local AI agents paying x402 invoices, with a bar kill switch.",
+  "homepage": "https://github.com/Nikodem01/chip402",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Allowance",
+    "displayName": "chip402",
     "description": "Balance, today's spend, live ledger, and a kill switch for agent payments.",
     "category": "System",
     "allowMultiple": false,

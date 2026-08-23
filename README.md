@@ -1,12 +1,12 @@
-# Allowance
+# chip402
 
 A spend-capped wallet for local AI agents, living in the Omarchy bar.
 
 Agents can pay [x402](https://x402.org) invoices on Hedera testnet. You set a daily cap and a per-request cap. One switch on the bar pauses every payment. HashPack (or the Hedera faucet) tops the account up; the plugin only holds a local **operator** key that cannot spend past the cap.
 
-This is not a general-purpose wallet. It is an allowance.
+This is not a general-purpose wallet. It is pocket-money chips for agents.
 
-![Allowance panel](preview.png)
+![chip402 panel](preview.png)
 
 ![Kill switch](assets/demo.gif)
 
@@ -28,7 +28,7 @@ Needs Node.js 22+ and `npm`. The Hedera SDK is installed **outside** the plugin 
 omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes
 
 # one-time runtime + operator key
-~/.config/omarchy/plugins/nikodem.allowance/bin/allowance setup --watch
+~/.config/omarchy/plugins/nikodem.chip402/bin/chip402 setup --watch
 ```
 
 `setup` prints an EVM address. Fund it with testnet HBAR:
@@ -36,13 +36,13 @@ omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes
 1. [Hedera testnet faucet](https://portal.hedera.com/faucet), or
 2. HashPack, send testnet HBAR to that address
 
-Then add the widget if the installer did not: `omarchy plugin enable nikodem.allowance`.
+Then add the widget if the installer did not: `omarchy plugin enable nikodem.chip402`.
 
 Optional PATH helper:
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/.config/omarchy/plugins/nikodem.allowance/bin/allowance ~/.local/bin/allowance
+ln -sf ~/.config/omarchy/plugins/nikodem.chip402/bin/chip402 ~/.local/bin/chip402
 ```
 
 ## Pay something
@@ -50,13 +50,13 @@ ln -sf ~/.config/omarchy/plugins/nikodem.allowance/bin/allowance ~/.local/bin/al
 In one terminal:
 
 ```bash
-allowance demo          # x402 seller on :4403, 1000 tinybars per request
+chip402 demo          # x402 seller on :4403, 1000 tinybars per request
 ```
 
 In another:
 
 ```bash
-allowance fetch http://127.0.0.1:4403/secret
+chip402 fetch http://127.0.0.1:4403/secret
 ```
 
 The panel ledger should show the settlement. Click a row to open it on HashScan.
@@ -78,9 +78,9 @@ Right-click the bar icon to pause. `p` in the panel does the same.
 ## Remove
 
 ```bash
-omarchy plugin remove nikodem.allowance --yes
+omarchy plugin remove nikodem.chip402 --yes
 # optional: wipe keys, config, and the SDK copy
-rm -rf ~/.config/omarchy-allowance ~/.local/state/omarchy-allowance ~/.local/bin/allowance
+rm -rf ~/.config/chip402 ~/.local/state/chip402 ~/.local/bin/chip402
 ```
 
 Removal does not write to any other Omarchy config unless you previously enabled the widget — `plugin remove` takes the widget off the bar.
@@ -88,13 +88,13 @@ Removal does not write to any other Omarchy config unless you previously enabled
 ## How it works
 
 1. An agent requests a URL.
-2. If the server returns HTTP 402, Allowance reads `PAYMENT-REQUIRED`, picks `exact` on `hedera:testnet`, and checks the kill switch, host allowlist, per-request cap, and daily cap.
+2. If the server returns HTTP 402, chip402 reads `PAYMENT-REQUIRED`, picks `exact` on `hedera:testnet`, and checks the kill switch, host allowlist, per-request cap, and daily cap.
 3. It builds a `TransferTransaction` whose `transactionId.accountId` is the x402 facilitator fee-payer (`0.0.9185802`), signs with the local operator key, and retries with `PAYMENT-SIGNATURE`.
 4. The facilitator co-signs and submits. Network fees are not paid by the operator.
-5. The panel watches `~/.local/state/omarchy-allowance/state.json` and appends a ledger row.
+5. The panel watches `~/.local/state/chip402/state.json` and appends a ledger row.
 
-Operator key: `~/.config/omarchy-allowance/key` (ECDSA, DER, mode 600).
-Config: `~/.config/omarchy-allowance/config.json`.
+Operator key: `~/.config/chip402/key` (ECDSA, DER, mode 600).
+Config: `~/.config/chip402/config.json`.
 
 ## Defaults
 
@@ -107,13 +107,13 @@ Config: `~/.config/omarchy-allowance/config.json`.
 | Facilitator | `https://x402.org/facilitator` |
 
 ```bash
-allowance cap daily 0.5
-allowance cap request 0.01
-allowance allow api.example.com
-allowance pause
-allowance resume
+chip402 cap daily 0.5
+chip402 cap request 0.01
+chip402 allow api.example.com
+chip402 pause
+chip402 resume
 ```
 
 ## License
 
-MIT. External dependency: [`@hashgraph/sdk`](https://www.npmjs.com/package/@hashgraph/sdk) (Apache-2.0), installed into `~/.local/state/omarchy-allowance/runtime` and never vendored inside the plugin tree.
+MIT. External dependency: [`@hashgraph/sdk`](https://www.npmjs.com/package/@hashgraph/sdk) (Apache-2.0), installed into `~/.local/state/chip402/runtime` and never vendored inside the plugin tree.

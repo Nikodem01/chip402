@@ -42,7 +42,7 @@ export function pickHederaRequirement(paymentRequired) {
 
 export function evaluateSpend({ config, state, url, requirement }) {
   if (config.paused === true || state.paused === true) {
-    return deny("paused", "Allowance is paused");
+    return deny("paused", "chip402 is paused");
   }
   if (!config.accountId) {
     return deny("unconfigured", "No Hedera account yet — fund the operator key first");

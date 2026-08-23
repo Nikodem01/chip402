@@ -1,7 +1,7 @@
-# Agent notes — Allowance
+# Agent notes — chip402
 
 Omarchy plugin: spend-capped Hedera operator for local agents paying x402 invoices.
-Repo: `/home/niko/Work/omarchy-allowance`. Plugin id `nikodem.allowance`.
+Repo: `/home/niko/Work/omarchy-allowance`. Plugin id `nikodem.chip402`.
 
 Do **not** open a GitHub repo, marketplace issue, or PR unless Nikodem explicitly asks.
 
@@ -50,24 +50,24 @@ Do **not** use this MCP to sign, submit, or mutate network state. It only search
 - Faucet / HashPack send HBAR to that `0x…` alias → Hedera auto-creates `0.0.n`. Daemon polls mirror node and fills `accountId`.
 - x402 `exact` on `hedera:testnet` wants `0.0.n` in `payTo` / `extra.feePayer`, not the `0x` alias. Facilitator fee-payer is `0.0.9185802`.
 - HBAR is always singular uppercase; tinybars always plural lowercase. Networks: `mainnet` / `testnet` / `previewnet` lowercase.
-- JS SDK in this repo is `@hashgraph/sdk` in `~/.local/state/omarchy-allowance/runtime` (outside the plugin tree; no symlinks). Newer namespace is `@hiero-ledger/sdk` — check docs before changing imports.
+- JS SDK in this repo is `@hashgraph/sdk` in `~/.local/state/chip402/runtime` (outside the plugin tree; no symlinks). Newer namespace is `@hiero-ledger/sdk` — check docs before changing imports.
 
 ## Layout
 
 ```
-manifest.json          bar-widget, id nikodem.allowance
-Panel.qml Service.qml Model.js AllowanceIcon.qml
-daemon/allowanced.mjs  127.0.0.1:4402
+manifest.json          bar-widget, id nikodem.chip402
+Panel.qml Service.qml Model.js ChipIcon.qml
+daemon/chip402d.mjs  127.0.0.1:4402
 daemon/lib/{hedera,x402,policy,state,sdk,paths,log}.mjs
 demo/seller.mjs        127.0.0.1:4403
-bin/allowance          CLI
+bin/chip402          CLI
 ```
 
 Secrets live **outside** the repo:
 
-- `~/.config/omarchy-allowance/key` and `merchant-key` (mode 600; daemon refuses looser)
-- `~/.config/omarchy-allowance/config.json`
-- `~/.local/state/omarchy-allowance/state.json` (QML FileView)
+- `~/.config/chip402/key` and `merchant-key` (mode 600; daemon refuses looser)
+- `~/.config/chip402/config.json`
+- `~/.local/state/chip402/state.json` (QML FileView)
 
 Never commit keys. Never `chmod` the key file to anything but 600.
 
@@ -76,10 +76,10 @@ Never commit keys. Never `chmod` the key file to anything but 600.
 ```bash
 omarchy plugin validate .
 node --test daemon/lib/*.test.mjs
-./bin/allowance status
-./bin/allowance setup --watch    # wait for faucet → accountId
-./bin/allowance demo             # seller
-./bin/allowance fetch http://127.0.0.1:4403/secret
+./bin/chip402 status
+./bin/chip402 setup --watch    # wait for faucet → accountId
+./bin/chip402 demo             # seller
+./bin/chip402 fetch http://127.0.0.1:4403/secret
 ```
 
 Plugin is already installed from this checkout (`omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes`). After QML edits, the shell hot-reloads; if not: `omarchy-shell shell rescanPlugins`.

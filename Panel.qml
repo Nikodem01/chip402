@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "nikodem.allowance"
-  ipcTarget: "nikodem.allowance"
+  moduleName: "nikodem.chip402"
+  ipcTarget: "nikodem.chip402"
   manageIpc: false
 
   property string focusSection: "header"
@@ -33,31 +33,31 @@ Panel {
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color iconColor: allowance.active ? foreground : dim
-  readonly property string toggleHint: allowance.paused ? "Allow agents to spend" : "Pause all agent spending"
-  readonly property color barIconColor: allowance.active ? barForeground : Qt.darker(barForeground, 1.55)
+  readonly property color iconColor: chip402.active ? foreground : dim
+  readonly property string toggleHint: chip402.paused ? "Let agents spend" : "Pause all agent spending"
+  readonly property color barIconColor: chip402.active ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
-  readonly property bool showLedger: allowance.ledger.length > 0
+  readonly property bool showLedger: chip402.ledger.length > 0
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
-  readonly property int dailyIndex: Model.nearestIndex(Model.dailyMarks(), allowance.dailyCapTinybars)
-  readonly property int requestIndex: Model.nearestIndex(Model.requestMarks(), allowance.perRequestTinybars)
+  readonly property int dailyIndex: Model.nearestIndex(Model.dailyMarks(), chip402.dailyCapTinybars)
+  readonly property int requestIndex: Model.nearestIndex(Model.requestMarks(), chip402.perRequestTinybars)
 
   function heroMeta() {
-    if (!allowance.configured) return "Fund the operator to start"
-    if (allowance.paused) return "Allowance paused"
+    if (!chip402.configured) return "Fund the operator to start"
+    if (chip402.paused) return "chip402 paused"
     return root.heroPhraseText
   }
 
   function heroDetail() {
-    if (!allowance.configured) return "SETUP"
-    if (allowance.paused) return "PAUSED"
-    return Model.formatHbarShort(allowance.balanceTinybars) + " ℏ"
+    if (!chip402.configured) return "SETUP"
+    if (chip402.paused) return "PAUSED"
+    return Model.formatHbarShort(chip402.balanceTinybars) + " ℏ"
   }
 
   function ensureCursor() {
-    if (focusSection === "ledger" && allowance.ledger.length === 0) focusSection = "header"
-    if (ledgerIndex >= allowance.ledger.length) ledgerIndex = Math.max(0, allowance.ledger.length - 1)
+    if (focusSection === "ledger" && chip402.ledger.length === 0) focusSection = "header"
+    if (ledgerIndex >= chip402.ledger.length) ledgerIndex = Math.max(0, chip402.ledger.length - 1)
     if (ledgerIndex < 0) ledgerIndex = 0
   }
 
@@ -66,8 +66,8 @@ Panel {
     ensureCursor()
     if (dy === 0) return
     if (focusSection === "header") {
-      if (dy > 0 && !allowance.configured) focusSection = "fund"
-      else if (dy > 0 && allowance.ledger.length > 0) {
+      if (dy > 0 && !chip402.configured) focusSection = "fund"
+      else if (dy > 0 && chip402.ledger.length > 0) {
         focusSection = "ledger"
         ledgerIndex = 0
         scrollCursorIntoView()
@@ -76,7 +76,7 @@ Panel {
     }
     if (focusSection === "fund") {
       if (dy < 0) setHeaderCursor()
-      else if (allowance.ledger.length > 0) {
+      else if (chip402.ledger.length > 0) {
         focusSection = "ledger"
         ledgerIndex = 0
       }
@@ -84,11 +84,11 @@ Panel {
     }
     if (focusSection === "ledger") {
       if (dy < 0 && ledgerIndex === 0) {
-        if (!allowance.configured) focusSection = "fund"
+        if (!chip402.configured) focusSection = "fund"
         else setHeaderCursor()
         return
       }
-      ledgerIndex = Math.max(0, Math.min(allowance.ledger.length - 1, ledgerIndex + dy))
+      ledgerIndex = Math.max(0, Math.min(chip402.ledger.length - 1, ledgerIndex + dy))
       scrollCursorIntoView()
     }
   }
@@ -101,14 +101,14 @@ Panel {
 
   function activateCursor() {
     ensureCursor()
-    if (focusSection === "header") allowance.toggle()
-    else if (focusSection === "fund") allowance.runSetup()
-    else if (focusSection === "ledger") allowance.openHashscan(selectedLedger())
+    if (focusSection === "header") chip402.toggle()
+    else if (focusSection === "fund") chip402.runSetup()
+    else if (focusSection === "ledger") chip402.openHashscan(selectedLedger())
   }
 
   function selectedLedger() {
-    if (allowance.ledger.length === 0) return null
-    return allowance.ledger[Math.max(0, Math.min(ledgerIndex, allowance.ledger.length - 1))]
+    if (chip402.ledger.length === 0) return null
+    return chip402.ledger[Math.max(0, Math.min(ledgerIndex, chip402.ledger.length - 1))]
   }
 
   function setLedgerCursor(index) {
@@ -146,18 +146,18 @@ Panel {
   onOpenedChanged: if (opened) {
     cursorActive = false
     if (panelFlick) panelFlick.contentY = 0
-    allowance.refresh()
+    chip402.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
   onLedgerIndexChanged: scrollCursorIntoView()
 
   Service {
-    id: allowance
+    id: chip402
     settings: root.settings
   }
 
   Connections {
-    target: allowance
+    target: chip402
     function onLedgerChanged() { root.ensureCursor() }
     function onConfiguredChanged() { root.ensureCursor() }
   }
@@ -169,10 +169,10 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { allowance.refresh(); return "ok" }
-    function pause(): string { allowance.pause(); return "ok" }
-    function resume(): string { allowance.resume(); return "ok" }
-    function status(): string { return allowance.statusText }
+    function refresh(): string { chip402.refresh(); return "ok" }
+    function pause(): string { chip402.pause(); return "ok" }
+    function resume(): string { chip402.resume(); return "ok" }
+    function status(): string { return chip402.statusText }
   }
 
   BarIconButton {
@@ -181,18 +181,18 @@ Panel {
     bar: root.bar
     iconComponent: Component {
       Item {
-        AllowanceIcon {
+        ChipIcon {
           anchors.centerIn: parent
           iconSize: Style.space(12)
           color: root.barIconColor
-          crossed: allowance.paused
-          warning: !allowance.configured
+          crossed: chip402.paused
+          warning: !chip402.configured
         }
       }
     }
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) allowance.toggle()
-      else if (buttonCode === Qt.MiddleButton) allowance.refresh()
+      if (buttonCode === Qt.RightButton) chip402.toggle()
+      else if (buttonCode === Qt.MiddleButton) chip402.refresh()
       else root.toggle()
     }
   }
@@ -218,10 +218,10 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "p" || t === "P") allowance.toggle()
-        else if (t === "r" || t === "R") allowance.refresh()
-        else if (t === "c" || t === "C") allowance.copy(allowance.accountId || allowance.evmAddress)
-        else if (t === "f" || t === "F") allowance.openAccount()
+        if (t === "p" || t === "P") chip402.toggle()
+        else if (t === "r" || t === "R") chip402.refresh()
+        else if (t === "c" || t === "C") chip402.copy(chip402.accountId || chip402.evmAddress)
+        else if (t === "f" || t === "F") chip402.openAccount()
       }
 
       Flickable {
@@ -250,30 +250,30 @@ Panel {
             PanelHero {
               id: hero
               width: parent.width
-              title: "Allowance"
+              title: "chip402"
               meta: root.heroMeta()
               detail: root.heroDetail()
               foreground: root.foreground
               fontFamily: root.fontFamily
-              iconOpacity: allowance.active ? 1.0 : 0.5
+              iconOpacity: chip402.active ? 1.0 : 0.5
               iconComponent: Component {
-                AllowanceIcon {
+                ChipIcon {
                   iconSize: Style.font.display
                   color: root.iconColor
-                  crossed: allowance.paused
-                  warning: !allowance.configured
+                  crossed: chip402.paused
+                  warning: !chip402.configured
                 }
               }
               trailingControl: Component {
                 ToggleSwitch {
                   id: powerSwitch
-                  checked: !allowance.paused && allowance.configured
-                  busy: allowance.busy
-                  interactive: allowance.configured
+                  checked: !chip402.paused && chip402.configured
+                  busy: chip402.busy
+                  interactive: chip402.configured
                   hasCursor: header.ringVisible
                   foreground: hero.foreground
                   onHovered: function(on) { if (on) header.focusHero() }
-                  onToggled: allowance.toggle()
+                  onToggled: chip402.toggle()
 
                   PanelToolTip {
                     visible: powerSwitch.containsMouse
@@ -286,38 +286,38 @@ Panel {
           }
 
           Text {
-            visible: allowance.actionStatus !== "" || allowance.lastError !== ""
+            visible: chip402.actionStatus !== "" || chip402.lastError !== ""
             width: parent.width
-            text: allowance.actionStatus !== "" ? allowance.actionStatus : allowance.lastError
-            color: allowance.lastError !== "" && allowance.actionStatus === "" ? root.urgent : root.dim
+            text: chip402.actionStatus !== "" ? chip402.actionStatus : chip402.lastError
+            color: chip402.lastError !== "" && chip402.actionStatus === "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
           }
 
           FundRow {
-            visible: !allowance.configured
+            visible: !chip402.configured
             width: parent.width
           }
 
           Column {
-            visible: allowance.configured
+            visible: chip402.configured
             width: parent.width
             spacing: Style.spacing.labelGap
 
-            InfoPair { label: "Balance"; value: Model.formatHbar(allowance.balanceTinybars) }
-            InfoPair { label: "Today"; value: Model.formatHbar(allowance.spentTodayTinybars) + " / " + Model.formatHbar(allowance.dailyCapTinybars) }
-            InfoPair { label: "Per request"; value: Model.formatHbar(allowance.perRequestTinybars) }
-            InfoPair { label: "Account"; value: allowance.accountId }
+            InfoPair { label: "Balance"; value: Model.formatHbar(chip402.balanceTinybars) }
+            InfoPair { label: "Today"; value: Model.formatHbar(chip402.spentTodayTinybars) + " / " + Model.formatHbar(chip402.dailyCapTinybars) }
+            InfoPair { label: "Per request"; value: Model.formatHbar(chip402.perRequestTinybars) }
+            InfoPair { label: "Account"; value: chip402.accountId }
           }
 
           PanelSeparator {
-            visible: allowance.configured
+            visible: chip402.configured
             foreground: root.foreground
           }
 
           Column {
-            visible: allowance.configured
+            visible: chip402.configured
             width: parent.width
             spacing: Style.space(10)
 
@@ -329,7 +329,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Daily cap  ·  " + Model.formatHbar(allowance.dailyCapTinybars)
+              text: "Daily cap  ·  " + Model.formatHbar(chip402.dailyCapTinybars)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -347,13 +347,13 @@ Panel {
               onReleased: function(v) {
                 var marks = Model.dailyMarks()
                 var idx = Math.max(0, Math.min(marks.length - 1, Math.round(v)))
-                allowance.setDailyCap(marks[idx])
+                chip402.setDailyCap(marks[idx])
               }
             }
 
             Text {
               width: parent.width
-              text: "Per request  ·  " + Model.formatHbar(allowance.perRequestTinybars)
+              text: "Per request  ·  " + Model.formatHbar(chip402.perRequestTinybars)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -371,13 +371,13 @@ Panel {
               onReleased: function(v) {
                 var marks = Model.requestMarks()
                 var idx = Math.max(0, Math.min(marks.length - 1, Math.round(v)))
-                allowance.setPerRequestCap(marks[idx])
+                chip402.setPerRequestCap(marks[idx])
               }
             }
           }
 
           PanelSeparator {
-            visible: allowance.configured
+            visible: chip402.configured
             foreground: root.foreground
           }
 
@@ -392,9 +392,9 @@ Panel {
             }
 
             Text {
-              visible: allowance.ledger.length === 0
+              visible: chip402.ledger.length === 0
               width: parent.width
-              text: allowance.configured ? "No payments yet. Try allowance fetch." : "Fund the operator, then pay a 402."
+              text: chip402.configured ? "No payments yet. Try chip402 fetch." : "Fund the operator, then pay a 402."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -409,7 +409,7 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: allowance.ledger
+                model: chip402.ledger
                 LedgerRow {
                   required property var modelData
                   required property int index
@@ -428,7 +428,7 @@ Panel {
   Timer {
     id: phraseTimer
     interval: 2800
-    running: root.opened && allowance.active
+    running: root.opened && chip402.active
     repeat: true
     onTriggered: phraseSwap.restart()
   }
@@ -462,7 +462,7 @@ Panel {
         root.cursorActive = true
         root.focusSection = "fund"
       }
-      onClicked: allowance.runSetup()
+      onClicked: chip402.runSetup()
     }
 
     RowLayout {
@@ -480,7 +480,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: allowance.evmAddress !== "" ? "Top up this operator" : "Create an operator key"
+          text: chip402.evmAddress !== "" ? "Top up this operator" : "Create an operator key"
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -489,7 +489,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: allowance.evmAddress !== "" ? allowance.evmAddress : "Generate a local Hedera key, then faucet it"
+          text: chip402.evmAddress !== "" ? chip402.evmAddress : "Generate a local Hedera key, then faucet it"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -502,8 +502,8 @@ Panel {
         tooltipText: "Copy address"
         foreground: root.foreground
         fontFamily: root.fontFamily
-        enabled: allowance.evmAddress !== ""
-        onClicked: allowance.copy(allowance.evmAddress)
+        enabled: chip402.evmAddress !== ""
+        onClicked: chip402.copy(chip402.evmAddress)
       }
 
       PanelActionButton {
@@ -511,7 +511,7 @@ Panel {
         tooltipText: "Open faucet"
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onClicked: allowance.openUrl("https://portal.hedera.com/faucet")
+        onClicked: chip402.openUrl("https://portal.hedera.com/faucet")
       }
     }
   }
@@ -529,7 +529,7 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onEntered: root.setLedgerCursor(ledgerRow.rowIndex)
-      onClicked: allowance.openHashscan(ledgerRow.row)
+      onClicked: chip402.openHashscan(ledgerRow.row)
     }
 
     RowLayout {

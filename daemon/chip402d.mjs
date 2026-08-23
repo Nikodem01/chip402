@@ -55,7 +55,7 @@ async function readBody(req) {
 function publicState(config, state) {
   return {
     ok: true,
-    name: "allowance",
+    name: "chip402",
     paused: config.paused === true,
     configured: Boolean(config.accountId),
     network: config.network,
@@ -304,7 +304,7 @@ async function handle(req, res) {
   }
 }
 
-const port = Number(process.env.ALLOWANCE_PORT || DEFAULT_PORT);
+const port = Number(process.env.CHIP402_PORT || DEFAULT_PORT);
 const server = http.createServer((req, res) => {
   handle(req, res).catch(async (err) => {
     await log("unhandled", err);
@@ -317,7 +317,7 @@ server.on("error", async (err) => {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/status`);
       const body = await res.json();
-      if (body?.name === "allowance") {
+      if (body?.name === "chip402") {
         await log(`already running on :${port}`);
         process.exit(0);
       }
@@ -332,7 +332,7 @@ server.on("error", async (err) => {
 });
 
 server.listen(port, "127.0.0.1", async () => {
-  await log(`allowanced listening on 127.0.0.1:${port}`);
+  await log(`chip402d listening on 127.0.0.1:${port}`);
   try {
     await refreshBalances();
   } catch (err) {

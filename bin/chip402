@@ -22,25 +22,25 @@ import { runtimeHint } from "../daemon/lib/sdk.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
-const daemonPath = path.join(root, "daemon", "allowanced.mjs");
+const daemonPath = path.join(root, "daemon", "chip402d.mjs");
 const sellerPath = path.join(root, "demo", "seller.mjs");
-const base = `http://127.0.0.1:${process.env.ALLOWANCE_PORT || DEFAULT_PORT}`;
+const base = `http://127.0.0.1:${process.env.CHIP402_PORT || DEFAULT_PORT}`;
 
 function usage() {
-  console.log(`Allowance — spend-capped x402 payments for local agents
+  console.log(`chip402 — spend-capped x402 payments for local agents
 
 Usage:
-  allowance status
-  allowance setup [--watch]
-  allowance fetch <url>
-  allowance pause
-  allowance resume
-  allowance cap daily <hbar>
-  allowance cap request <hbar>
-  allowance allow <host>
-  allowance fund
-  allowance demo
-  allowance tail
+  chip402 status
+  chip402 setup [--watch]
+  chip402 fetch <url>
+  chip402 pause
+  chip402 resume
+  chip402 cap daily <hbar>
+  chip402 cap request <hbar>
+  chip402 allow <host>
+  chip402 fund
+  chip402 demo
+  chip402 tail
 `);
 }
 
@@ -71,7 +71,7 @@ async function daemonUp() {
     const res = await fetch(`${base}/status`);
     if (!res.ok) return false;
     const body = await res.json();
-    return body?.name === "allowance";
+    return body?.name === "chip402";
   } catch {
     return false;
   }
@@ -85,7 +85,7 @@ async function ensureRuntime() {
   } catch {
     await fs.writeFile(
       pkg,
-      `${JSON.stringify({ name: "omarchy-allowance-runtime", private: true, type: "module", dependencies: { "@hashgraph/sdk": "^2.81.0" } }, null, 2)}\n`,
+      `${JSON.stringify({ name: "chip402-runtime", private: true, type: "module", dependencies: { "@hashgraph/sdk": "^2.81.0" } }, null, 2)}\n`,
     );
   }
   try {
@@ -120,7 +120,7 @@ async function ensureDaemon() {
     await new Promise((r) => setTimeout(r, 150));
     if (await daemonUp()) return;
   }
-  throw new Error("allowanced did not start on 127.0.0.1:4402");
+  throw new Error("chip402d did not start on 127.0.0.1:4402");
 }
 
 function hbarToTiny(value) {
@@ -195,7 +195,7 @@ Fund the operator (spender) with testnet HBAR:
   1. Open https://portal.hedera.com/faucet
   2. Paste this EVM address:
 
-     ${config.evmAddress || "(run allowance setup)"}
+     ${config.evmAddress || "(run chip402 setup)"}
 
   3. Or send testnet HBAR from HashPack to that address.
 
@@ -211,7 +211,7 @@ async function printStatus() {
   await ensureDaemon();
   const status = await api("POST", "/refresh");
   const line = status.paused ? "PAUSED" : status.configured ? "LIVE" : "NEEDS FUNDING";
-  console.log(`Allowance  ${line}`);
+  console.log(`chip402  ${line}`);
   console.log(`Account    ${status.accountId || "—"}  ${status.evmAddress || ""}`);
   console.log(`Balance    ${tinyToHbar(status.balanceTinybars)} ℏ`);
   console.log(`Today      ${tinyToHbar(status.spentTodayTinybars)} / ${tinyToHbar(status.dailyCapTinybars)} ℏ`);
@@ -238,7 +238,7 @@ try {
     if (config.accountId) console.log(`Existing account: ${hashscanAccount(config.accountId)}`);
   } else if (cmd === "fetch") {
     const url = rest[0];
-    if (!url) throw new Error("usage: allowance fetch <url>");
+    if (!url) throw new Error("usage: chip402 fetch <url>");
     await ensureDaemon();
     const result = await api("POST", "/fetch", { url });
     console.log(JSON.stringify(result, null, 2));
@@ -260,7 +260,7 @@ try {
     console.log(`per-request cap ${rest[1]} ℏ`);
   } else if (cmd === "allow") {
     const host = rest[0];
-    if (!host) throw new Error("usage: allowance allow <host>");
+    if (!host) throw new Error("usage: chip402 allow <host>");
     await ensureDaemon();
     await api("POST", "/allow-host", { host });
     console.log(`allowed ${host}`);

@@ -1,4 +1,4 @@
-# Allowance — build notes (verified 2026-08-23)
+# chip402 — build notes (verified 2026-08-23)
 
 Omarchy plugin: metered Hedera spending account for local AI agents, paying x402 invoices.
 Competition deadline: Mon 24 Aug 09:00 CEST. Submit to github.com/HANCORE-linux/omarchy-plugin-marketplace
@@ -25,28 +25,29 @@ Competition deadline: Mon 24 Aug 09:00 CEST. Submit to github.com/HANCORE-linux/
 - Offline tx build CONFIRMED working with @hashgraph/sdk 2.81:
   setTransactionId(TransactionId.generate(feePayer)).setNodeAccountIds([0.0.3]).freeze().sign(key)
   -> 264-char base64. No network needed to sign.
-- Runtime deps live OUTSIDE the plugin dir at ~/.local/state/omarchy-allowance/runtime
+- Runtime deps live OUTSIDE the plugin dir at ~/.local/state/chip402/runtime
   (npm i @hashgraph/sdk = 232MB; keeps plugin repo symlink-free for the validator).
 
 ## Layout
   manifest.json  Panel.qml  Service.qml  Model.js  assets/
-  daemon/allowanced.mjs (+lib/{hedera,x402,policy,state}.mjs)   127.0.0.1:4402
+  daemon/chip402d.mjs (+lib/{hedera,x402,policy,state}.mjs)   127.0.0.1:4402
   demo/seller.mjs   tiny hedera:testnet x402 seller so the demo is self-contained
-  bin/allowance     CLI: status | fetch <url> | fund | tail
+  bin/chip402     CLI: status | fetch <url> | fund | tail
 
 ## Config / state
-  ~/.config/omarchy-allowance/config.json   network, accountId, caps, host allowlist
-  ~/.config/omarchy-allowance/key           0600, refuse to start if looser
-  ~/.local/state/omarchy-allowance/state.json  balances + ledger; QML FileView watches it
+  ~/.config/chip402/config.json   network, accountId, caps, host allowlist
+  ~/.config/chip402/key           0600, refuse to start if looser
+  ~/.local/state/chip402/state.json  balances + ledger; QML FileView watches it
 
 ## Built (local, 2026-08-23)
 - Daemon, seller, CLI, QML panel, manifest, README, preview — validator passes
-- Operator + merchant ECDSA keys generated (mode 600) under ~/.config/omarchy-allowance/
+- Operator + merchant ECDSA keys generated (mode 600) under ~/.config/chip402/
 - Offline sign works with freezeWith(Client.forTestnet()): ~1840-char base64 (official path; the earlier 264-char proof used a single node id)
 - Live 402 still blocked on faucet HBAR for `0x9e79d8eb87eb1290e98ec49a818b3f059d8c3636`
+- Product renamed Allowance → **chip402** (id `nikodem.chip402`). Chaldean 23, Pythagorean 33.
 - Do NOT open a marketplace issue or GitHub PR until Nikodem says so
 
 ## Open
-- Fund operator + merchant via portal.hedera.com/faucet or HashPack, then `allowance demo` + `allowance fetch http://127.0.0.1:4403/secret`
+- Fund operator + merchant via portal.hedera.com/faucet or HashPack, then `chip402 demo` + `chip402 fetch http://127.0.0.1:4403/secret`
 - MCP stdio server (`pay_and_fetch`) — skip for v1
 - Marketplace issue (HANCORE-linux/omarchy-plugin-marketplace) only after approval — it is an issue, not a registry PR

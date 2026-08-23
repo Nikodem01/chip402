@@ -2,14 +2,14 @@ import os from "node:os";
 import path from "node:path";
 
 export const HOME = os.homedir();
-export const CONFIG_DIR = path.join(HOME, ".config", "omarchy-allowance");
-export const STATE_DIR = path.join(HOME, ".local", "state", "omarchy-allowance");
+export const CONFIG_DIR = path.join(HOME, ".config", "chip402");
+export const STATE_DIR = path.join(HOME, ".local", "state", "chip402");
 export const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 export const KEY_PATH = path.join(CONFIG_DIR, "key");
 export const MERCHANT_KEY_PATH = path.join(CONFIG_DIR, "merchant-key");
 export const STATE_PATH = path.join(STATE_DIR, "state.json");
 export const RUNTIME_DIR = path.join(STATE_DIR, "runtime");
-export const LOG_PATH = path.join(STATE_DIR, "allowanced.log");
+export const LOG_PATH = path.join(STATE_DIR, "chip402d.log");
 
 export const DEFAULT_PORT = 4402;
 export const DEFAULT_SELLER_PORT = 4403;
