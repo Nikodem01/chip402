@@ -1,0 +1,295 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  CONFIG_DIR,
+  DEFAULT_PORT,
+  DEFAULT_SELLER_PORT,
+  KEY_PATH,
+  MERCHANT_KEY_PATH,
+  RUNTIME_DIR,
+} from "../daemon/lib/paths.mjs";
+import {
+  keyExists,
+  loadConfig,
+  saveConfig,
+  writeKeyFile,
+} from "../daemon/lib/state.mjs";
+import { generateOperator, hashscanAccount, lookupAccount } from "../daemon/lib/hedera.mjs";
+import { runtimeHint } from "../daemon/lib/sdk.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, "..");
+const daemonPath = path.join(root, "daemon", "allowanced.mjs");
+const sellerPath = path.join(root, "demo", "seller.mjs");
+const base = `http://127.0.0.1:${process.env.ALLOWANCE_PORT || DEFAULT_PORT}`;
+
+function usage() {
+  console.log(`Allowance — spend-capped x402 payments for local agents
+
+Usage:
+  allowance status
+  allowance setup [--watch]
+  allowance fetch <url>
+  allowance pause
+  allowance resume
+  allowance cap daily <hbar>
+  allowance cap request <hbar>
+  allowance allow <host>
+  allowance fund
+  allowance demo
+  allowance tail
+`);
+}
+
+async function api(method, pathname, body) {
+  const res = await fetch(`${base}${pathname}`, {
+    method,
+    headers: body ? { "content-type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
+  if (!res.ok) {
+    const error = new Error(json.error || json.reason || `${method} ${pathname} ${res.status}`);
+    error.status = res.status;
+    error.body = json;
+    throw error;
+  }
+  return json;
+}
+
+async function daemonUp() {
+  try {
+    const res = await fetch(`${base}/status`);
+    if (!res.ok) return false;
+    const body = await res.json();
+    return body?.name === "allowance";
+  } catch {
+    return false;
+  }
+}
+
+async function ensureRuntime() {
+  await fs.mkdir(RUNTIME_DIR, { recursive: true });
+  const pkg = path.join(RUNTIME_DIR, "package.json");
+  try {
+    await fs.access(pkg);
+  } catch {
+    await fs.writeFile(
+      pkg,
+      `${JSON.stringify({ name: "omarchy-allowance-runtime", private: true, type: "module", dependencies: { "@hashgraph/sdk": "^2.81.0" } }, null, 2)}\n`,
+    );
+  }
+  try {
+    await fs.access(path.join(RUNTIME_DIR, "node_modules", "@hashgraph", "sdk"));
+  } catch {
+    console.error(`Installing @hashgraph/sdk into ${RUNTIME_DIR} …`);
+    await run("bash", ["-lc", "npm install @hashgraph/sdk"], { cwd: RUNTIME_DIR });
+  }
+}
+
+function run(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: "inherit", ...opts });
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${cmd} exited ${code}`));
+    });
+    child.on("error", reject);
+  });
+}
+
+async function ensureDaemon() {
+  if (await daemonUp()) return;
+  await ensureRuntime();
+  const child = spawn(process.execPath, [daemonPath], {
+    stdio: "ignore",
+    detached: true,
+    env: process.env,
+  });
+  child.unref();
+  for (let i = 0; i < 20; i += 1) {
+    await new Promise((r) => setTimeout(r, 150));
+    if (await daemonUp()) return;
+  }
+  throw new Error("allowanced did not start on 127.0.0.1:4402");
+}
+
+function hbarToTiny(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`invalid HBAR amount: ${value}`);
+  return String(BigInt(Math.round(n * 100_000_000)));
+}
+
+function tinyToHbar(value) {
+  const n = BigInt(String(value || "0"));
+  const whole = n / 100000000n;
+  const frac = (n % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
+  return frac ? `${whole}.${frac}` : `${whole}`;
+}
+
+async function setup(watch) {
+  await ensureRuntime();
+  const config = await loadConfig();
+  if (!keyExists(KEY_PATH)) {
+    const operator = generateOperator();
+    await writeKeyFile(KEY_PATH, operator.der);
+    config.evmAddress = operator.evmAddress;
+    console.log(`Operator key written to ${KEY_PATH} (mode 600)`);
+  } else if (!config.evmAddress) {
+    const { parsePrivateKey, evmAddressFor } = await import("../daemon/lib/hedera.mjs");
+    const { readKeyFile } = await import("../daemon/lib/state.mjs");
+    const key = parsePrivateKey(await readKeyFile(KEY_PATH));
+    config.evmAddress = evmAddressFor(key);
+  }
+  if (!keyExists(MERCHANT_KEY_PATH)) {
+    const merchant = generateOperator();
+    await writeKeyFile(MERCHANT_KEY_PATH, merchant.der);
+    config.merchantEvmAddress = merchant.evmAddress;
+    console.log(`Merchant key written to ${MERCHANT_KEY_PATH} (mode 600)`);
+  }
+  await saveConfig(config);
+  printFund(config);
+  if (!watch) return;
+  console.log("Waiting for faucet / HashPack top-up (Ctrl-C to stop)…");
+  for (;;) {
+    const next = await loadConfig();
+    let changed = false;
+    if (next.evmAddress && !next.accountId) {
+      const found = await lookupAccount(next.evmAddress);
+      if (found?.accountId) {
+        next.accountId = found.accountId;
+        changed = true;
+        console.log(`Operator account ${found.accountId}  balance ${tinyToHbar(found.balanceTinybars)} ℏ`);
+      }
+    }
+    if (next.merchantEvmAddress && !next.merchantAccountId) {
+      const found = await lookupAccount(next.merchantEvmAddress);
+      if (found?.accountId) {
+        next.merchantAccountId = found.accountId;
+        changed = true;
+        console.log(`Merchant account ${found.accountId}`);
+      }
+    }
+    if (changed) await saveConfig(next);
+    if (next.accountId) {
+      console.log("Setup complete.");
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+}
+
+function printFund(config) {
+  console.log(`
+Fund the operator (spender) with testnet HBAR:
+
+  1. Open https://portal.hedera.com/faucet
+  2. Paste this EVM address:
+
+     ${config.evmAddress || "(run allowance setup)"}
+
+  3. Or send testnet HBAR from HashPack to that address.
+
+Merchant (demo seller) address:
+
+     ${config.merchantEvmAddress || "(none)"}
+
+Config: ${CONFIG_DIR}
+`);
+}
+
+async function printStatus() {
+  await ensureDaemon();
+  const status = await api("POST", "/refresh");
+  const line = status.paused ? "PAUSED" : status.configured ? "LIVE" : "NEEDS FUNDING";
+  console.log(`Allowance  ${line}`);
+  console.log(`Account    ${status.accountId || "—"}  ${status.evmAddress || ""}`);
+  console.log(`Balance    ${tinyToHbar(status.balanceTinybars)} ℏ`);
+  console.log(`Today      ${tinyToHbar(status.spentTodayTinybars)} / ${tinyToHbar(status.dailyCapTinybars)} ℏ`);
+  console.log(`Per req    ${tinyToHbar(status.perRequestTinybars)} ℏ`);
+  console.log(`Hosts      ${(status.allowHosts || []).join(", ")}`);
+  if (status.accountUrl) console.log(`HashScan   ${status.accountUrl}`);
+  if (status.lastError) console.log(`Error      ${status.lastError}`);
+}
+
+const [cmd, ...rest] = process.argv.slice(2);
+
+try {
+  if (!cmd || cmd === "-h" || cmd === "--help") {
+    usage();
+    process.exit(0);
+  }
+  if (cmd === "status") {
+    await printStatus();
+  } else if (cmd === "setup") {
+    await setup(rest.includes("--watch"));
+  } else if (cmd === "fund") {
+    const config = await loadConfig();
+    printFund(config);
+    if (config.accountId) console.log(`Existing account: ${hashscanAccount(config.accountId)}`);
+  } else if (cmd === "fetch") {
+    const url = rest[0];
+    if (!url) throw new Error("usage: allowance fetch <url>");
+    await ensureDaemon();
+    const result = await api("POST", "/fetch", { url });
+    console.log(JSON.stringify(result, null, 2));
+  } else if (cmd === "pause") {
+    await ensureDaemon();
+    await api("POST", "/pause", { paused: true });
+    console.log("paused");
+  } else if (cmd === "resume") {
+    await ensureDaemon();
+    await api("POST", "/pause", { paused: false });
+    console.log("live");
+  } else if (cmd === "cap" && rest[0] === "daily") {
+    await ensureDaemon();
+    await api("POST", "/caps", { dailyTinybars: hbarToTiny(rest[1]) });
+    console.log(`daily cap ${rest[1]} ℏ`);
+  } else if (cmd === "cap" && rest[0] === "request") {
+    await ensureDaemon();
+    await api("POST", "/caps", { perRequestTinybars: hbarToTiny(rest[1]) });
+    console.log(`per-request cap ${rest[1]} ℏ`);
+  } else if (cmd === "allow") {
+    const host = rest[0];
+    if (!host) throw new Error("usage: allowance allow <host>");
+    await ensureDaemon();
+    await api("POST", "/allow-host", { host });
+    console.log(`allowed ${host}`);
+  } else if (cmd === "demo") {
+    await ensureRuntime();
+    await run(process.execPath, [sellerPath], { cwd: root });
+  } else if (cmd === "tail") {
+    await ensureDaemon();
+    for (;;) {
+      const status = await api("GET", "/status");
+      console.clear?.();
+      console.log(`spent today ${tinyToHbar(status.spentTodayTinybars)} ℏ   paused=${status.paused}`);
+      for (const row of (status.ledger || []).slice(0, 12)) {
+        console.log(`${row.ts}  ${row.status.padEnd(8)}  ${tinyToHbar(row.amountTinybars)} ℏ  ${row.host || row.url}`);
+        if (row.hashscan) console.log(`           ${row.hashscan}`);
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  } else if (cmd === "daemon") {
+    await ensureRuntime();
+    await run(process.execPath, [daemonPath], { cwd: root });
+  } else {
+    usage();
+    process.exit(1);
+  }
+} catch (err) {
+  console.error(err.body ? JSON.stringify(err.body, null, 2) : err.message);
+  if (String(err.message || "").includes("Hedera SDK is not installed")) {
+    console.error(runtimeHint());
+  }
+  process.exit(1);
+}

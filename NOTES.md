@@ -39,6 +39,14 @@ Competition deadline: Mon 24 Aug 09:00 CEST. Submit to github.com/HANCORE-linux/
   ~/.config/omarchy-allowance/key           0600, refuse to start if looser
   ~/.local/state/omarchy-allowance/state.json  balances + ledger; QML FileView watches it
 
+## Built (local, 2026-08-23)
+- Daemon, seller, CLI, QML panel, manifest, README, preview — validator passes
+- Operator + merchant ECDSA keys generated (mode 600) under ~/.config/omarchy-allowance/
+- Offline sign works with freezeWith(Client.forTestnet()): ~1840-char base64 (official path; the earlier 264-char proof used a single node id)
+- Live 402 still blocked on faucet HBAR for `0x9e79d8eb87eb1290e98ec49a818b3f059d8c3636`
+- Do NOT open a marketplace issue or GitHub PR until Nikodem says so
+
 ## Open
-- Need Hedera testnet accountId + DER key from portal.hedera.com
-- MCP stdio server (`pay_and_fetch` tool) so Claude Code can spend directly — high value, cheap
+- Fund operator + merchant via portal.hedera.com/faucet or HashPack, then `allowance demo` + `allowance fetch http://127.0.0.1:4403/secret`
+- MCP stdio server (`pay_and_fetch`) — skip for v1
+- Marketplace issue (HANCORE-linux/omarchy-plugin-marketplace) only after approval — it is an issue, not a registry PR

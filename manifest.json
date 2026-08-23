@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "nikodem.allowance",
+  "name": "Allowance",
+  "version": "1.0.0",
+  "author": "Nikodem Dominiak",
+  "license": "MIT",
+  "description": "Spend-capped Hedera wallet for local AI agents paying x402 invoices, with a bar kill switch.",
+  "homepage": "https://github.com/Nikodem01/omarchy-allowance",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Allowance",
+    "description": "Balance, today's spend, live ledger, and a kill switch for agent payments.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 15
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}
