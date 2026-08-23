@@ -44,7 +44,7 @@ Competition deadline: Mon 24 Aug 09:00 CEST. Submit to github.com/HANCORE-linux/
 - Operator + merchant ECDSA keys generated (mode 600) under ~/.config/chip402/
 - Offline sign works with freezeWith(Client.forTestnet()): ~1840-char base64 (official path; the earlier 264-char proof used a single node id)
 - Live 402 still blocked on faucet HBAR for `0x9e79d8eb87eb1290e98ec49a818b3f059d8c3636`
-- Product renamed Allowance → **chip402** (id `nikodem.chip402`). Chaldean 23, Pythagorean 33.
+- Product renamed Allowance → **chip402** (id `chip402`). Chaldean 23, Pythagorean 33.
 - Do NOT open a marketplace issue or GitHub PR until Nikodem says so
 
 ## Open

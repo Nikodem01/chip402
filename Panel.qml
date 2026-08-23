@@ -9,8 +9,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "nikodem.chip402"
-  ipcTarget: "nikodem.chip402"
+  moduleName: "chip402"
+  ipcTarget: "chip402"
   manageIpc: false
 
   property string focusSection: "header"

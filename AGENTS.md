@@ -1,7 +1,7 @@
 # Agent notes — chip402
 
 Omarchy plugin: spend-capped Hedera operator for local agents paying x402 invoices.
-Repo: `/home/niko/Work/omarchy-allowance`. Plugin id `nikodem.chip402`.
+Repo: `/home/niko/Work/omarchy-allowance`. Plugin id `chip402`.
 
 Do **not** open a GitHub repo, marketplace issue, or PR unless Nikodem explicitly asks.
 
@@ -55,7 +55,7 @@ Do **not** use this MCP to sign, submit, or mutate network state. It only search
 ## Layout
 
 ```
-manifest.json          bar-widget, id nikodem.chip402
+manifest.json          bar-widget, id chip402
 Panel.qml Service.qml Model.js ChipIcon.qml
 daemon/chip402d.mjs  127.0.0.1:4402
 daemon/lib/{hedera,x402,policy,state,sdk,paths,log}.mjs

@@ -28,7 +28,7 @@ Needs Node.js 22+ and `npm`. The Hedera SDK is installed **outside** the plugin 
 omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes
 
 # one-time runtime + operator key
-~/.config/omarchy/plugins/nikodem.chip402/bin/chip402 setup --watch
+~/.config/omarchy/plugins/chip402/bin/chip402 setup --watch
 ```
 
 `setup` prints an EVM address. Fund it with testnet HBAR:
@@ -36,13 +36,13 @@ omarchy plugin add /home/niko/Work/omarchy-allowance --enable --yes
 1. [Hedera testnet faucet](https://portal.hedera.com/faucet), or
 2. HashPack, send testnet HBAR to that address
 
-Then add the widget if the installer did not: `omarchy plugin enable nikodem.chip402`.
+Then add the widget if the installer did not: `omarchy plugin enable chip402`.
 
 Optional PATH helper:
 
 ```bash
 mkdir -p ~/.local/bin
-ln -sf ~/.config/omarchy/plugins/nikodem.chip402/bin/chip402 ~/.local/bin/chip402
+ln -sf ~/.config/omarchy/plugins/chip402/bin/chip402 ~/.local/bin/chip402
 ```
 
 ## Pay something
@@ -78,7 +78,7 @@ Right-click the bar icon to pause. `p` in the panel does the same.
 ## Remove
 
 ```bash
-omarchy plugin remove nikodem.chip402 --yes
+omarchy plugin remove chip402 --yes
 # optional: wipe keys, config, and the SDK copy
 rm -rf ~/.config/chip402 ~/.local/state/chip402 ~/.local/bin/chip402
 ```
