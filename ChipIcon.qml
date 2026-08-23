@@ -1,7 +1,10 @@
 import QtQuick
+import QtQuick.Effects
 import qs.Commons
 import qs.Ui
 
+// Renders assets/chip.svg and recolors it to the bar/panel foreground.
+// The SVG is the source of truth — do not redraw the mark in QML.
 Item {
   id: root
 
@@ -16,27 +19,23 @@ Item {
   implicitWidth: iconSize
   implicitHeight: iconSize
 
-  // Stacked coins — reads as "metered money" at bar size without an SVG.
-  Coin {
-    width: root.iconSize * 0.72
-    height: width * 0.34
-    x: (root.iconSize - width) / 2
-    y: root.iconSize * 0.18
-    opacity: 0.45
+  Image {
+    id: mark
+    anchors.fill: parent
+    source: Qt.resolvedUrl("assets/chip.svg")
+    fillMode: Image.PreserveAspectFit
+    sourceSize.width: Math.max(64, Math.round(width * 3))
+    sourceSize.height: Math.max(64, Math.round(height * 3))
+    visible: false
+    layer.enabled: true
+    asynchronous: false
   }
-  Coin {
-    width: root.iconSize * 0.82
-    height: width * 0.34
-    x: (root.iconSize - width) / 2
-    y: root.iconSize * 0.36
-    opacity: 0.75
-  }
-  Coin {
-    width: root.iconSize * 0.90
-    height: width * 0.36
-    x: (root.iconSize - width) / 2
-    y: root.iconSize * 0.54
-    opacity: 1.0
+
+  MultiEffect {
+    anchors.fill: mark
+    source: mark
+    colorization: 1.0
+    colorizationColor: root.color
   }
 
   Rectangle {
@@ -47,6 +46,7 @@ Item {
     radius: height / 2
     color: root.color
     rotation: -45
+    z: 2
   }
 
   BorderSurface {
@@ -56,7 +56,8 @@ Item {
     radius: width / 2
     color: root.badgeColor
     anchors.right: parent.right
-    anchors.bottom: parent.bottom
+    anchors.top: parent.top
+    z: 3
     borderSpec: Border.flat(Color.popups.background, 1)
 
     Text {
@@ -67,12 +68,5 @@ Item {
       font.pixelSize: Math.max(6, parent.height * 0.72)
       font.bold: true
     }
-  }
-
-  component Coin: Rectangle {
-    radius: height / 2
-    color: "transparent"
-    border.width: Math.max(1.5, root.iconSize * 0.08)
-    border.color: root.color
   }
 }

@@ -20,7 +20,7 @@ Panel {
 
   readonly property var activePhrases: [
     "Metering agents",
-    "Counting tinybars",
+    "Counting chips",
     "Watching spend",
     "Guarding the cap",
     "Signing invoices",
@@ -38,25 +38,81 @@ Panel {
   readonly property color barIconColor: chip402.active ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
   readonly property bool showLedger: chip402.ledger.length > 0
+  // Conditions under which chip402 will refuse to spend even though nothing is paused. Caps
+  // stay silent, but a refusal the user cannot see would just look like a broken plugin.
+  readonly property string holdReason: {
+    if (chip402.facilitatorError !== "") return "Facilitator unreachable — payments are held"
+    if (chip402.feePayer === "" && chip402.configured) return "Payment sponsor unknown — payments are held"
+    if (chip402.configured && !chip402.balanceFresh) return "Balance is stale — payments are held"
+    if (chip402.floatWarning !== "") return chip402.floatWarning
+    return ""
+  }
+
+  readonly property string remainingMicro: Model.remainingMicro(chip402.dailyCapMicro, chip402.spentTodayMicro)
+  readonly property real spendRatio: Model.spendRatio(chip402.dailyCapMicro, chip402.spentTodayMicro)
+  readonly property bool spendAlarming: spendRatio >= 0.85
+  readonly property color track: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.18)
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Color.accent) : "transparent"
-  readonly property int dailyIndex: Model.nearestIndex(Model.dailyMarks(), chip402.dailyCapTinybars)
-  readonly property int requestIndex: Model.nearestIndex(Model.requestMarks(), chip402.perRequestTinybars)
+  readonly property int dailyIndex: Model.nearestIndex(Model.dailyMarks(), chip402.dailyCapMicro)
+  readonly property int requestIndex: Model.nearestIndex(Model.requestMarks(), chip402.perRequestMicro)
 
   function heroMeta() {
-    if (!chip402.configured) return "Fund the operator to start"
-    if (chip402.paused) return "chip402 paused"
+    if (chip402.paused && chip402.configured) return "Agents cannot spend"
+    if (root.holdReason !== "") return root.holdReason
+    if (chip402.phase === "need_key") return "Create a local operator key"
+    if (chip402.phase === "need_hbar") return "Send HBAR to open the account"
+    if (chip402.phase === "completing") return "Putting the key on record"
+    if (chip402.phase === "associating") return "Linking USDC to this account"
+    if (chip402.phase === "need_usdc") return "Send testnet USDC to start"
     return root.heroPhraseText
   }
 
   function heroDetail() {
-    if (!chip402.configured) return "SETUP"
-    if (chip402.paused) return "PAUSED"
-    return Model.formatHbarShort(chip402.balanceTinybars) + " ℏ"
+    if (chip402.paused && chip402.configured) return "PAUSED"
+    if (chip402.phase === "need_usdc") return "0.00 USDC"
+    if (chip402.phase !== "ready") return "SETUP"
+    return Model.formatUsdShort(root.remainingMicro) + " left"
+  }
+
+  function setupTitle() {
+    if (chip402.phase === "need_key") return "Create an operator key"
+    if (chip402.phase === "need_hbar") return "Send a little HBAR"
+    if (chip402.phase === "completing") return "Putting the key on record"
+    if (chip402.phase === "associating") return "Linking USDC"
+    if (chip402.phase === "need_usdc") return "Send testnet USDC"
+    return "Top up this operator"
+  }
+
+  function setupSubtitle() {
+    if (chip402.phase === "need_key") return "A local Hedera key. Nothing leaves this machine."
+    if (chip402.phase === "need_hbar") return chip402.evmAddress || "Waiting for the EVM address"
+    if (chip402.phase === "completing") return "One cheap self-signed transaction, then it can pay"
+    if (chip402.phase === "associating") return "Needs a little HBAR for the association fee"
+    if (chip402.phase === "need_usdc") return chip402.accountId || chip402.evmAddress
+    return chip402.evmAddress
+  }
+
+  function setupAddress() {
+    if (chip402.phase === "need_hbar" || chip402.phase === "need_key") return chip402.evmAddress
+    return chip402.accountId || chip402.evmAddress
+  }
+
+  function emptyLedgerText() {
+    if (chip402.phase === "need_key") return "Create the operator key, then agents can settle x402 invoices here."
+    if (chip402.phase === "need_hbar") return "Send HBAR so Hedera creates the account, then pay a 402."
+    if (chip402.phase === "completing") return "The account has no key on record yet, so the facilitator would reject every payment. chip402 is fixing that."
+    if (chip402.phase === "associating") return "Waiting for USDC association before payments can settle."
+    if (chip402.phase === "need_usdc") return "Send testnet USDC, then try chip402 fetch."
+    return "No payments yet. Agents settle x402 invoices here."
   }
 
   function ensureCursor() {
-    if (focusSection === "ledger" && chip402.ledger.length === 0) focusSection = "header"
+    if (focusSection === "fund" && chip402.ready) focusSection = chip402.configured ? "account" : "header"
+    if (focusSection === "account" && !chip402.configured) focusSection = chip402.ready ? "header" : "fund"
+    if (focusSection === "ledger" && chip402.ledger.length === 0) {
+      focusSection = chip402.configured ? "account" : (chip402.ready ? "header" : "fund")
+    }
     if (ledgerIndex >= chip402.ledger.length) ledgerIndex = Math.max(0, chip402.ledger.length - 1)
     if (ledgerIndex < 0) ledgerIndex = 0
   }
@@ -66,7 +122,8 @@ Panel {
     ensureCursor()
     if (dy === 0) return
     if (focusSection === "header") {
-      if (dy > 0 && !chip402.configured) focusSection = "fund"
+      if (dy > 0 && !chip402.ready) focusSection = "fund"
+      else if (dy > 0 && chip402.configured) focusSection = "account"
       else if (dy > 0 && chip402.ledger.length > 0) {
         focusSection = "ledger"
         ledgerIndex = 0
@@ -76,15 +133,28 @@ Panel {
     }
     if (focusSection === "fund") {
       if (dy < 0) setHeaderCursor()
+      else if (chip402.configured) focusSection = "account"
       else if (chip402.ledger.length > 0) {
         focusSection = "ledger"
         ledgerIndex = 0
       }
       return
     }
+    if (focusSection === "account") {
+      if (dy < 0) {
+        if (!chip402.ready) focusSection = "fund"
+        else setHeaderCursor()
+      } else if (chip402.ledger.length > 0) {
+        focusSection = "ledger"
+        ledgerIndex = 0
+        scrollCursorIntoView()
+      }
+      return
+    }
     if (focusSection === "ledger") {
       if (dy < 0 && ledgerIndex === 0) {
-        if (!chip402.configured) focusSection = "fund"
+        if (chip402.configured) focusSection = "account"
+        else if (!chip402.ready) focusSection = "fund"
         else setHeaderCursor()
         return
       }
@@ -102,7 +172,11 @@ Panel {
   function activateCursor() {
     ensureCursor()
     if (focusSection === "header") chip402.toggle()
-    else if (focusSection === "fund") chip402.runSetup()
+    else if (focusSection === "fund") {
+      if (chip402.phase === "need_key") chip402.runSetup()
+      else chip402.copy(root.setupAddress())
+    }
+    else if (focusSection === "account") chip402.copy(chip402.accountId)
     else if (focusSection === "ledger") chip402.openHashscan(selectedLedger())
   }
 
@@ -183,10 +257,10 @@ Panel {
       Item {
         ChipIcon {
           anchors.centerIn: parent
-          iconSize: Style.space(12)
+          iconSize: Style.bar.iconCanvas
           color: root.barIconColor
           crossed: chip402.paused
-          warning: !chip402.configured
+          warning: !chip402.ready
         }
       }
     }
@@ -261,7 +335,7 @@ Panel {
                   iconSize: Style.font.display
                   color: root.iconColor
                   crossed: chip402.paused
-                  warning: !chip402.configured
+                  warning: !chip402.ready
                 }
               }
               trailingControl: Component {
@@ -286,17 +360,21 @@ Panel {
           }
 
           Text {
-            visible: chip402.actionStatus !== "" || chip402.lastError !== ""
+            visible: chip402.actionStatus !== "" || chip402.displayError !== "" || root.holdReason !== ""
             width: parent.width
-            text: chip402.actionStatus !== "" ? chip402.actionStatus : chip402.lastError
-            color: chip402.lastError !== "" && chip402.actionStatus === "" ? root.urgent : root.dim
+            text: chip402.actionStatus !== ""
+              ? chip402.actionStatus
+              : (chip402.displayError !== "" ? chip402.displayError : root.holdReason)
+            color: (chip402.displayError !== "" || root.holdReason !== "") && chip402.actionStatus === ""
+              ? root.urgent
+              : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
           }
 
-          FundRow {
-            visible: !chip402.configured
+          SetupRow {
+            visible: !chip402.ready
             width: parent.width
           }
 
@@ -305,10 +383,87 @@ Panel {
             width: parent.width
             spacing: Style.spacing.labelGap
 
-            InfoPair { label: "Balance"; value: Model.formatHbar(chip402.balanceTinybars) }
-            InfoPair { label: "Today"; value: Model.formatHbar(chip402.spentTodayTinybars) + " / " + Model.formatHbar(chip402.dailyCapTinybars) }
-            InfoPair { label: "Per request"; value: Model.formatHbar(chip402.perRequestTinybars) }
-            InfoPair { label: "Account"; value: chip402.accountId }
+            InfoPair {
+              label: "Balance"
+              value: chip402.balanceFresh
+                ? Model.formatUsd(chip402.balanceMicro)
+                : Model.formatUsd(chip402.balanceMicro) + "  (stale)"
+            }
+            InfoPair {
+              label: "In flight"
+              visible: chip402.pendingMicro !== "0"
+              value: Model.formatUsd(chip402.pendingMicro)
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(4)
+
+              InfoPair {
+                label: "Today"
+                value: Model.formatUsdShort(chip402.spentTodayMicro) + " / " + Model.formatUsd(chip402.dailyCapMicro)
+              }
+
+              SpendMeter {
+                width: parent.width
+                value: root.spendRatio
+                alarming: root.spendAlarming
+              }
+            }
+
+            InfoPair { label: "Per request"; value: Model.formatUsd(chip402.perRequestMicro) }
+            InfoPair {
+              label: "Fee payer"
+              value: chip402.feePayer !== "" ? chip402.feePayer : "not discovered — payments held"
+            }
+
+            AccountRow {
+              width: parent.width
+            }
+          }
+
+          PanelSeparator {
+            foreground: root.foreground
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(10)
+
+            PanelSectionHeader {
+              text: "LEDGER"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              visible: chip402.ledger.length === 0
+              width: parent.width
+              text: root.emptyLedgerText()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+              horizontalAlignment: Text.AlignHCenter
+            }
+
+            Column {
+              id: ledgerColumn
+              visible: root.showLedger
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: chip402.ledger
+                LedgerRow {
+                  required property var modelData
+                  required property int index
+                  width: ledgerColumn.width
+                  row: modelData
+                  rowIndex: index
+                }
+              }
+            }
           }
 
           PanelSeparator {
@@ -329,7 +484,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Daily cap  ·  " + Model.formatHbar(chip402.dailyCapTinybars)
+              text: "Daily cap  ·  " + Model.formatUsd(chip402.dailyCapMicro)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -353,7 +508,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Per request  ·  " + Model.formatHbar(chip402.perRequestTinybars)
+              text: "Per request  ·  " + Model.formatUsd(chip402.perRequestMicro)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -372,51 +527,6 @@ Panel {
                 var marks = Model.requestMarks()
                 var idx = Math.max(0, Math.min(marks.length - 1, Math.round(v)))
                 chip402.setPerRequestCap(marks[idx])
-              }
-            }
-          }
-
-          PanelSeparator {
-            visible: chip402.configured
-            foreground: root.foreground
-          }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(10)
-
-            PanelSectionHeader {
-              text: "LEDGER"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Text {
-              visible: chip402.ledger.length === 0
-              width: parent.width
-              text: chip402.configured ? "No payments yet. Try chip402 fetch." : "Fund the operator, then pay a 402."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.WordWrap
-              horizontalAlignment: Text.AlignHCenter
-            }
-
-            Column {
-              id: ledgerColumn
-              visible: root.showLedger
-              width: parent.width
-              spacing: Style.space(6)
-
-              Repeater {
-                model: chip402.ledger
-                LedgerRow {
-                  required property var modelData
-                  required property int index
-                  width: ledgerColumn.width
-                  row: modelData
-                  rowIndex: index
-                }
               }
             }
           }
@@ -448,7 +558,7 @@ Panel {
     }
   }
 
-  component FundRow: CursorSurface {
+  component SetupRow: CursorSurface {
     id: fundRow
     hasCursor: root.cursorActive && root.focusSection === "fund"
     foreground: root.foreground
@@ -462,7 +572,10 @@ Panel {
         root.cursorActive = true
         root.focusSection = "fund"
       }
-      onClicked: chip402.runSetup()
+      onClicked: {
+        if (chip402.phase === "need_key") chip402.runSetup()
+        else chip402.copy(root.setupAddress())
+      }
     }
 
     RowLayout {
@@ -480,7 +593,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: chip402.evmAddress !== "" ? "Top up this operator" : "Create an operator key"
+          text: root.setupTitle()
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -489,7 +602,7 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          text: chip402.evmAddress !== "" ? chip402.evmAddress : "Generate a local Hedera key, then faucet it"
+          text: root.setupSubtitle()
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -502,16 +615,117 @@ Panel {
         tooltipText: "Copy address"
         foreground: root.foreground
         fontFamily: root.fontFamily
-        enabled: chip402.evmAddress !== ""
-        onClicked: chip402.copy(chip402.evmAddress)
+        enabled: root.setupAddress() !== ""
+        onClicked: chip402.copy(root.setupAddress())
       }
 
       PanelActionButton {
+        visible: chip402.phase === "need_hbar" || chip402.phase === "completing" || chip402.phase === "associating"
         iconText: "󰌁"
         tooltipText: "Open faucet"
         foreground: root.foreground
         fontFamily: root.fontFamily
         onClicked: chip402.openUrl("https://portal.hedera.com/faucet")
+      }
+
+      PanelActionButton {
+        visible: chip402.phase === "need_usdc"
+        iconText: "󰌁"
+        tooltipText: "Open account on HashScan"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: chip402.openAccount()
+      }
+    }
+  }
+
+  component SpendMeter: Item {
+    id: meter
+    property real value: 0
+    property bool alarming: false
+    property real thickness: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
+
+    implicitHeight: thickness
+
+    Rectangle {
+      id: meterTrack
+      anchors.fill: parent
+      radius: height / 2
+      color: root.track
+    }
+
+    Rectangle {
+      anchors.left: meterTrack.left
+      anchors.verticalCenter: meterTrack.verticalCenter
+      height: meterTrack.height
+      radius: meterTrack.radius
+      width: meterTrack.width * Math.max(0, Math.min(1, meter.value))
+      color: meter.alarming ? root.urgent : root.foreground
+
+      Behavior on width {
+        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
+      }
+    }
+  }
+
+  component AccountRow: CursorSurface {
+    id: accountRow
+    hasCursor: root.cursorActive && root.focusSection === "account"
+    foreground: root.foreground
+    implicitHeight: accountInner.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.focusSection = "account"
+      }
+      onClicked: chip402.copy(chip402.accountId)
+    }
+
+    RowLayout {
+      id: accountInner
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(8)
+
+      Text {
+        text: "Account"
+        color: root.foreground
+        opacity: 0.6
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Text {
+        Layout.fillWidth: true
+        text: chip402.accountId
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideMiddle
+        horizontalAlignment: Text.AlignRight
+      }
+
+      PanelActionButton {
+        iconText: "󰆏"
+        tooltipText: "Copy account"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: chip402.accountId !== ""
+        onClicked: chip402.copy(chip402.accountId)
+      }
+
+      PanelActionButton {
+        iconText: "󰌁"
+        tooltipText: "Open on HashScan"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        enabled: chip402.accountId !== ""
+        onClicked: chip402.openAccount()
       }
     }
   }

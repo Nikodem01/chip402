@@ -12,11 +12,14 @@ This is not a general-purpose wallet. It is pocket-money chips for agents.
 
 ## What you get
 
-- Bar icon that greys out when paused and badges when the operator is unfunded
-- Panel with balance, today's spend, caps, and a live ledger (HashScan links)
+- Bar icon that greys out when paused and badges until the operator has USDC
+- Panel with remaining pocket money, today's spend meter, caps, and a live ledger (HashScan links)
+- Setup stepper in the panel: key → HBAR → key on record → USDC, one next action at a time
 - Kill switch: the hero toggle. Off means nothing signs, even if an agent retries
-- Local daemon on `127.0.0.1:4402` so Claude Code / curl / any agent can pay
-- Host allowlist (localhost only, until you opt in)
+- Local daemon on a unix socket at `$XDG_RUNTIME_DIR/chip402.sock` (mode `600`) so Claude Code
+  / curl / any agent can pay — and no web page can, because browsers cannot open unix sockets
+- Host allowlist (localhost only, until you opt in), https required for anything remote
+- Caps are silent: chip402 never interrupts an agent to ask. It either pays or it does not
 - Key file mode `600`, refused at start if looser
 
 ## Install
@@ -31,10 +34,11 @@ omarchy plugin add /home/niko/Work/chip402 --enable --yes
 ~/.config/omarchy/plugins/chip402/bin/chip402 setup --watch
 ```
 
-`setup` prints an EVM address. Fund it with testnet HBAR:
+`setup` prints an EVM address. Spend is **USDC** on Hedera testnet (`0.0.429274`).
 
-1. [Hedera testnet faucet](https://portal.hedera.com/faucet), or
-2. HashPack, send testnet HBAR to that address
+1. Send a little **HBAR** from the [Hedera faucet](https://portal.hedera.com/faucet) so the account exists and can pay association fees.
+2. chip402 associates USDC on the next daemon refresh.
+3. Send **testnet USDC** to the same address (Circle faucet or HashPack).
 
 Then add the widget if the installer did not: `omarchy plugin enable chip402`.
 
@@ -50,7 +54,7 @@ ln -sf ~/.config/omarchy/plugins/chip402/bin/chip402 ~/.local/bin/chip402
 In one terminal:
 
 ```bash
-chip402 demo          # x402 seller on :4403, 1000 tinybars per request
+chip402 demo          # x402 seller on :4403, 0.01 USDC per request
 ```
 
 In another:
@@ -61,17 +65,32 @@ chip402 fetch http://127.0.0.1:4403/secret
 
 The panel ledger should show the settlement. Click a row to open it on HashScan.
 
-Agents talk to the daemon directly:
+Agents talk to the daemon over its unix socket. Filesystem permissions are the
+authorization, so there is no token to manage and nothing listening on a TCP port:
 
 ```bash
-curl -sS http://127.0.0.1:4402/status
-curl -sS -X POST http://127.0.0.1:4402/fetch \
+SOCK="$XDG_RUNTIME_DIR/chip402.sock"
+
+curl -sS --unix-socket "$SOCK" http://chip402.local/status
+curl -sS --unix-socket "$SOCK" http://chip402.local/fetch \
   -H 'content-type: application/json' \
   -d '{"url":"http://127.0.0.1:4403/secret"}'
-curl -sS -X POST http://127.0.0.1:4402/pause \
+curl -sS --unix-socket "$SOCK" http://chip402.local/pause \
   -H 'content-type: application/json' \
   -d '{"paused":true}'
 ```
+
+For an agent that cannot use a unix socket, TCP is opt-in and needs a bearer token:
+
+```bash
+chip402 token          # writes ~/.config/chip402/token, mode 600
+chip402 config tcp on  # then restart the daemon
+curl -sS -H "authorization: Bearer $(cat ~/.config/chip402/token)" \
+  http://127.0.0.1:4402/status
+```
+
+Over TCP the daemon validates the `Host` header and refuses any request carrying `Origin`
+or `Sec-Fetch-*`, so a web page cannot drive it through DNS rebinding.
 
 Right-click the bar icon to pause. `p` in the panel does the same.
 
@@ -100,8 +119,8 @@ Config: `~/.config/chip402/config.json`.
 
 | Cap | Default |
 | --- | --- |
-| Daily | 1 HBAR |
-| Per request | 0.1 HBAR |
+| Daily | 10 USDC |
+| Per request | 1 USDC |
 | Allowed hosts | `127.0.0.1`, `localhost`, `[::1]` |
 | Network | Hedera testnet |
 | Facilitator | `https://x402.org/facilitator` |

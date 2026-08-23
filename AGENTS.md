@@ -49,7 +49,9 @@ Do **not** use this MCP to sign, submit, or mutate network state. It only search
 - Account IDs are `0.0.n`, assigned when the account is created. Until first HBAR, we only have an **EVM alias** (`0x…`) derived from an ECDSA secp256k1 key.
 - Faucet / HashPack send HBAR to that `0x…` alias → Hedera auto-creates `0.0.n`. Daemon polls mirror node and fills `accountId`.
 - x402 `exact` on `hedera:testnet` wants `0.0.n` in `payTo` / `extra.feePayer`, not the `0x` alias. Facilitator fee-payer is `0.0.9185802`.
-- HBAR is always singular uppercase; tinybars always plural lowercase. Networks: `mainnet` / `testnet` / `previewnet` lowercase.
+- Spend asset is USDC testnet `0.0.429274` (6 decimals). An account with `max_automatic_token_associations` of `-1` (the default for auto-created and completed-hollow accounts) needs **no** explicit association — an unconditional `TokenAssociateTransaction` costs ~0.63 HBAR and is charged even when it comes back `TOKEN_ALREADY_ASSOCIATED_TO_ACCOUNT`. x402 transfers themselves are facilitator-sponsored.
+- HBAR sent to an EVM alias auto-creates a **hollow** account: an id and an alias, `"key": null` on the mirror node, and no signing key. The facilitator looks that key up and rejects every payment from it. One self-paid, self-signed transaction completes it; a fee-only `TransferTransaction` is the cheapest vehicle (~127k tinybar).
+- HBAR is always singular uppercase. Networks: `mainnet` / `testnet` / `previewnet` lowercase.
 - JS SDK in this repo is `@hashgraph/sdk` in `~/.local/state/chip402/runtime` (outside the plugin tree; no symlinks). Newer namespace is `@hiero-ledger/sdk` — check docs before changing imports.
 
 ## Layout
@@ -57,11 +59,15 @@ Do **not** use this MCP to sign, submit, or mutate network state. It only search
 ```
 manifest.json          bar-widget, id chip402
 Panel.qml Service.qml Model.js ChipIcon.qml
-daemon/chip402d.mjs  127.0.0.1:4402
-daemon/lib/{hedera,x402,policy,state,sdk,paths,log}.mjs
+daemon/chip402d.mjs  unix socket $XDG_RUNTIME_DIR/chip402.sock (mode 600); TCP is opt-in
+daemon/lib/{hedera,x402,policy,state,networks,facilitator,client,sdk,paths,log}.mjs
 demo/seller.mjs        127.0.0.1:4403
 bin/chip402          CLI
+test/{e2e,accounting,transport}.test.mjs
 ```
+
+Talk to the daemon with `curl --unix-socket "$XDG_RUNTIME_DIR/chip402.sock" http://chip402.local/status`.
+QML cannot: `XMLHttpRequest` is TCP-only, so `Service.qml` shells out to curl.
 
 Secrets live **outside** the repo:
 
@@ -75,7 +81,7 @@ Never commit keys. Never `chmod` the key file to anything but 600.
 
 ```bash
 omarchy plugin validate .
-node --test daemon/lib/*.test.mjs
+node --test daemon/lib/*.test.mjs Model.test.mjs test/*.test.mjs
 ./bin/chip402 status
 ./bin/chip402 setup --watch    # wait for faucet → accountId
 ./bin/chip402 demo             # seller
