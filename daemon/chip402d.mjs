@@ -453,22 +453,10 @@ async function handleFetch(body) {
   return withLock(async () => {
     const config = await loadConfig();
     const state = decorate(config, await loadState());
-    let key;
-    try {
-      key = await readKeyFile();
-    } catch (err) {
-      const error = new Error(err.message);
-      error.status = 409;
-      throw error;
-    }
-
     const profile = profileFor(config);
     const gate = (target) => checkHost({ url: target, allowHosts: config.allowHosts, profile });
-    const discovered = await discoverFeePayer(config);
-    state.facilitatorError = discovered.error;
-    state.feePayer = discovered.feePayer;
 
-    // Refuse before any packet leaves the machine.
+    // Refuse before any packet leaves the machine, and before the key file is even opened.
     const preflight = gate(url);
     if (!preflight.ok) {
       pushLedger(state, {
@@ -489,6 +477,19 @@ async function handleFetch(body) {
       error.payload = { ok: false, code: preflight.code, reason: preflight.reason };
       throw error;
     }
+
+    let key;
+    try {
+      key = await readKeyFile();
+    } catch (err) {
+      const error = new Error(err.message);
+      error.status = 409;
+      throw error;
+    }
+
+    const discovered = await discoverFeePayer(config);
+    state.facilitatorError = discovered.error;
+    state.feePayer = discovered.feePayer;
 
     let reservation = null;
     try {

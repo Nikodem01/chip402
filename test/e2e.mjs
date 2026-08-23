@@ -12,6 +12,8 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import net from "node:net";
+import fs from "node:fs";
+import os from "node:os";
 
 import { DEMO_PRICE_MICRO, SOCKET_PATH } from "../daemon/lib/paths.mjs";
 import { call, daemonTarget, daemonUp } from "../daemon/lib/client.mjs";
@@ -230,6 +232,74 @@ test("11. the cap change left an audit row", async () => {
   const audits = status.ledger.filter((row) => row.kind === "audit");
   assert.ok(audits.length > 0, "raising a cap left no trace in the ledger");
   assert.ok(audits.some((row) => row.action === "caps"), "no audit row for the cap change");
+});
+
+// The reconciler is what makes a crash mid-payment safe, so prove it against a real
+// settlement rather than only against a stub: seed the on-disk state a crash would leave —
+// a pending row holding a reservation for a transaction that did land — and let a daemon
+// start on it. A separate state directory and socket keep this away from the live daemon.
+test("13. a daemon starting on a crashed state settles the reservation from the chain", async (t) => {
+  if (!test.onChain) {
+    t.skip("needs a confirmed settlement to reconcile against");
+    return;
+  }
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "chip402-crash-"));
+  const socket = path.join(stateDir, "crash.sock");
+  const { txId, payTo, amountMicro } = test.paid.result.payment;
+  const stamp = new Date();
+  const today = `${stamp.getFullYear()}-${String(stamp.getMonth() + 1).padStart(2, "0")}-${String(stamp.getDate()).padStart(2, "0")}`;
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    JSON.stringify({
+      schema: 2,
+      accountId: config.accountId,
+      spentTodayMicro: amountMicro,
+      spentTodayDate: today,
+      seenPayees: [],
+      ledger: [
+        {
+          id: "crashed-row",
+          kind: "payment",
+          status: "pending",
+          amountMicro,
+          payTo,
+          host: "127.0.0.1",
+          txId,
+          spentDate: today,
+          expiresAt: new Date(Date.now() + 180_000).toISOString(),
+        },
+      ],
+    }),
+    { mode: 0o600 },
+  );
+
+  const crashed = spawn(process.execPath, [path.join(root, "daemon", "chip402d.mjs")], {
+    cwd: root,
+    env: { ...process.env, CHIP402_STATE_DIR: stateDir, CHIP402_SOCKET: socket },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  crashed.stdout.resume();
+  crashed.stderr.resume();
+  spawned.push(crashed);
+  const crashedTarget = daemonTarget({ socketPath: socket });
+  for (let i = 0; i < 80 && !(await daemonUp(crashedTarget)); i += 1) await wait(250);
+  assert.ok(await daemonUp(crashedTarget), "the recovering daemon never came up");
+
+  // Startup reconcile is asynchronous — it has a mirror-node round trip to make.
+  let status;
+  let row;
+  for (let i = 0; i < 40; i += 1) {
+    status = await call(crashedTarget, "GET", "/status");
+    row = status.ledger.find((entry) => entry.id === "crashed-row");
+    if (row && row.status !== "pending") break;
+    await wait(500);
+  }
+  assert.ok(row, "the pending row was lost");
+  assert.equal(row.status, "settled", "a settled payment must not be released back to the cap");
+  assert.equal(row.onChainMicro, amountMicro, "the amount was taken from the chain");
+  assert.equal(status.spentTodayMicro, amountMicro, "the daily counter still reflects the spend");
+  assert.equal(status.pendingMicro, "0");
+  crashed.kill("SIGTERM");
 });
 
 test("12. a host that is not on the allowlist is refused", async () => {
