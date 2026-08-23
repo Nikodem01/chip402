@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import crypto from "node:crypto";
 import {
   CONFIG_DIR,
   DEFAULT_PORT,
@@ -10,7 +11,10 @@ import {
   KEY_PATH,
   MERCHANT_KEY_PATH,
   RUNTIME_DIR,
+  SOCKET_PATH,
+  TOKEN_PATH,
 } from "../daemon/lib/paths.mjs";
+import { call, daemonTarget, daemonUp as socketUp, readToken } from "../daemon/lib/client.mjs";
 import {
   keyExists,
   loadConfig,
@@ -18,13 +22,16 @@ import {
   writeKeyFile,
 } from "../daemon/lib/state.mjs";
 import { generateOperator, hashscanAccount, lookupAccount } from "../daemon/lib/hedera.mjs";
+import { TESTNET, mainnetBlockedMessage, resolveNetwork } from "../daemon/lib/networks.mjs";
 import { runtimeHint } from "../daemon/lib/sdk.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const daemonPath = path.join(root, "daemon", "chip402d.mjs");
 const sellerPath = path.join(root, "demo", "seller.mjs");
-const base = `http://127.0.0.1:${process.env.CHIP402_PORT || DEFAULT_PORT}`;
+const tcp = process.env.CHIP402_TCP === "1";
+const target = daemonTarget({ tcp, port: process.env.CHIP402_PORT || DEFAULT_PORT });
+let token = "";
 
 function usage() {
   console.log(`chip402 — spend-capped x402 payments for local agents
@@ -35,46 +42,27 @@ Usage:
   chip402 fetch <url>
   chip402 pause
   chip402 resume
-  chip402 cap daily <hbar>
-  chip402 cap request <hbar>
+  chip402 cap daily <usdc>
+  chip402 cap request <usdc>
   chip402 allow <host>
+  chip402 network [testnet|mainnet]
+  chip402 token
   chip402 fund
   chip402 demo
   chip402 tail
 `);
 }
 
+// The daemon speaks HTTP over a unix socket unless TCP is explicitly opted into, in which
+// case a bearer token from ~/.config/chip402/token is required.
 async function api(method, pathname, body) {
-  const res = await fetch(`${base}${pathname}`, {
-    method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  let json;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = { raw: text };
-  }
-  if (!res.ok) {
-    const error = new Error(json.error || json.reason || `${method} ${pathname} ${res.status}`);
-    error.status = res.status;
-    error.body = json;
-    throw error;
-  }
-  return json;
+  if (tcp && !token) token = await readToken();
+  return call(target, method, pathname, body, { token });
 }
 
 async function daemonUp() {
-  try {
-    const res = await fetch(`${base}/status`);
-    if (!res.ok) return false;
-    const body = await res.json();
-    return body?.name === "chip402";
-  } catch {
-    return false;
-  }
+  if (tcp && !token) token = await readToken();
+  return socketUp(target, { token });
 }
 
 async function ensureRuntime() {
@@ -120,20 +108,22 @@ async function ensureDaemon() {
     await new Promise((r) => setTimeout(r, 150));
     if (await daemonUp()) return;
   }
-  throw new Error("chip402d did not start on 127.0.0.1:4402");
+  throw new Error(`chip402d did not start on ${tcp ? `127.0.0.1:${DEFAULT_PORT}` : SOCKET_PATH}`);
 }
 
-function hbarToTiny(value) {
+function usdToMicro(value) {
   const n = Number(value);
-  if (!Number.isFinite(n) || n < 0) throw new Error(`invalid HBAR amount: ${value}`);
-  return String(BigInt(Math.round(n * 100_000_000)));
+  if (!Number.isFinite(n) || n < 0) throw new Error(`invalid USDC amount: ${value}`);
+  return String(BigInt(Math.round(n * 1_000_000)));
 }
 
-function tinyToHbar(value) {
+function microToUsd(value) {
   const n = BigInt(String(value || "0"));
-  const whole = n / 100000000n;
-  const frac = (n % 100000000n).toString().padStart(8, "0").replace(/0+$/, "");
-  return frac ? `${whole}.${frac}` : `${whole}`;
+  const whole = n / 1000000n;
+  const frac = (n % 1000000n).toString().padStart(6, "0").replace(/0+$/, "");
+  if (!frac) return `${whole}.00`;
+  if (frac.length === 1) return `${whole}.${frac}0`;
+  return `${whole}.${frac}`;
 }
 
 async function setup(watch) {
@@ -164,15 +154,15 @@ async function setup(watch) {
     const next = await loadConfig();
     let changed = false;
     if (next.evmAddress && !next.accountId) {
-      const found = await lookupAccount(next.evmAddress);
+      const found = await lookupAccount(next.evmAddress, next.network);
       if (found?.accountId) {
         next.accountId = found.accountId;
         changed = true;
-        console.log(`Operator account ${found.accountId}  balance ${tinyToHbar(found.balanceTinybars)} ℏ`);
+        console.log(`Operator account ${found.accountId}`);
       }
     }
     if (next.merchantEvmAddress && !next.merchantAccountId) {
-      const found = await lookupAccount(next.merchantEvmAddress);
+      const found = await lookupAccount(next.merchantEvmAddress, next.network);
       if (found?.accountId) {
         next.merchantAccountId = found.accountId;
         changed = true;
@@ -181,7 +171,8 @@ async function setup(watch) {
     }
     if (changed) await saveConfig(next);
     if (next.accountId) {
-      console.log("Setup complete.");
+      console.log("Account is on-chain. Associating USDC happens on daemon refresh.");
+      console.log("Then send testnet USDC to the operator (Circle faucet or HashPack).");
       return;
     }
     await new Promise((r) => setTimeout(r, 4000));
@@ -189,17 +180,20 @@ async function setup(watch) {
 }
 
 function printFund(config) {
+  const profile = resolveNetwork(config.network || TESTNET.id);
   console.log(`
-Fund the operator (spender) with testnet HBAR:
+chip402 is a prepaid card for Omarchy agents on ${profile.id}.
+Spend assets: USDC ${profile.usdc} and HBAR 0.0.0 (USDC invoices in this build).
 
-  1. Open https://portal.hedera.com/faucet
-  2. Paste this EVM address:
-
+  1. Create the account with a little HBAR (association fees):
+     ${profile.faucetHbar}
      ${config.evmAddress || "(run chip402 setup)"}
 
-  3. Or send testnet HBAR from HashPack to that address.
+  2. After the account exists, chip402 associates USDC automatically.
 
-Merchant (demo seller) address:
+  3. Top up this operator from HashPack or the faucet — keep real funds in HashPack.
+
+Merchant (demo seller):
 
      ${config.merchantEvmAddress || "(none)"}
 
@@ -212,12 +206,24 @@ async function printStatus() {
   const status = await api("POST", "/refresh");
   const line = status.paused ? "PAUSED" : status.configured ? "LIVE" : "NEEDS FUNDING";
   console.log(`chip402  ${line}`);
+  console.log(`Network    ${status.network || TESTNET.id}`);
+  console.log(`Transport  ${tcp ? `127.0.0.1:${DEFAULT_PORT} (TCP)` : SOCKET_PATH}`);
   console.log(`Account    ${status.accountId || "—"}  ${status.evmAddress || ""}`);
-  console.log(`Balance    ${tinyToHbar(status.balanceTinybars)} ℏ`);
-  console.log(`Today      ${tinyToHbar(status.spentTodayTinybars)} / ${tinyToHbar(status.dailyCapTinybars)} ℏ`);
-  console.log(`Per req    ${tinyToHbar(status.perRequestTinybars)} ℏ`);
+  console.log(
+    `Balance    ${microToUsd(status.balanceMicro)} USDC${status.balanceFresh ? "" : "  (STALE — payments denied)"}`,
+  );
+  console.log(`Today      ${microToUsd(status.spentTodayMicro)} / ${microToUsd(status.dailyCapMicro)} USDC`);
+  if (status.pendingMicro && status.pendingMicro !== "0") {
+    console.log(`Pending    ${microToUsd(status.pendingMicro)} USDC in flight`);
+  }
+  console.log(`Per req    ${microToUsd(status.perRequestMicro)} USDC`);
+  console.log(`Fee payer  ${status.feePayer || "— (discovery failed; payments denied)"}`);
+  if (status.hollow) console.log("Account    hollow — no key on record yet, completing it");
+  if (status.associated === false) console.log("USDC       not associated yet");
   console.log(`Hosts      ${(status.allowHosts || []).join(", ")}`);
   if (status.accountUrl) console.log(`HashScan   ${status.accountUrl}`);
+  if (status.floatWarning) console.log(`Float      ${status.floatWarning}`);
+  if (status.facilitatorError) console.log(`Facilitator ${status.facilitatorError}`);
   if (status.lastError) console.log(`Error      ${status.lastError}`);
 }
 
@@ -235,7 +241,7 @@ try {
   } else if (cmd === "fund") {
     const config = await loadConfig();
     printFund(config);
-    if (config.accountId) console.log(`Existing account: ${hashscanAccount(config.accountId)}`);
+    if (config.accountId) console.log(`Existing account: ${hashscanAccount(config.accountId, config.network)}`);
   } else if (cmd === "fetch") {
     const url = rest[0];
     if (!url) throw new Error("usage: chip402 fetch <url>");
@@ -252,12 +258,31 @@ try {
     console.log("live");
   } else if (cmd === "cap" && rest[0] === "daily") {
     await ensureDaemon();
-    await api("POST", "/caps", { dailyTinybars: hbarToTiny(rest[1]) });
-    console.log(`daily cap ${rest[1]} ℏ`);
+    await api("POST", "/caps", { dailyMicro: usdToMicro(rest[1]) });
+    console.log(`daily cap ${rest[1]} USDC`);
   } else if (cmd === "cap" && rest[0] === "request") {
     await ensureDaemon();
-    await api("POST", "/caps", { perRequestTinybars: hbarToTiny(rest[1]) });
-    console.log(`per-request cap ${rest[1]} ℏ`);
+    await api("POST", "/caps", { perRequestMicro: usdToMicro(rest[1]) });
+    console.log(`per-request cap ${rest[1]} USDC`);
+  } else if (cmd === "network") {
+    if (!rest[0] || rest[0] === "show") {
+      const config = await loadConfig();
+      const profile = resolveNetwork(config.network);
+      console.log(profile.id);
+      console.log(`USDC       ${profile.usdc}`);
+      console.log(`HBAR       0.0.0`);
+      console.log(`feePayer   ${profile.feePayer}`);
+      console.log(`mainnet    ${mainnetBlockedMessage()}`);
+    } else {
+      const profile = resolveNetwork(rest[0]);
+      console.log(profile.id);
+    }
+  } else if (cmd === "token") {
+    const value = crypto.randomBytes(32).toString("hex");
+    await writeKeyFile(TOKEN_PATH, value);
+    console.log(`Bearer token written to ${TOKEN_PATH} (mode 600).`);
+    console.log('Enable TCP with: chip402 config tcp on   (or set "tcp": true in config.json)');
+    console.log("The unix socket needs no token; TCP is only for agents that cannot use one.");
   } else if (cmd === "allow") {
     const host = rest[0];
     if (!host) throw new Error("usage: chip402 allow <host>");
@@ -267,14 +292,22 @@ try {
   } else if (cmd === "demo") {
     await ensureRuntime();
     await run(process.execPath, [sellerPath], { cwd: root });
+  } else if (cmd === "config" && rest[0] === "tcp") {
+    const on = rest[1] === "on" || rest[1] === "true";
+    const config = await loadConfig();
+    config.tcp = on;
+    await saveConfig(config);
+    console.log(`TCP transport ${on ? "enabled — restart chip402d" : "disabled — restart chip402d"}`);
   } else if (cmd === "tail") {
     await ensureDaemon();
     for (;;) {
       const status = await api("GET", "/status");
       console.clear?.();
-      console.log(`spent today ${tinyToHbar(status.spentTodayTinybars)} ℏ   paused=${status.paused}`);
+      console.log(`spent today ${microToUsd(status.spentTodayMicro)} USDC   paused=${status.paused}`);
       for (const row of (status.ledger || []).slice(0, 12)) {
-        console.log(`${row.ts}  ${row.status.padEnd(8)}  ${tinyToHbar(row.amountTinybars)} ℏ  ${row.host || row.url}`);
+        const label = row.kind === "audit" ? `audit    ${row.action}` : row.status.padEnd(8);
+        const mark = row.firstSight ? " *new payee*" : "";
+        console.log(`${row.ts}  ${label}  ${microToUsd(row.amountMicro)} USDC  ${row.host || row.url || row.detail || ""}${mark}`);
         if (row.hashscan) console.log(`           ${row.hashscan}`);
       }
       await new Promise((r) => setTimeout(r, 2000));

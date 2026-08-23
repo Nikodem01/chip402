@@ -1,43 +1,62 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import {
   CONFIG_DIR,
   CONFIG_PATH,
   DEFAULT_ALLOW_HOSTS,
-  DEFAULT_DAILY_TINYBARS,
-  DEFAULT_PER_REQUEST_TINYBARS,
+  DEFAULT_DAILY_MICRO,
+  DEFAULT_PER_REQUEST_MICRO,
   DEFAULT_PORT,
-  FACILITATOR,
-  FEE_PAYER,
   KEY_MODE,
   KEY_PATH,
   LEDGER_LIMIT,
   MERCHANT_KEY_PATH,
-  NETWORK,
   STATE_DIR,
   STATE_PATH,
 } from "./paths.mjs";
+import { TESTNET, resolveNetwork } from "./networks.mjs";
+
+export const STATE_SCHEMA = 2;
+export const STATE_MODE = 0o600;
+
+// Fields from the pre-USDC build. They are HBAR tinybar amounts and rendering them as
+// USDC is off by eight orders of magnitude, so they are deleted rather than carried.
+const LEGACY_STATE_FIELDS = [
+  "balanceTinybars",
+  "spentTodayTinybars",
+  "dailyCapTinybars",
+  "perRequestTinybars",
+  "amountTinybars",
+];
+const LEGACY_LEDGER_FIELDS = ["amountTinybars"];
 
 export const DEFAULT_CONFIG = {
-  network: NETWORK,
+  network: TESTNET.id,
   accountId: "",
   evmAddress: "",
   merchantAccountId: "",
   merchantEvmAddress: "",
-  facilitator: FACILITATOR,
-  feePayer: FEE_PAYER,
+  facilitator: TESTNET.facilitator,
+  feePayer: TESTNET.feePayer,
+  facilitatorApiKey: "",
   port: DEFAULT_PORT,
+  tcp: false,
+  asset: TESTNET.usdc,
+  hashscan: TESTNET.hashscan,
   caps: {
-    dailyTinybars: DEFAULT_DAILY_TINYBARS,
-    perRequestTinybars: DEFAULT_PER_REQUEST_TINYBARS,
+    dailyMicro: DEFAULT_DAILY_MICRO,
+    perRequestMicro: DEFAULT_PER_REQUEST_MICRO,
   },
+  maxFloatMicro: TESTNET.defaultMaxFloatUsdcMicro,
   allowHosts: [...DEFAULT_ALLOW_HOSTS],
   paused: false,
 };
 
 export function emptyState() {
   return {
+    schema: STATE_SCHEMA,
     updatedAt: new Date().toISOString(),
     paused: false,
     configured: false,
@@ -45,17 +64,29 @@ export function emptyState() {
     evmAddress: "",
     merchantAccountId: "",
     merchantEvmAddress: "",
-    balanceTinybars: "0",
-    spentTodayTinybars: "0",
+    balanceMicro: "0",
+    balanceAt: "",
+    hbarTinybars: "0",
+    hollow: null,
+    spentTodayMicro: "0",
     spentTodayDate: todayStamp(),
-    dailyCapTinybars: DEFAULT_DAILY_TINYBARS,
-    perRequestTinybars: DEFAULT_PER_REQUEST_TINYBARS,
+    dailyCapMicro: DEFAULT_DAILY_MICRO,
+    perRequestMicro: DEFAULT_PER_REQUEST_MICRO,
+    associated: false,
     allowHosts: [...DEFAULT_ALLOW_HOSTS],
+    hashscan: TESTNET.hashscan,
+    facilitator: TESTNET.facilitator,
+    feePayer: "",
+    feePayerAt: "",
+    facilitatorError: "",
+    seenPayees: [],
     lastError: "",
     ledger: [],
   };
 }
 
+// Local date on purpose: the panel says "today", and the user's today is the one on their
+// wall clock, not UTC. Ledger timestamps stay ISO/UTC.
 export function todayStamp(date = new Date()) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
@@ -78,27 +109,50 @@ export async function readJson(file, fallback) {
   }
 }
 
-export async function writeJsonAtomic(file, value, mode = 0o644) {
+export async function writeJsonAtomic(file, value, mode = 0o600) {
   await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
+  const tmp = `${file}.${process.pid}.tmp`;
   const body = `${JSON.stringify(value, null, 2)}\n`;
-  await fs.writeFile(tmp, body, { mode });
+  const handle = await fs.open(tmp, "wx", mode);
+  try {
+    // umask can strip bits off the open() mode, so pin them before anything is written.
+    await handle.chmod(mode);
+    await handle.writeFile(body, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
   await fs.rename(tmp, file);
+}
+
+export function configuredNetworkId(stored = {}) {
+  return process.env.CHIP402_NETWORK || stored.network || TESTNET.id;
 }
 
 export async function loadConfig() {
   await ensureDirs();
   const stored = await readJson(CONFIG_PATH, {});
+  const profile = resolveNetwork(configuredNetworkId(stored));
   const caps = stored.caps && typeof stored.caps === "object" ? stored.caps : {};
   return {
     ...DEFAULT_CONFIG,
     ...stored,
+    network: profile.id,
+    facilitator: stored.facilitator || profile.facilitator,
+    // The pinned fee payer is only ever a hint for the panel. Spend decisions compare the
+    // invoice against the value discovered from /supported.
+    feePayer: stored.feePayer || profile.feePayer,
+    facilitatorApiKey: String(stored.facilitatorApiKey || ""),
+    asset: stored.asset || profile.usdc,
+    hashscan: profile.hashscan,
+    tcp: stored.tcp === true,
     caps: {
-      dailyTinybars: String(caps.dailyTinybars ?? DEFAULT_CONFIG.caps.dailyTinybars),
-      perRequestTinybars: String(
-        caps.perRequestTinybars ?? DEFAULT_CONFIG.caps.perRequestTinybars,
+      dailyMicro: String(caps.dailyMicro ?? profile.defaultDailyMicro ?? DEFAULT_CONFIG.caps.dailyMicro),
+      perRequestMicro: String(
+        caps.perRequestMicro ?? profile.defaultPerRequestMicro ?? DEFAULT_CONFIG.caps.perRequestMicro,
       ),
     },
+    maxFloatMicro: String(stored.maxFloatMicro ?? profile.defaultMaxFloatUsdcMicro),
     allowHosts: Array.isArray(stored.allowHosts)
       ? stored.allowHosts.map(String)
       : [...DEFAULT_ALLOW_HOSTS],
@@ -111,27 +165,62 @@ export async function saveConfig(config) {
   await writeJsonAtomic(CONFIG_PATH, config, 0o600);
 }
 
+export function migrateState(stored = {}) {
+  const state = { ...emptyState(), ...stored };
+  if (Number(stored.schema || 0) >= STATE_SCHEMA) {
+    state.ledger = Array.isArray(state.ledger) ? state.ledger : [];
+    return state;
+  }
+  for (const field of LEGACY_STATE_FIELDS) delete state[field];
+  state.ledger = (Array.isArray(state.ledger) ? state.ledger : []).map((row) => {
+    const next = { ...row };
+    for (const field of LEGACY_LEDGER_FIELDS) delete next[field];
+    if (next.amountMicro == null) next.amountMicro = "0";
+    if (!next.kind) next.kind = "payment";
+    return next;
+  });
+  state.schema = STATE_SCHEMA;
+  return state;
+}
+
 export async function loadState() {
   await ensureDirs();
   const stored = await readJson(STATE_PATH, emptyState());
-  const state = { ...emptyState(), ...stored };
+  const state = migrateState(stored);
   if (state.spentTodayDate !== todayStamp()) {
-    state.spentTodayTinybars = "0";
+    state.spentTodayMicro = "0";
     state.spentTodayDate = todayStamp();
   }
   if (!Array.isArray(state.ledger)) state.ledger = [];
+  if (!Array.isArray(state.seenPayees)) state.seenPayees = [];
   return state;
+}
+
+// Truncation must never drop a `pending` row: that row is the only record that money may
+// be in flight, and losing it means the crash reconciler cannot find it.
+export function trimLedger(ledger, limit = LEDGER_LIMIT) {
+  const rows = Array.isArray(ledger) ? ledger : [];
+  const pending = rows.filter((row) => row && row.status === "pending");
+  const rest = rows.filter((row) => !row || row.status !== "pending");
+  const keep = rest.slice(0, Math.max(0, limit - pending.length));
+  const kept = new Set([...pending, ...keep]);
+  return rows.filter((row) => kept.has(row));
 }
 
 export async function saveState(state) {
   await ensureDirs();
   const next = {
     ...state,
+    schema: STATE_SCHEMA,
     updatedAt: new Date().toISOString(),
-    ledger: Array.isArray(state.ledger) ? state.ledger.slice(0, LEDGER_LIMIT) : [],
+    ledger: trimLedger(state.ledger),
   };
-  await writeJsonAtomic(STATE_PATH, next, 0o644);
+  await writeJsonAtomic(STATE_PATH, next, STATE_MODE);
   return next;
+}
+
+export function ledgerId() {
+  return crypto.randomUUID();
 }
 
 export function assertKeyPermissions(file = KEY_PATH) {

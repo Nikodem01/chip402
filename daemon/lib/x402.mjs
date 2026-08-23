@@ -1,4 +1,5 @@
-import { FACILITATOR, FEE_PAYER, HBAR_ASSET, NETWORK } from "./paths.mjs";
+import { FACILITATOR } from "./paths.mjs";
+import { TESTNET, resolveNetwork } from "./networks.mjs";
 import { pickHederaRequirement } from "./policy.mjs";
 import { signExactTransfer } from "./hedera.mjs";
 import { log } from "./log.mjs";
@@ -6,6 +7,7 @@ import { log } from "./log.mjs";
 const PAYMENT_REQUIRED = "payment-required";
 const PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE";
 const PAYMENT_RESPONSE = "payment-response";
+const MAX_REDIRECTS = 5;
 
 export function b64json(value) {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64");
@@ -46,20 +48,38 @@ export function decodePaymentRequired(response, bodyText) {
   return fromHeader;
 }
 
-export function buildPaymentPayload({ requirement, resource, transaction }) {
-  return {
+// Servers advertise extensions in PaymentRequired and clients echo them in PaymentPayload;
+// the client must include at least the info it received. Dropping the field is a spec
+// violation and loses whatever the server needed echoed back.
+export function buildPaymentPayload({ requirement, resource, transaction, extensions }) {
+  const payload = {
     x402Version: 2,
     resource: resource || { url: "", description: "chip402 payment", mimeType: "application/json" },
     accepted: requirement,
     payload: { transaction },
   };
+  // "The client must include at least the info received; it may append additional info but
+  // cannot delete or overwrite existing info." Copied verbatim, whatever shape it arrived in.
+  if (extensions && typeof extensions === "object") payload.extensions = extensions;
+  return payload;
 }
 
-export async function facilitatorCall(facilitator, path, body) {
+export class FacilitatorCallError extends Error {
+  constructor(code, message, status, body) {
+    super(message);
+    this.code = code;
+    this.status = status;
+    this.body = body;
+  }
+}
+
+export async function facilitatorCall(facilitator, path, body, { apiKey = "" } = {}) {
   const base = String(facilitator || FACILITATOR).replace(/\/$/, "");
+  const headers = { "content-type": "application/json", accept: "application/json" };
+  if (apiKey) headers["X-Api-Key"] = apiKey;
   const res = await fetch(`${base}${path}`, {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
+    headers,
     body: JSON.stringify(body),
   });
   const text = await res.text();
@@ -71,29 +91,42 @@ export async function facilitatorCall(facilitator, path, body) {
   }
   if (!res.ok) {
     const reason = json?.invalidReason || json?.errorReason || json?.error || text.slice(0, 240);
-    const error = new Error(`Facilitator ${path} ${res.status}: ${reason}`);
-    error.status = res.status;
-    error.body = json;
-    throw error;
+    // A rate limit or a rejected key is an infrastructure answer, not a declined payment,
+    // and must not be recorded as one.
+    const code =
+      res.status === 401 || res.status === 403
+        ? "facilitator_unauthorized"
+        : res.status === 429
+          ? "facilitator_rate_limited"
+          : "facilitator_error";
+    throw new FacilitatorCallError(code, `Facilitator ${path} ${res.status}: ${reason}`, res.status, json);
   }
   return json;
 }
 
-export async function verifyAndSettle({ facilitator, paymentPayload, paymentRequirements }) {
+// The wire code says which rule was broken; the message says which account or amount broke
+// it. Only reporting the code throws away every diagnostic the facilitator produced.
+export function facilitatorReason(code, message, fallback) {
+  return [code, message].filter(Boolean).join(": ") || fallback;
+}
+
+export async function verifyAndSettle({ facilitator, paymentPayload, paymentRequirements, apiKey = "" }) {
   const payload = {
     x402Version: 2,
     paymentPayload,
     paymentRequirements,
   };
-  const verify = await facilitatorCall(facilitator, "/verify", payload);
+  const verify = await facilitatorCall(facilitator, "/verify", payload, { apiKey });
   if (verify && verify.isValid === false) {
-    const error = new Error(verify.invalidReason || "facilitator rejected payment");
+    const error = new Error(facilitatorReason(verify.invalidReason, verify.invalidMessage, "facilitator rejected payment"));
+    error.code = verify.invalidReason || "verify_failed";
     error.body = verify;
     throw error;
   }
-  const settle = await facilitatorCall(facilitator, "/settle", payload);
+  const settle = await facilitatorCall(facilitator, "/settle", payload, { apiKey });
   if (settle && settle.success === false) {
-    const error = new Error(settle.errorReason || "settlement failed");
+    const error = new Error(facilitatorReason(settle.errorReason, settle.errorMessage, "settlement failed"));
+    error.code = settle.errorReason || "settle_failed";
     error.body = settle;
     throw error;
   }
@@ -111,6 +144,53 @@ async function readBody(response) {
   return { text, json };
 }
 
+function isRedirect(status) {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308;
+}
+
+function sameOrigin(a, b) {
+  try {
+    const left = new URL(a);
+    const right = new URL(b);
+    return left.protocol === right.protocol && left.host === right.host;
+  } catch {
+    return false;
+  }
+}
+
+function redirectDenied(reason) {
+  const error = new Error(reason);
+  error.code = "redirect_denied";
+  return error;
+}
+
+// The unpaid probe may be redirected, but every hop is re-checked against the allowlist:
+// otherwise a seller redirects to a host that was never allowed and its 402 is the one we
+// evaluate.
+async function fetchFollowing(url, init, checkHost) {
+  let current = url;
+  const first = checkHost ? checkHost(url) : { ok: true };
+  if (!first.ok) {
+    const error = new Error(first.reason || `Host not allowed: ${url}`);
+    error.code = first.code || "host_denied";
+    error.policy = first;
+    throw error;
+  }
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
+    const res = await fetch(current, { ...init, redirect: "manual" });
+    if (!isRedirect(res.status)) return { response: res, url: current };
+    const location = res.headers.get("location");
+    if (!location) return { response: res, url: current };
+    const next = new URL(location, current).toString();
+    const decision = checkHost ? checkHost(next) : { ok: true };
+    if (!decision.ok) {
+      throw redirectDenied(decision.reason || `Redirect to a host that is not allowed: ${next}`);
+    }
+    current = next;
+  }
+  throw redirectDenied(`Too many redirects from ${url}`);
+}
+
 export async function payAndFetch({
   url,
   method = "GET",
@@ -119,23 +199,28 @@ export async function payAndFetch({
   accountId,
   privateKeyRaw,
   facilitator = FACILITATOR,
-  feePayer = FEE_PAYER,
+  feePayer,
+  network = TESTNET.id,
   decide,
+  checkHost,
+  onSigned,
 }) {
   const requestHeaders = { ...headers };
   const init = {
     method,
     headers: requestHeaders,
-    redirect: "follow",
   };
   if (body !== undefined && method !== "GET" && method !== "HEAD") init.body = body;
 
-  const first = await fetch(url, init);
+  const probe = await fetchFollowing(url, init, checkHost);
+  const first = probe.response;
+  const resourceUrl = probe.url;
   if (first.status !== 402) {
     const payload = await readBody(first);
     return {
       paid: false,
       status: first.status,
+      url: resourceUrl,
       headers: Object.fromEntries(first.headers.entries()),
       ...payload,
     };
@@ -146,9 +231,15 @@ export async function payAndFetch({
   if (!paymentRequired) {
     throw new Error("402 response had no PAYMENT-REQUIRED payload");
   }
-  const requirement = pickHederaRequirement(paymentRequired);
+  const profile = resolveNetwork(network);
+  if (Number(paymentRequired.x402Version || 0) === 1 || paymentRequired.accepts?.some?.((item) => item?.maxAmountRequired != null)) {
+    const error = new Error("Seller speaks x402 v1; chip402 is v2-only");
+    error.code = "unsupported_version";
+    throw error;
+  }
+  const requirement = pickHederaRequirement(paymentRequired, profile);
   const decision = decide
-    ? decide({ url, paymentRequired, requirement })
+    ? await decide({ url: resourceUrl, paymentRequired, requirement })
     : { ok: true };
   if (!decision.ok) {
     const error = new Error(decision.reason || "policy denied");
@@ -157,35 +248,53 @@ export async function payAndFetch({
     throw error;
   }
   if (!requirement) {
-    throw new Error("No hedera:testnet exact HBAR option advertised");
+    throw new Error(`No ${profile.id} exact USDC option advertised`);
   }
-
-  const chosen = {
-    ...requirement,
-    extra: {
-      ...(requirement.extra || {}),
-      feePayer: requirement.extra?.feePayer || feePayer,
-    },
-  };
+  if (!feePayer) {
+    const error = new Error("No discovered facilitator fee payer — refusing to sign");
+    error.code = "fee_payer_unknown";
+    throw error;
+  }
+  // The discovered fee payer is an assertion, never a substitution. Rewriting the invoice's
+  // extra.feePayer would make paymentPayload.accepted disagree with the requirements the
+  // resource server hands the facilitator, which is a guaranteed
+  // accepted_payment_requirements_mismatch rejection instead of a clean skip.
+  const advertised = requirement.extra?.feePayer;
+  if (advertised !== feePayer) {
+    const error = new Error(
+      `Invoice feePayer ${advertised || "(none)"} is not the ${feePayer} advertised by ${facilitator}/supported`,
+    );
+    error.code = "fee_payer_mismatch";
+    throw error;
+  }
+  const chosen = requirement;
   const signed = await signExactTransfer({
     payerAccountId: accountId,
     privateKeyRaw,
     payTo: chosen.payTo,
-    amountTinybars: chosen.amount,
-    feePayer: chosen.extra.feePayer,
-    asset: chosen.asset || HBAR_ASSET,
-    network: chosen.network || NETWORK,
+    amount: chosen.amount,
+    feePayer: advertised,
+    asset: chosen.asset || profile.usdc,
+    network: chosen.network || profile.id,
+    maxTimeoutSeconds: chosen.maxTimeoutSeconds,
   });
+  // Never log the transaction body: it is a signed, spendable transfer.
   await log("signed x402 transfer", {
-    url,
+    url: resourceUrl,
     amount: chosen.amount,
     payTo: chosen.payTo,
     txId: signed.transactionId,
     bytes: signed.transaction.length,
+    nodes: signed.nodeAccountIds,
+    validFor: signed.validDurationSeconds,
   });
 
+  // The daemon records the transaction id before the retry goes out, so a crash mid-flight
+  // leaves something the reconciler can look up on the mirror node.
+  if (onSigned) await onSigned({ signed, requirement: chosen, resourceUrl });
+
   const resource = paymentRequired.resource || {
-    url,
+    url: resourceUrl,
     description: "chip402 payment",
     mimeType: "application/json",
   };
@@ -193,20 +302,45 @@ export async function payAndFetch({
     requirement: chosen,
     resource,
     transaction: signed.transaction,
+    extensions: paymentRequired.extensions,
   });
 
+  const signatureHeader = b64json(paymentPayload);
+  await log("x402 payment header", {
+    txId: signed.transactionId,
+    headerBytes: signatureHeader.length,
+    nodes: signed.nodeAccountIds.length,
+  });
   const retryHeaders = {
     ...requestHeaders,
-    [PAYMENT_SIGNATURE]: b64json(paymentPayload),
+    [PAYMENT_SIGNATURE]: signatureHeader,
   };
-  const retryInit = { ...init, headers: retryHeaders };
-  const second = await fetch(url, retryInit);
+  // The paid retry carries a signed, spendable transfer. It is never followed anywhere the
+  // allowlist has not cleared, and never to a different origin than the one the payment was
+  // constructed for.
+  const second = await fetch(resourceUrl, { ...init, headers: retryHeaders, redirect: "manual" });
+  if (isRedirect(second.status)) {
+    const location = second.headers.get("location");
+    const next = location ? new URL(location, resourceUrl).toString() : "";
+    const allowed = next && checkHost ? checkHost(next) : { ok: false, reason: "no redirect target" };
+    const error = redirectDenied(
+      !next
+        ? "Paid retry was redirected without a target"
+        : !allowed.ok
+          ? `Paid retry redirected to a host that is not allowed: ${next}`
+          : `Paid retry redirected off-origin to ${next} — the payment was constructed for ${resourceUrl}`,
+    );
+    error.signed = signed;
+    error.requirement = chosen;
+    throw error;
+  }
   const secondBody = await readBody(second);
   const settlement = parseB64json(header(second.headers, PAYMENT_RESPONSE));
 
   return {
     paid: true,
     status: second.status,
+    url: resourceUrl,
     headers: Object.fromEntries(second.headers.entries()),
     paymentRequired,
     requirement: chosen,
@@ -217,7 +351,17 @@ export async function payAndFetch({
   };
 }
 
-export function paymentRequiredBody({ url, payTo, amount, feePayer, description, mimeType }) {
+export function paymentRequiredBody({
+  url,
+  payTo,
+  amount,
+  feePayer,
+  description,
+  mimeType,
+  profile = TESTNET,
+  extensions,
+  maxTimeoutSeconds = 180,
+}) {
   return {
     x402Version: 2,
     error: "PAYMENT-SIGNATURE header is required",
@@ -226,16 +370,19 @@ export function paymentRequiredBody({ url, payTo, amount, feePayer, description,
       description: description || "Paid resource",
       mimeType: mimeType || "application/json",
     },
+    ...(extensions && typeof extensions === "object" ? { extensions } : {}),
     accepts: [
       {
         scheme: "exact",
-        network: NETWORK,
+        network: profile.id,
         amount: String(amount),
-        asset: HBAR_ASSET,
+        asset: profile.usdc,
         payTo,
-        maxTimeoutSeconds: 180,
-        extra: { feePayer: feePayer || FEE_PAYER },
+        maxTimeoutSeconds,
+        extra: { feePayer: feePayer || profile.feePayer },
       },
     ],
   };
 }
+
+export { sameOrigin };
