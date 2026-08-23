@@ -98,7 +98,10 @@ Settled transaction ids from this iteration:
   is bound even when the daemon is given one, a second daemon on the same socket exits 0
   rather than fighting over `state.json`, and anything carrying `Origin` or `Sec-Fetch-*` is
   refused on both transports. With TCP opted in, a missing or wrong bearer token, a foreign
-  `Host`, or a non-loopback peer are each refused.
+  `Host`, or a non-loopback peer are each refused. The residual, by design: a process running
+  as **the same user** can open the socket, exactly as it can already read
+  `~/.config/chip402/key`. The boundary this buys is other local users and web pages, not
+  same-uid code.
 - **Fee payer comes from `/supported`.** Discovery failure, expiry, or a facilitator that
   stops advertising our network all deny with `fee_payer_unknown`; nothing falls back.
 - **A mirror-node outage denies.** `balanceAt` older than 120s is `stale_balance`. An account
