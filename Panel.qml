@@ -277,7 +277,10 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    // Enough for the full panel — five receipts, the blocked line and both sliders — without
+    // a scroll. fittedContentHeight still clamps to the screen, so this cannot overflow, and
+    // a quieter day just makes the panel shorter.
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(680))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -828,23 +831,35 @@ Panel {
             elide: Text.ElideRight
           }
 
+          Text {
+            text: Model.ledgerTime(ledgerRow.row)
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+          }
+
           // Its own right-aligned column, so the money can be scanned straight down the
           // panel instead of landing at a different x on every row.
+          // Not hidden when empty: a blocked row has no amount, and collapsing the slot
+          // would slide its time out of the column the payments above it line up in.
           Text {
             text: Model.ledgerAmount(ledgerRow.row)
-            visible: text !== ""
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             horizontalAlignment: Text.AlignRight
-            Layout.minimumWidth: Style.space(72)
+            Layout.minimumWidth: Style.space(76)
             Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
           }
         }
 
+        // Only rows with something unusual about them get a second line, so a routine
+        // receipt stays one line and anything that is not routine gains weight by being two.
         Text {
           Layout.fillWidth: true
-          text: Model.ledgerMeta(ledgerRow.row)
+          visible: text !== ""
+          text: Model.ledgerNote(ledgerRow.row)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

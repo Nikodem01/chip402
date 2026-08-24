@@ -169,23 +169,20 @@ function ledgerAmount(row) {
   return formatUsd(micro)
 }
 
-function ledgerMeta(row) {
+// A settled payment is one line: the tick, the payee, the time and the amount already say
+// everything. Only a row with something unusual about it earns a second line, which is also
+// what gives that row more weight than the routine ones around it.
+function ledgerNote(row) {
   if (!row) return ""
+  if (row.kind === "audit") return String(row.detail || "")
   var bits = []
-  var time = ledgerTime(row)
-  if (time) bits.push(time)
-  if (row.kind === "audit") {
-    if (row.detail) bits.push(String(row.detail))
-    return bits.join(" · ")
-  }
   var status = String(row.status || "")
   if (status === "denied") {
     // The short code label, not the prose reason: the reason only ever half-rendered here.
     // chip402 log prints it in full.
     bits.push(denialCodeLabel(row.code))
-  } else {
-    var label = ledgerStatusLabel(status)
-    if (label) bits.push(label)
+  } else if (status === "pending") {
+    bits.push("in flight")
   }
   // Not a prompt and not a block: an unfamiliar payee is simply visible in the history
   // instead of indistinguishable from a routine one.
@@ -205,7 +202,7 @@ function ledgerGlyph(row) {
 // How many payment rows fit above the LIMITS sliders without the panel needing a scroll.
 var LEDGER_VISIBLE = 5
 // How many denial reasons fit on one line before it starts eliding.
-var DENIAL_REASONS_SHOWN = 2
+var DENIAL_REASONS_SHOWN = 1
 
 // Local days, matching the daemon's todayStamp(). A panel that says "today" has to mean the
 // user's today, not UTC's.
@@ -476,7 +473,7 @@ if (typeof module !== "undefined") {
     hashscanTx: hashscanTx,
     hashscanAccount: hashscanAccount,
     ledgerTitle: ledgerTitle,
-    ledgerMeta: ledgerMeta,
+    ledgerNote: ledgerNote,
     ledgerTime: ledgerTime,
     ledgerAmount: ledgerAmount,
     ledgerStatusLabel: ledgerStatusLabel,

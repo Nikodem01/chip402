@@ -56,11 +56,10 @@ test("a ledger row never renders an HBAR amount as USDC", () => {
   assert.equal(Model.ledgerStatusLabel("pending"), "in flight");
   const row = { amountMicro: "10000", status: "settled", ts: "2026-08-23T20:22:04.000Z" };
   assert.equal(Model.ledgerAmount(row), "0.01 USDC");
-  const meta = Model.ledgerMeta(row);
-  assert.match(meta, /paid/);
-  assert.doesNotMatch(meta, /settled/);
-  // The amount has its own column now, so it must not also be repeated in the meta line.
-  assert.doesNotMatch(meta, /USDC/);
+  // A settled payment needs no second line at all: the tick, the payee, the time and the
+  // amount carry it.
+  assert.equal(Model.ledgerNote(row), "");
+  assert.equal(Model.ledgerNote({ status: "pending", amountMicro: "10000" }), "in flight");
   // The pre-USDC field is gone; a row that still carries one shows nothing, not 1.23 USDC.
   assert.equal(Model.ledgerAmount({ amountTinybars: "12345678", status: "settled", ts: "" }), "");
   // A blocked row moved no money, so it gets no figure at all.
@@ -74,7 +73,6 @@ test("the ledger clock is local, so it agrees with the local day the panel count
   const at = new Date(row.ts);
   const expected = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
   assert.equal(Model.ledgerTime(row), expected);
-  assert.match(Model.ledgerMeta(row), new RegExp(`^${expected} `));
   assert.equal(Model.ledgerTime({ ts: "not a date" }), "");
   assert.equal(Model.ledgerTime(null), "");
 });
@@ -122,7 +120,9 @@ test("blocked payments collapse into one line that does not read as an alarm", (
   const rows = Model.deniedToday(ledger, now);
   assert.equal(rows.length, 3);
   const summary = Model.denialSummary(rows);
-  assert.equal(summary, "3 not paid today · 2 over cap, 1 host not allowed");
+  // One reason on the line: at 380px anything longer elides mid-reason, and the expansion
+  // is where the rest belongs.
+  assert.equal(summary, "3 not paid today · 2 over cap +1 more");
   // "not paid" rather than "blocked": the daemon files a seller that never answered under the
   // same denied status as a cap refusal, and only one of those is chip402 deciding something.
   assert.match(Model.denialSummary([denied("failed")]), /^1 not paid today · failed$/);
@@ -132,11 +132,11 @@ test("blocked payments collapse into one line that does not read as an alarm", (
   const everything = ["daily_cap", "per_request_cap", "host_denied", "insecure_host", "failed"]
     .map((code) => denied(code));
   const wide = Model.denialSummary(everything);
-  assert.ok(wide.length <= 72, wide);
-  assert.match(wide, /\+3 more$/, "what did not fit has to be counted, not silently dropped");
+  assert.ok(wide.length <= 48, wide);
+  assert.match(wide, /\+4 more$/, "what did not fit has to be counted, not silently dropped");
   // Commonest reason first, so the two that make the line are the two worth naming.
   const lopsided = [denied("host_denied"), denied("daily_cap"), denied("daily_cap"), denied("failed")];
-  assert.match(Model.denialSummary(lopsided), /^4 not paid today · 2 over cap, /);
+  assert.match(Model.denialSummary(lopsided), /^4 not paid today · 2 over cap \+2 more$/);
   assert.equal(Model.denialSummary([]), "");
   assert.equal(Model.denialSummary(null), "");
 });
@@ -192,16 +192,19 @@ test("cap changes are summarised beside the caps, not listed with payments", () 
 });
 
 test("a first-sight payee is marked without interrupting anything", () => {
-  const meta = Model.ledgerMeta({ amountMicro: "10000", status: "settled", firstSight: true, ts: "" });
-  assert.match(meta, /new payee/);
-  assert.doesNotMatch(Model.ledgerMeta({ amountMicro: "10000", status: "settled", ts: "" }), /new payee/);
+  const note = Model.ledgerNote({ amountMicro: "10000", status: "settled", firstSight: true, ts: "" });
+  assert.equal(note, "new payee");
+  assert.equal(Model.ledgerNote({ amountMicro: "10000", status: "settled", ts: "" }), "");
+  // A first payment to an unknown payee that is still settling says both things.
+  assert.equal(Model.ledgerNote({ status: "pending", firstSight: true }), "in flight · new payee");
+  assert.equal(Model.ledgerNote({ status: "denied", code: "daily_cap" }), "over cap");
 });
 
 test("audit rows read as settings changes, not payments", () => {
   const row = { kind: "audit", action: "caps", detail: "daily cap 10000000 to 50000000 micro-USDC", ts: "" };
   assert.equal(Model.ledgerTitle(row), "Cap changed");
-  assert.match(Model.ledgerMeta(row), /daily cap/);
-  assert.doesNotMatch(Model.ledgerMeta(row), /0\.00 USDC/, "an audit row is not a zero-value payment");
+  assert.match(Model.ledgerNote(row), /daily cap/);
+  assert.doesNotMatch(Model.ledgerNote(row), /0\.00 USDC/, "an audit row is not a zero-value payment");
   assert.equal(Model.ledgerTitle({ kind: "audit", action: "pause" }), "Paused");
 });
 
