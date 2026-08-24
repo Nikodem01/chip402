@@ -1,6 +1,7 @@
 import http from "node:http";
 import fs from "node:fs/promises";
 import { DEFAULT_PORT, SOCKET_PATH, TOKEN_PATH } from "./paths.mjs";
+import { FETCH_TIMEOUT_MS, MAX_RESOURCE_BYTES } from "./http.mjs";
 
 // The daemon speaks HTTP over a unix socket by default. Everything that talks to it goes
 // through here so the transport is decided in exactly one place.
@@ -19,7 +20,7 @@ export function daemonTarget({ socketPath = SOCKET_PATH, port = DEFAULT_PORT, tc
   return { tcp: false, socketPath };
 }
 
-export function request(target, method, pathname, body, { token = "" } = {}) {
+export function request(target, method, pathname, body, { token = "", timeoutMs = FETCH_TIMEOUT_MS } = {}) {
   const payload = body === undefined ? null : JSON.stringify(body);
   const headers = { accept: "application/json" };
   if (payload) {
@@ -32,9 +33,24 @@ export function request(target, method, pathname, body, { token = "" } = {}) {
     : { socketPath: target.socketPath, method, path: pathname, headers, host: "chip402.local" };
 
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
     const req = http.request(options, (res) => {
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
+      let size = 0;
+      res.on("data", (chunk) => {
+        size += chunk.length;
+        if (size > MAX_RESOURCE_BYTES) {
+          req.destroy();
+          done(reject, new Error(`daemon response exceeded ${MAX_RESOURCE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString("utf8");
         let json;
@@ -43,10 +59,14 @@ export function request(target, method, pathname, body, { token = "" } = {}) {
         } catch {
           json = { raw: text };
         }
-        resolve({ status: res.statusCode, json, text });
+        done(resolve, { status: res.statusCode, json, text });
       });
     });
-    req.on("error", reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      done(reject, new Error(`daemon request timed out after ${timeoutMs}ms`));
+    });
+    req.on("error", (err) => done(reject, err));
     if (payload) req.write(payload);
     req.end();
   });

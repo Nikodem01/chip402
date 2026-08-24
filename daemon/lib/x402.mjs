@@ -3,6 +3,15 @@ import { TESTNET, resolveNetwork } from "./networks.mjs";
 import { pickHederaRequirement } from "./policy.mjs";
 import { signExactTransfer } from "./hedera.mjs";
 import { log } from "./log.mjs";
+import {
+  FETCH_TIMEOUT_MS,
+  MAX_RESOURCE_BYTES,
+  MAX_RESPONSE_BYTES,
+  cancelBody,
+  isAbortError,
+  readCapped,
+  requestSignal,
+} from "./http.mjs";
 
 const PAYMENT_REQUIRED = "payment-required";
 const PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE";
@@ -73,16 +82,43 @@ export class FacilitatorCallError extends Error {
   }
 }
 
-export async function facilitatorCall(facilitator, path, body, { apiKey = "" } = {}) {
+export async function facilitatorCall(
+  facilitator,
+  path,
+  body,
+  {
+    apiKey = "",
+    fetchImpl = fetch,
+    timeoutMs = FETCH_TIMEOUT_MS,
+    maxBytes = MAX_RESPONSE_BYTES,
+  } = {},
+) {
   const base = String(facilitator || FACILITATOR).replace(/\/$/, "");
   const headers = { "content-type": "application/json", accept: "application/json" };
   if (apiKey) headers["X-Api-Key"] = apiKey;
-  const res = await fetch(`${base}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
+  let res;
+  try {
+    res = await fetchImpl(`${base}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: requestSignal(timeoutMs),
+    });
+  } catch (err) {
+    throw new FacilitatorCallError(
+      "facilitator_unreachable",
+      `Facilitator ${path} unreachable: ${err.message}`,
+    );
+  }
+  let text;
+  try {
+    text = await readCapped(res, { maxBytes });
+  } catch (err) {
+    throw new FacilitatorCallError(
+      err.code === "response_too_large" ? "response_too_large" : "facilitator_error",
+      `Facilitator ${path}: ${err.message}`,
+    );
+  }
   let json = null;
   try {
     json = JSON.parse(text);
@@ -133,8 +169,8 @@ export async function verifyAndSettle({ facilitator, paymentPayload, paymentRequ
   return { verify, settle };
 }
 
-async function readBody(response) {
-  const text = await response.text();
+async function readBody(response, { maxBytes = MAX_RESPONSE_BYTES } = {}) {
+  const text = await readCapped(response, { maxBytes });
   let json = null;
   try {
     json = JSON.parse(text);
@@ -142,6 +178,19 @@ async function readBody(response) {
     json = null;
   }
   return { text, json };
+}
+
+async function timedFetch(fetchImpl, url, init, timeoutMs = FETCH_TIMEOUT_MS) {
+  try {
+    return await fetchImpl(url, { ...init, signal: requestSignal(timeoutMs, init.signal) });
+  } catch (err) {
+    if (isAbortError(err)) {
+      const error = new Error(`Timed out fetching ${url}`);
+      error.code = "timeout";
+      throw error;
+    }
+    throw err;
+  }
 }
 
 function isRedirect(status) {
@@ -167,7 +216,7 @@ function redirectDenied(reason) {
 // The unpaid probe may be redirected, but every hop is re-checked against the allowlist:
 // otherwise a seller redirects to a host that was never allowed and its 402 is the one we
 // evaluate.
-async function fetchFollowing(url, init, checkHost) {
+async function fetchFollowing(url, init, checkHost, fetchImpl = fetch) {
   let current = url;
   const first = checkHost ? checkHost(url) : { ok: true };
   if (!first.ok) {
@@ -177,10 +226,11 @@ async function fetchFollowing(url, init, checkHost) {
     throw error;
   }
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
-    const res = await fetch(current, { ...init, redirect: "manual" });
+    const res = await timedFetch(fetchImpl, current, { ...init, redirect: "manual" });
     if (!isRedirect(res.status)) return { response: res, url: current };
     const location = res.headers.get("location");
     if (!location) return { response: res, url: current };
+    await cancelBody(res);
     const next = new URL(location, current).toString();
     const decision = checkHost ? checkHost(next) : { ok: true };
     if (!decision.ok) {
@@ -204,6 +254,7 @@ export async function payAndFetch({
   decide,
   checkHost,
   onSigned,
+  fetchImpl = fetch,
 }) {
   const requestHeaders = { ...headers };
   const init = {
@@ -212,7 +263,7 @@ export async function payAndFetch({
   };
   if (body !== undefined && method !== "GET" && method !== "HEAD") init.body = body;
 
-  const probe = await fetchFollowing(url, init, checkHost);
+  const probe = await fetchFollowing(url, init, checkHost, fetchImpl);
   const first = probe.response;
   const resourceUrl = probe.url;
   if (first.status !== 402) {
@@ -318,8 +369,13 @@ export async function payAndFetch({
   // The paid retry carries a signed, spendable transfer. It is never followed anywhere the
   // allowlist has not cleared, and never to a different origin than the one the payment was
   // constructed for.
-  const second = await fetch(resourceUrl, { ...init, headers: retryHeaders, redirect: "manual" });
+  const second = await timedFetch(fetchImpl, resourceUrl, {
+    ...init,
+    headers: retryHeaders,
+    redirect: "manual",
+  });
   if (isRedirect(second.status)) {
+    await cancelBody(second);
     const location = second.headers.get("location");
     const next = location ? new URL(location, resourceUrl).toString() : "";
     const allowed = next && checkHost ? checkHost(next) : { ok: false, reason: "no redirect target" };
@@ -334,7 +390,7 @@ export async function payAndFetch({
     error.requirement = chosen;
     throw error;
   }
-  const secondBody = await readBody(second);
+  const secondBody = await readBody(second, { maxBytes: MAX_RESOURCE_BYTES });
   const settlement = parseB64json(header(second.headers, PAYMENT_RESPONSE));
 
   return {

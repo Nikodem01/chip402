@@ -1,4 +1,5 @@
 import { FACILITATOR_TTL_MS } from "./paths.mjs";
+import { MAX_RESPONSE_BYTES, cancelBody, readCappedJson, requestSignal } from "./http.mjs";
 
 // The trust anchor for a payment is the account that co-signs and submits it. Pinning that
 // account in source means a facilitator key rotation either breaks every payment or, worse,
@@ -35,7 +36,13 @@ export function feePayerFrom(kind) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
-export async function fetchSupported({ facilitator, apiKey, fetchImpl = fetch, timeoutMs = 10_000 }) {
+export async function fetchSupported({
+  facilitator,
+  apiKey,
+  fetchImpl = fetch,
+  timeoutMs = 10_000,
+  maxBytes = MAX_RESPONSE_BYTES,
+} = {}) {
   const url = supportedUrl(facilitator);
   if (!facilitator) {
     throw new FacilitatorError("facilitator_unconfigured", "No facilitator configured for this network");
@@ -44,11 +51,12 @@ export async function fetchSupported({ facilitator, apiKey, fetchImpl = fetch, t
   if (apiKey) headers["X-Api-Key"] = apiKey;
   let res;
   try {
-    res = await fetchImpl(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+    res = await fetchImpl(url, { headers, signal: requestSignal(timeoutMs) });
   } catch (err) {
     throw new FacilitatorError("facilitator_unreachable", `Facilitator /supported unreachable: ${err.message}`);
   }
   if (res.status === 401 || res.status === 403) {
+    await cancelBody(res);
     throw new FacilitatorError(
       "facilitator_unauthorized",
       `Facilitator rejected the API key (${res.status}) — set facilitatorApiKey`,
@@ -56,6 +64,7 @@ export async function fetchSupported({ facilitator, apiKey, fetchImpl = fetch, t
     );
   }
   if (res.status === 429) {
+    await cancelBody(res);
     throw new FacilitatorError(
       "facilitator_rate_limited",
       "Facilitator rate limit hit on /supported — this is not a declined payment",
@@ -63,11 +72,18 @@ export async function fetchSupported({ facilitator, apiKey, fetchImpl = fetch, t
     );
   }
   if (!res.ok) {
+    await cancelBody(res);
     throw new FacilitatorError("facilitator_unreachable", `Facilitator /supported ${res.status}`, res.status);
   }
   try {
-    return await res.json();
+    return await readCappedJson(res, { maxBytes });
   } catch (err) {
+    if (err.code === "response_too_large") {
+      throw new FacilitatorError(
+        "facilitator_unreachable",
+        `Facilitator /supported exceeded ${maxBytes} bytes`,
+      );
+    }
     throw new FacilitatorError("facilitator_unreachable", `Facilitator /supported is not JSON: ${err.message}`);
   }
 }

@@ -1,6 +1,7 @@
 import { HBAR, TESTNET, resolveNetwork } from "./networks.mjs";
 import { loadSdk } from "./sdk.mjs";
 import { log } from "./log.mjs";
+import { FETCH_TIMEOUT_MS, cancelBody, readCappedJson, requestSignal } from "./http.mjs";
 
 // docs.hedera.com/native/transactions/modify-fields: max network valid duration 180s, SDK
 // default 120s, minimum 15s. The protobuf response-code page still says 120 is the maximum;
@@ -87,17 +88,30 @@ function isZeroKeyMaterial(value) {
   return /^0+$/.test(body);
 }
 
+async function mirrorGet(url) {
+  const res = await fetch(url, {
+    headers: { accept: "application/json" },
+    signal: requestSignal(FETCH_TIMEOUT_MS),
+  });
+  if (res.status === 404) {
+    await cancelBody(res);
+    return { status: 404, json: null };
+  }
+  const json = await readCappedJson(res);
+  return { status: res.status, json };
+}
+
 export async function lookupAccount(evmOrId, networkOrProfile = TESTNET) {
   const id = String(evmOrId || "").trim();
   if (!id) return null;
   const profile = profileOf(networkOrProfile);
   const url = `${profile.mirror}/api/v1/accounts/${encodeURIComponent(id)}?limit=1`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const res = await mirrorGet(url);
   if (res.status === 404) return null;
-  if (!res.ok) {
+  if (res.status < 200 || res.status >= 300) {
     throw new Error(`Mirror node ${res.status} for ${id}`);
   }
-  const body = await res.json();
+  const body = res.json || {};
   return {
     accountId: String(body.account || body.account_id || ""),
     evmAddress: body.evm_address ? `0x${String(body.evm_address).replace(/^0x/i, "")}` : "",
@@ -115,10 +129,10 @@ export async function tokenBalance(accountId, tokenId, networkOrProfile = TESTNE
   const asset = tokenId || profile.usdc;
   if (!id) return { balance: "0", associated: false };
   const url = `${profile.mirror}/api/v1/accounts/${encodeURIComponent(id)}/tokens?limit=100`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const res = await mirrorGet(url);
   if (res.status === 404) return { balance: "0", associated: false };
-  if (!res.ok) throw new Error(`Mirror node ${res.status} for tokens of ${id}`);
-  const body = await res.json();
+  if (res.status < 200 || res.status >= 300) throw new Error(`Mirror node ${res.status} for tokens of ${id}`);
+  const body = res.json || {};
   const tokens = Array.isArray(body.tokens) ? body.tokens : [];
   const hit = tokens.find((row) => String(row.token_id) === String(asset));
   if (!hit) return { balance: "0", associated: false };
@@ -163,10 +177,10 @@ export async function lookupTransaction(txId, networkOrProfile = TESTNET) {
   }
   const profile = profileOf(networkOrProfile);
   const url = `${profile.mirror}/api/v1/transactions/${encodeURIComponent(id)}`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const res = await mirrorGet(url);
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Mirror node ${res.status} for transaction ${id}`);
-  const body = await res.json();
+  if (res.status < 200 || res.status >= 300) throw new Error(`Mirror node ${res.status} for transaction ${id}`);
+  const body = res.json || {};
   const rows = Array.isArray(body.transactions) ? body.transactions : [];
   if (rows.length === 0) return null;
   const ok = rows.filter((entry) => String(entry.result || "") === "SUCCESS");

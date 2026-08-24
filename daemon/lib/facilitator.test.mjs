@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FacilitatorError, createDiscovery, feePayerFrom, selectKind, supportedUrl } from "./facilitator.mjs";
+import { FacilitatorError, createDiscovery, feePayerFrom, fetchSupported, selectKind, supportedUrl } from "./facilitator.mjs";
 
 const TESTNET_SUPPORTED = {
   kinds: [
@@ -101,6 +101,23 @@ test("the API key is sent as X-Api-Key when one is configured", async () => {
   });
   await discovery.discover({ facilitator: "https://f", network: "hedera:testnet", apiKey: "b402_test" });
   assert.equal(seen["X-Api-Key"], "b402_test");
+});
+
+test("a /supported body over the byte cap is refused before it is parsed", async () => {
+  await assert.rejects(
+    () =>
+      fetchSupported({
+        facilitator: "https://f",
+        fetchImpl: async () => new Response("x".repeat(500), { status: 200 }),
+        maxBytes: 64,
+      }),
+    (err) => {
+      assert.ok(err instanceof FacilitatorError);
+      assert.equal(err.code, "facilitator_unreachable");
+      assert.match(err.message, /exceeded 64 bytes/);
+      return true;
+    },
+  );
 });
 
 test("an unreachable facilitator is a failure, never a silent fallback", async () => {

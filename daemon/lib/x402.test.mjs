@@ -4,6 +4,7 @@ import {
   b64json,
   buildPaymentPayload,
   decodePaymentRequired,
+  facilitatorCall,
   facilitatorReason,
   parseB64json,
   paymentRequiredBody,
@@ -72,6 +73,35 @@ test("PAYMENT-REQUIRED is read from the header or the body", () => {
   const headers = new Headers({ "payment-required": b64json(body) });
   assert.equal(decodePaymentRequired({ headers }, "").accepts[0].payTo, "0.0.1");
   assert.equal(decodePaymentRequired({ headers: new Headers() }, JSON.stringify(body)).accepts[0].payTo, "0.0.1");
+});
+
+test("facilitatorCall refuses a body over the byte cap", async () => {
+  await assert.rejects(
+    () =>
+      facilitatorCall("https://f", "/verify", {}, {
+        maxBytes: 32,
+        fetchImpl: async () => new Response("y".repeat(200), { status: 200 }),
+      }),
+    (err) => err.code === "response_too_large",
+  );
+});
+
+test("facilitatorCall treats a deadline as unreachable, not as a declined payment", async () => {
+  await assert.rejects(
+    () =>
+      facilitatorCall("https://f", "/settle", {}, {
+        timeoutMs: 40,
+        fetchImpl: (_url, init) =>
+          new Promise((_, reject) => {
+            init.signal.addEventListener("abort", () => {
+              const err = new Error("aborted");
+              err.name = "TimeoutError";
+              reject(err);
+            });
+          }),
+      }),
+    (err) => err.code === "facilitator_unreachable",
+  );
 });
 
 test("the facilitator's diagnostic message is kept, not just its code", () => {
