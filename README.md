@@ -27,8 +27,7 @@ This is not a general-purpose wallet. It is pocket-money chips for agents.
 Needs Node.js 22+ and `npm`. The Hedera SDK is installed **outside** the plugin directory (the Omarchy validator forbids symlinks, and the SDK is large).
 
 ```bash
-# from this checkout (until the GitHub repo is published)
-omarchy plugin add /home/niko/Work/chip402 --enable --yes
+omarchy plugin add https://github.com/Nikodem01/chip402 --enable --yes
 
 # one-time runtime + operator key
 ~/.config/omarchy/plugins/chip402/bin/chip402 setup --watch
@@ -114,6 +113,29 @@ Removal does not write to any other Omarchy config unless you previously enabled
 
 Operator key: `~/.config/chip402/key` (ECDSA, DER, mode 600).
 Config: `~/.config/chip402/config.json`.
+
+## Testnet only, on purpose
+
+chip402 runs on Hedera **testnet**. The payments are real — real USDC moving between real
+accounts, with each settlement confirmed against the mirror node rather than taken on the
+seller's word — but the money is testnet money.
+
+Mainnet is written and not armed:
+
+```bash
+$ chip402 network mainnet
+hedera:mainnet is not enabled in this build (MAINNET_SHIPPED=false). chip402 ships testnet only.
+```
+
+The mainnet profile, the `/supported` fee-payer discovery, the facilitator API-key path and the
+401/429 handling are all in place and unit-tested, and a test suite asserts the switch stays
+shut. What has *not* happened is a single call to a mainnet facilitator's `/verify` or
+`/settle`. Until that path has been exercised, a build that would sign against real money on
+it is a build making a promise it has not kept, so `resolveNetwork` refuses the network
+outright instead.
+
+Flipping `MAINNET_SHIPPED` in `daemon/lib/networks.mjs` is the whole delta, and deliberately
+requires editing source rather than a setting.
 
 ## Defaults
 
