@@ -398,7 +398,7 @@ function setupSteps() {
 }
 
 function setupHint(phase) {
-  if (phase === "need_key") return "chip402 needs an operator key before it can be funded"
+  if (phase === "need_key") return "A local key with no passphrase. Anything running as you can read it, so the caps — not the key — bound what it can lose"
   if (phase === "need_hbar") return "Send a little HBAR to the address below to create the account"
   if (phase === "completing") return "Writing the key on record — one cheap transaction, then payments can be signed"
   if (phase === "associating") return "Associating USDC so the account can hold it"

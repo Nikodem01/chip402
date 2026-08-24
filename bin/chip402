@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import {
   CONFIG_DIR,
+  DEFAULT_DAILY_MICRO,
+  DEFAULT_PER_REQUEST_MICRO,
   DEFAULT_PORT,
   DEFAULT_SELLER_PORT,
   KEY_PATH,
@@ -186,10 +188,41 @@ function microToUsd(value) {
   return `${whole}.${frac}`;
 }
 
+// Said once, at the only moment it matters: when the key comes into existence. Printed, not
+// prompted — the panel runs `chip402 setup` non-interactively, so a question would hang it.
+function keyDisclosure(config) {
+  const daily = microToUsd(config.dailyCapMicro || DEFAULT_DAILY_MICRO);
+  const perRequest = microToUsd(config.perRequestMicro || DEFAULT_PER_REQUEST_MICRO);
+  console.log(`
+About to create the operator key
+────────────────────────────────
+  chip402 generates a Hedera ECDSA key and stores it at
+  ${KEY_PATH}, mode 600, UNENCRYPTED.
+
+  There is no passphrase, and nobody holds one. A daemon that signs
+  invoices while you are not watching cannot stop to ask for one, so
+  this key is protected by file permissions and by the spend caps —
+  not by a secret you remember.
+
+  What that means in practice:
+    · Anything running as your user can read the file. So can root.
+      chip402 does not defend against code you already ran.
+    · What it can lose is bounded by the caps, not by the key:
+      ${daily} USDC per day, ${perRequest} USDC per request by default.
+    · Treat the balance like a coat pocket, not a bank account. Top it
+      up from a real wallet; do not park savings here.
+    · To revoke it: rm ${KEY_PATH}
+      Funds stay on Hedera, and nothing can move them without the key.
+
+  This build signs on testnet only and refuses mainnet.
+`);
+}
+
 async function setup(watch) {
   await ensureRuntime();
   const config = await loadConfig();
   if (!keyExists(KEY_PATH)) {
+    keyDisclosure(config);
     const operator = generateOperator();
     await writeKeyFile(KEY_PATH, operator.der);
     config.evmAddress = operator.evmAddress;

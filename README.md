@@ -118,14 +118,55 @@ Removal does not write to any other Omarchy config unless you previously enabled
 4. The facilitator co-signs and submits. Network fees are not paid by the operator.
 5. The panel watches `~/.local/state/chip402/state.json` and appends a ledger row.
 
-Operator key: `~/.config/chip402/key` (ECDSA, DER, mode 600).
-Config: `~/.config/chip402/config.json`.
+## The key, and who holds it
+
+Nobody holds a passphrase, because there isn't one.
+
+`chip402 setup` generates a Hedera ECDSA key and writes it to `~/.config/chip402/key`,
+**mode 600, unencrypted**. A daemon that signs invoices while you are not watching cannot stop
+to ask for a passphrase, so the key is protected by file permissions and by the spend caps
+rather than by a secret you remember. `setup` says all of this out loud before it creates the
+key, and the panel repeats it on the first setup step.
+
+What follows from that:
+
+- **Anything running as your user can read the file. So can root.** chip402 does not defend
+  against code you have already run — the same is true of your SSH keys. What it defends
+  against is an agent overspending, a browser reaching the daemon, and a seller being paid
+  twice.
+- **The caps bound the loss, not the key.** 10 USDC/day and 1 USDC per request by default,
+  enforced before anything is signed, with a kill switch on the bar.
+- **Treat the balance like a coat pocket.** Top it up from a real wallet; do not park savings
+  in it. The plugin holds an *operator* account, not your wallet.
+- **Revoking is `rm ~/.config/chip402/key`.** The funds stay on Hedera and nothing can move
+  them without the key. chip402 refuses to start if the file is looser than 600, and redacts
+  DER and PEM keys from its logs.
+
+Config: `~/.config/chip402/config.json`. Nothing is written outside `~/.config/chip402` and
+`~/.local/state/chip402`.
 
 ## Testnet only, on purpose
 
 chip402 runs on Hedera **testnet**. The payments are real — real USDC moving between real
 accounts, with each settlement confirmed against the mirror node rather than taken on the
 seller's word — but the money is testnet money.
+
+It has been proven against a seller it did not author. [Printwright](https://printwright.liftbyai.com)
+is an independent x402 marketplace for licensed 3D-printable models, settling through a
+different facilitator (`api.testnet.blocky402.com`, fee payer `0.0.7162784`) than chip402's
+default. Point chip402 at that facilitator and it discovers the new sponsor, pays, and gets a
+real licence back:
+
+| What happened | Proof |
+| --- | --- |
+| 0.60 USDC — commercial licence, *Beaver Desk Mascot with Hat* | [`0.0.7162784@1787550243.004621353`](https://hashscan.io/testnet/transaction/0.0.7162784%401787550243.004621353) · certificate `pw-7a2587cc0345bc49fd3e70b3` |
+| 0.20 USDC — *Bag Sealer* | [`0.0.7162784@1787550318.813448723`](https://hashscan.io/testnet/transaction/0.0.7162784%401787550318.813448723) |
+| 0.25 USDC — *Cable Clip* | [`0.0.7162784@1787550330.669218212`](https://hashscan.io/testnet/transaction/0.0.7162784%401787550330.669218212) |
+| A 2.90 USDC invoice **refused** by the per-request cap | `per_request_cap: Invoice 2900000 exceeds per-request cap 1000000` |
+
+The mirror node shows the first as `0.0.10193689 -600000` / `0.0.9584959 +600000` on token
+`0.0.429274`, `SUCCESS`. The refusal is the point as much as the payments are: chip402 declined
+a real invoice from a real seller, silently, without asking anyone.
 
 Mainnet is written and not armed:
 

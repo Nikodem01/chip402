@@ -105,7 +105,7 @@ Panel {
   }
 
   function setupSubtitle() {
-    if (chip402.phase === "need_key") return "A local Hedera key. Nothing leaves this machine."
+    if (chip402.phase === "need_key") return "Unencrypted at ~/.config/chip402/key, mode 600. No passphrase — the caps are the limit."
     if (chip402.phase === "need_hbar") return chip402.evmAddress || "Waiting for the EVM address"
     if (chip402.phase === "completing") return "One cheap self-signed transaction, then it can pay"
     if (chip402.phase === "associating") return "Needs a little HBAR for the association fee"
