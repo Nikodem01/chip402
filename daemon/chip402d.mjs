@@ -21,6 +21,7 @@ import {
   loadConfig,
   loadState,
   readKeyFile,
+  readTokenFile,
   saveConfig,
   saveState,
   todayStamp,
@@ -30,6 +31,7 @@ import {
   evaluateSpend,
   floatWarning,
   isFirstSight,
+  forwardableHeaders,
   parseHost,
   payeeKey,
   profileFor,
@@ -216,6 +218,16 @@ async function discoverFeePayer(config) {
   }
 }
 
+// A ledger row is written from seller, facilitator and caller strings, kept for 50 rows, and
+// read back by the panel. Each field gets a ceiling here, at the one place rows are made,
+// rather than at the dozen places that supply them.
+const MAX_ROW_FIELD_CHARS = 240;
+
+function clampField(value) {
+  const text = String(value ?? "");
+  return text.length > MAX_ROW_FIELD_CHARS ? `${text.slice(0, MAX_ROW_FIELD_CHARS)}…` : text;
+}
+
 function pushLedger(state, entry) {
   const row = {
     id: entry.id || ledgerId(),
@@ -223,6 +235,9 @@ function pushLedger(state, entry) {
     kind: entry.kind || "payment",
     ...entry,
   };
+  for (const [key, value] of Object.entries(row)) {
+    if (typeof value === "string") row[key] = clampField(value);
+  }
   if (row.txId) row.hashscan = hashscanTransaction(row.txId, entry.network);
   state.ledger = [row, ...(state.ledger || [])];
   return row;
@@ -441,6 +456,8 @@ async function refreshBalances() {
   });
 }
 
+const MAX_URL_CHARS = 2_048;
+const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
 async function handleFetch(body) {
   const url = String(body.url || "").trim();
   if (!url) {
@@ -448,7 +465,17 @@ async function handleFetch(body) {
     error.status = 400;
     throw error;
   }
+  if (url.length > MAX_URL_CHARS) {
+    const error = new Error(`url exceeds ${MAX_URL_CHARS} characters`);
+    error.status = 400;
+    throw error;
+  }
   const method = String(body.method || "GET").toUpperCase();
+  if (!ALLOWED_METHODS.has(method)) {
+    const error = new Error(`method must be one of ${[...ALLOWED_METHODS].join(", ")}`);
+    error.status = 400;
+    throw error;
+  }
 
   return withLock(async () => {
     const config = await loadConfig();
@@ -496,7 +523,7 @@ async function handleFetch(body) {
       const result = await payAndFetch({
         url,
         method,
-        headers: body.headers && typeof body.headers === "object" ? body.headers : {},
+        headers: forwardableHeaders(body.headers),
         body: body.body,
         accountId: config.accountId,
         privateKeyRaw: key,
@@ -550,10 +577,10 @@ async function handleFetch(body) {
       const facilitatorFailed = result.settlement?.success === false;
       const pendingSettlement = result.settlement?.errorReason === "settlement_pending";
       const settled = result.status >= 200 && result.status < 300 && !facilitatorFailed;
-      const txId =
-        result.settlement?.transactionId ||
-        result.settlement?.transaction ||
-        result.signed.transactionId;
+      // The id this daemon signed is the only one it will reconcile against. Taking the
+      // facilitator's echoed value instead would let a seller name a transaction the mirror
+      // node has never heard of, and the reservation it belongs to would never settle.
+      const txId = result.signed.transactionId;
       if (reservation) {
         reservation.txId = txId;
         reservation.hashscan = hashscanTransaction(txId, config.network);
@@ -816,20 +843,14 @@ async function main() {
   const tcp = config.tcp === true || process.env.CHIP402_TCP === "1";
   const port = Number(process.env.CHIP402_PORT || config.port || DEFAULT_PORT);
   if (tcp) {
+    // The mode is proven on the descriptor the token is read from, before it is a secret in
+    // this process, not by a second stat of the same pathname afterwards.
     try {
-      bearerToken = (await fs.readFile(TOKEN_PATH, "utf8")).trim();
-    } catch {
-      bearerToken = "";
-    }
-    if (!bearerToken) {
+      bearerToken = await readTokenFile(TOKEN_PATH);
+    } catch (err) {
       console.error(
-        `TCP transport is enabled but ${TOKEN_PATH} is missing or empty. Run: chip402 token`,
+        `TCP transport is enabled but ${TOKEN_PATH} is unusable: ${err.message}. Run: chip402 token`,
       );
-      process.exit(1);
-    }
-    const mode = fsSync.statSync(TOKEN_PATH).mode & 0o777;
-    if (mode !== 0o600) {
-      console.error(`Refusing to load ${TOKEN_PATH}: mode is ${mode.toString(8)}, need 600`);
       process.exit(1);
     }
   }

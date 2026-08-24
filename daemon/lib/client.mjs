@@ -1,18 +1,15 @@
 import http from "node:http";
-import fs from "node:fs/promises";
 import { DEFAULT_PORT, SOCKET_PATH, TOKEN_PATH } from "./paths.mjs";
+import { readTokenFile } from "./state.mjs";
 import { FETCH_TIMEOUT_MS, MAX_RESOURCE_BYTES } from "./http.mjs";
 
 // The daemon speaks HTTP over a unix socket by default. Everything that talks to it goes
 // through here so the transport is decided in exactly one place.
 
-export async function readToken() {
-  try {
-    const raw = (await fs.readFile(TOKEN_PATH, "utf8")).trim();
-    return raw || "";
-  } catch {
-    return "";
-  }
+// A token file that is not a regular file this user owns at mode 600 is a refusal, not an
+// empty string: silently returning "" would downgrade the caller to the unauthenticated path.
+export async function readToken(file = TOKEN_PATH) {
+  return readTokenFile(file);
 }
 
 export function daemonTarget({ socketPath = SOCKET_PATH, port = DEFAULT_PORT, tcp = false } = {}) {

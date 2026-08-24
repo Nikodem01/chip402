@@ -1,6 +1,4 @@
-import fs from "node:fs/promises";
 import fsSync from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
 import {
   CONFIG_DIR,
@@ -15,8 +13,15 @@ import {
   MERCHANT_KEY_PATH,
   STATE_DIR,
   STATE_PATH,
+  TOKEN_PATH,
 } from "./paths.mjs";
 import { TESTNET, resolveNetwork } from "./networks.mjs";
+import {
+  MAX_SECRET_BYTES,
+  ensureOwnedDir,
+  readVerified,
+  writeVerifiedAtomic,
+} from "./safeio.mjs";
 
 export const STATE_SCHEMA = 2;
 export const STATE_MODE = 0o600;
@@ -94,15 +99,17 @@ export function todayStamp(date = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
+// Both directories hold things that are nobody else's business: the key and the API key in
+// one, the ledger, the log and the installed runtime in the other. Owner-only, and re-checked
+// on the descriptor every time rather than assumed from a mkdir that no-ops when it exists.
 export async function ensureDirs() {
-  await fs.mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
-  await fs.mkdir(STATE_DIR, { recursive: true, mode: 0o755 });
+  await ensureOwnedDir(CONFIG_DIR);
+  await ensureOwnedDir(STATE_DIR);
 }
 
 export async function readJson(file, fallback) {
   try {
-    const raw = await fs.readFile(file, "utf8");
-    return JSON.parse(raw);
+    return JSON.parse(await readVerified(file));
   } catch (err) {
     if (err && err.code === "ENOENT") return fallback;
     throw err;
@@ -110,19 +117,7 @@ export async function readJson(file, fallback) {
 }
 
 export async function writeJsonAtomic(file, value, mode = 0o600) {
-  await fs.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  const body = `${JSON.stringify(value, null, 2)}\n`;
-  const handle = await fs.open(tmp, "wx", mode);
-  try {
-    // umask can strip bits off the open() mode, so pin them before anything is written.
-    await handle.chmod(mode);
-    await handle.writeFile(body, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await fs.rename(tmp, file);
+  await writeVerifiedAtomic(file, `${JSON.stringify(value, null, 2)}\n`, mode);
 }
 
 export function configuredNetworkId(stored = {}) {
@@ -223,29 +218,24 @@ export function ledgerId() {
   return crypto.randomUUID();
 }
 
-export function assertKeyPermissions(file = KEY_PATH) {
-  if (!fsSync.existsSync(file)) {
-    throw new Error(`Missing key file: ${file}`);
-  }
-  const mode = fsSync.statSync(file).mode & 0o777;
-  if (mode !== KEY_MODE) {
-    throw new Error(
-      `Refusing to load ${file}: mode is ${mode.toString(8).padStart(3, "0")}, need 600`,
-    );
-  }
-}
-
+// The mode is asserted on the same descriptor the bytes are read from, so there is no window
+// between "this file is 600 and mine" and "these are its contents".
 export async function readKeyFile(file = KEY_PATH) {
-  assertKeyPermissions(file);
-  const raw = (await fs.readFile(file, "utf8")).trim();
+  const raw = (await readVerified(file, { maxBytes: MAX_SECRET_BYTES, exactMode: KEY_MODE })).trim();
   if (!raw) throw new Error(`Key file is empty: ${file}`);
   return raw;
 }
 
 export async function writeKeyFile(file, contents) {
   await ensureDirs();
-  await fs.writeFile(file, `${contents.trim()}\n`, { mode: KEY_MODE });
-  await fs.chmod(file, KEY_MODE);
+  await writeVerifiedAtomic(file, `${String(contents).trim()}\n`, KEY_MODE);
+}
+
+// Same treatment as the key: the mode is asserted on the descriptor the bytes come from.
+export async function readTokenFile(file = TOKEN_PATH) {
+  const raw = (await readVerified(file, { maxBytes: MAX_SECRET_BYTES, exactMode: KEY_MODE })).trim();
+  if (!raw) throw new Error(`Token file is empty: ${file}`);
+  return raw;
 }
 
 export function keyExists(file = KEY_PATH) {

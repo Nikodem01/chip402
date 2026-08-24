@@ -46,22 +46,28 @@ test("readCapped accepts a body at the limit", async () => {
   assert.equal(await readCapped(res, { maxBytes: 32 }), text);
 });
 
-test("readCappedJson parses a mock that only implements json()", async () => {
-  const json = await readCappedJson({
-    json: async () => ({ kinds: [{ network: "hedera:testnet" }] }),
-  });
+test("readCappedJson parses a streamed body", async () => {
+  const res = new Response(JSON.stringify({ kinds: [{ network: "hedera:testnet" }] }), { status: 200 });
+  const json = await readCappedJson(res);
   assert.equal(json.kinds[0].network, "hedera:testnet");
 });
 
-test("readCappedJson refuses a mock json() payload over the cap", async () => {
+test("readCappedJson refuses a streamed payload over the cap", async () => {
+  const res = new Response(JSON.stringify({ pad: "x".repeat(500) }), { status: 200 });
+  await assert.rejects(() => readCappedJson(res, { maxBytes: 40 }), (err) => err.code === "response_too_large");
+});
+
+// The point of the helper is that no body is ever materialized before a limit sees it, so a
+// response that can only be read whole is refused rather than read.
+test("readCapped refuses a response whose body cannot be streamed", async () => {
   await assert.rejects(
-    () =>
-      readCappedJson(
-        { json: async () => ({ pad: "x".repeat(500) }) },
-        { maxBytes: 40 },
-      ),
-    (err) => err.code === "response_too_large",
+    () => readCapped({ body: {}, json: async () => ({ ok: true }), text: async () => "ok" }),
+    (err) => err.code === "unstreamable_body",
   );
+});
+
+test("readCapped treats an absent body as empty", async () => {
+  assert.equal(await readCapped({ body: null }), "");
 });
 
 test("requestSignal is aborted once the deadline passes", async () => {

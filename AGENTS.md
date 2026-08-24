@@ -54,26 +54,80 @@ Do **not** use this MCP to sign, submit, or mutate network state. It only search
 - HBAR is always singular uppercase. Networks: `mainnet` / `testnet` / `previewnet` lowercase.
 - JS SDK in this repo is `@hashgraph/sdk` in `~/.local/state/chip402/runtime` (outside the plugin tree; no symlinks). Newer namespace is `@hiero-ledger/sdk` — check docs before changing imports.
 
+## Marketplace review (binding before any resubmission)
+
+chip402 is listed at HANCORE-linux/omarchy-plugin-marketplace issue #2035. Two gates: a
+deterministic scanner, then a human security review by `HANCORE-linux` that blocks commits
+with "this exact SHA is not approvable". The scanner passing means nothing about the review.
+
+Read the skill before touching the daemon, the panel or the setup path:
+`~/.grok/skills/omarchy-marketplace-hardening/SKILL.md` (mirror:
+`~/.claude/skills/omarchy-marketplace-hardening/`). It encodes ~70 maintainer reviews.
+
+The premise: an Omarchy plugin is unsandboxed code inside a long-lived process, so every byte
+from network, subprocess, disk, clipboard or compositor is attacker-controlled. Caps must be
+**producer-side and fail-closed** (a check after the bytes are resident does not count) and
+file access must be **descriptor-bound** (stat-then-open is a check-to-use window).
+
+Six blocking classes — audit all six before replying to a review, not just the one named:
+
+1. Unbounded input (byte cap + deadline + item cap on every response, stdout **and** stderr,
+   file load and cache).
+2. Predictable-path state: owner-only dir, `O_NOFOLLOW`, regular-file/owner/size on the
+   descriptor, descriptor-relative atomic replace.
+3. QML rich text: every non-literal `Text`/tooltip needs `textFormat: Text.PlainText`.
+4. Supply chain: committed lockfile with hashes, frozen install, full-SHA pins.
+5. Secrets never in argv or a child environment.
+6. Privilege: argv over interpolated shell, allowlisted mutations.
+
+State of the six classes in this tree — audit before changing any of it, and do not let an
+item drift back:
+
+1. Bounded input: `daemon/lib/http.mjs` streams every response under a byte cap with a
+   deadline and refuses a body it cannot stream; item caps live in `policy.mjs`
+   (`MAX_ACCEPTS`), `hedera.mjs` (`MAX_MIRROR_ROWS`), `x402.mjs` (response headers) and
+   `Model.js` (`MAX_LEDGER_ROWS`); `chip402d.mjs` caps `/fetch` urls and every ledger field.
+2. Files: `daemon/lib/safeio.mjs` is the only way state, keys, the token and the log are
+   opened — `O_NOFOLLOW`, `fstat` on the descriptor, owner, type, size, mode at open.
+   `CONFIG_DIR` and `STATE_DIR` are `0700`, re-tightened through their descriptors.
+3. QML rich text: every `Text` in `Panel.qml` and `ChipIcon.qml` sets
+   `textFormat: Text.PlainText`. Host components (`PanelHero`, `PanelToolTip`) cannot be set
+   from here, so `Model.parseState` strips markup and control characters and clamps lengths at
+   the boundary. Keep both halves.
+4. Supply chain: `runtime/package.json` pins `@hashgraph/sdk` exactly, `runtime/package-lock.json`
+   carries the integrity hashes, `ensureRuntime` installs with `npm ci --ignore-scripts` over
+   argv, and `loadSdk` refuses a runtime directory installed from a different lockfile.
+5. Secrets: keys and the bearer token are read through `readVerified` at mode 600; nothing
+   goes in argv or a child environment. The README documents the TCP token over stdin.
+6. Privilege: `Service.qml` launches argv only — no shell, no login shell. `openUrl` takes
+   https and nothing else. `allow "*"` is refused on every network.
+
+The panel reads state over the daemon's socket (`GET /status`), never off disk. If you are
+tempted to reintroduce `FileView` on `state.json`, that is the shape the marketplace has
+blocked at least seven times.
+
 ## Layout
 
 ```
 manifest.json          bar-widget, id chip402
 Panel.qml Service.qml Model.js ChipIcon.qml
 daemon/chip402d.mjs  unix socket $XDG_RUNTIME_DIR/chip402.sock (mode 600); TCP is opt-in
-daemon/lib/{hedera,x402,policy,state,networks,facilitator,client,sdk,paths,log}.mjs
+daemon/lib/{hedera,x402,policy,state,safeio,networks,facilitator,client,sdk,paths,log}.mjs
+runtime/{package.json,package-lock.json}  reviewed dependency graph, installed with npm ci
 demo/seller.mjs        127.0.0.1:4403
 bin/chip402          CLI
-test/{e2e,accounting,transport}.test.mjs
+test/{e2e,accounting,transport,hardening,mainnet-switch}.test.mjs
 ```
 
 Talk to the daemon with `curl --unix-socket "$XDG_RUNTIME_DIR/chip402.sock" http://chip402.local/status`.
-QML cannot: `XMLHttpRequest` is TCP-only, so `Service.qml` shells out to curl.
+QML cannot: `XMLHttpRequest` is TCP-only, so `Service.qml` runs curl as argv — no shell — and
+applies the response body it gets back. That response is where the panel's state comes from.
 
 Secrets live **outside** the repo:
 
 - `~/.config/chip402/key` and `merchant-key` (mode 600; daemon refuses looser)
 - `~/.config/chip402/config.json`
-- `~/.local/state/chip402/state.json` (QML FileView)
+- `~/.local/state/chip402/state.json` (daemon only; the panel reads `GET /status` instead)
 
 Never commit keys. Never `chmod` the key file to anything but 600.
 

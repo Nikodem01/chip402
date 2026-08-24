@@ -34,23 +34,19 @@ export async function cancelBody(res) {
   }
 }
 
+// Streaming is the only way a body is read here. res.text() and res.json() would have to
+// materialize the whole body before any limit could look at it, which is a check after the
+// fact and no ceiling at all — so there is no fallback to them, not even for a response that
+// merely looks small. A body that cannot be streamed is refused.
 export async function readCapped(res, { maxBytes = MAX_RESPONSE_BYTES } = {}) {
   if (!res) return "";
-  if (res.body && typeof res.body.getReader === "function") {
-    return readStream(res.body, maxBytes);
+  if (res.body === null || res.body === undefined) return "";
+  if (typeof res.body.getReader !== "function") {
+    const error = new Error("response body is not streamable; refusing to read it unbounded");
+    error.code = "unstreamable_body";
+    throw error;
   }
-  if (typeof res.text === "function") {
-    const text = await res.text();
-    assertByteLimit(text, maxBytes);
-    return text;
-  }
-  if (typeof res.json === "function") {
-    const json = await res.json();
-    const text = typeof json === "string" ? json : JSON.stringify(json);
-    assertByteLimit(text, maxBytes);
-    return text;
-  }
-  return "";
+  return readStream(res.body, maxBytes);
 }
 
 export async function readCappedJson(res, opts = {}) {
@@ -62,12 +58,6 @@ export async function readCappedJson(res, opts = {}) {
     const error = new Error(`response is not JSON: ${err.message}`);
     error.code = "not_json";
     throw error;
-  }
-}
-
-function assertByteLimit(text, maxBytes) {
-  if (Buffer.byteLength(String(text), "utf8") > maxBytes) {
-    throw new ResponseLimitError(maxBytes);
   }
 }
 

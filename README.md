@@ -31,7 +31,7 @@ This is not a general-purpose wallet. It is pocket-money chips for agents.
 
 ## Install
 
-Needs Node.js 22+ and `npm`. The Hedera SDK is installed **outside** the plugin directory (the Omarchy validator forbids symlinks, and the SDK is large).
+Needs Node.js 22+, `npm`, `curl` and `wl-copy` (wl-clipboard). The Hedera SDK is installed **outside** the plugin directory (the Omarchy validator forbids symlinks, and the SDK is large) — from the lockfile committed at `runtime/package-lock.json`, with `npm ci --ignore-scripts`, so the dependency graph that signs your payments is the one in this repository and no package's install hook runs. If `node` lives somewhere only a login shell would find it (nvm, asdf), set `CHIP402_NODE` to its path before starting the bar.
 
 ```bash
 omarchy plugin add https://github.com/Nikodem01/chip402 --enable --yes
@@ -128,8 +128,13 @@ For an agent that cannot use a unix socket, TCP is opt-in and needs a bearer tok
 ```bash
 chip402 token          # writes ~/.config/chip402/token, mode 600
 chip402 config tcp on  # then restart the daemon
-curl -sS -H "authorization: Bearer $(cat ~/.config/chip402/token)" \
-  http://127.0.0.1:4402/status
+
+# Read the token into the shell, then hand curl the header from a file it reads on stdin.
+# A command line is visible to every process running as you, through /proc — so the token
+# never goes in one.
+TOKEN=$(cat ~/.config/chip402/token)
+printf 'header = "authorization: Bearer %s"\n' "$TOKEN" |
+  curl -sS --config - http://127.0.0.1:4402/status
 ```
 
 Over TCP the daemon validates the `Host` header and refuses any request carrying `Origin`
@@ -252,7 +257,7 @@ verify or settle a payment. The code paths are unit-tested against stubs. The ne
 | --- | --- |
 | Daily | 10 USDC |
 | Per request | 1 USDC |
-| Allowed hosts | `127.0.0.1`, `localhost`, `[::1]` |
+| Allowed hosts | `127.0.0.1`, `localhost`, `[::1]` (named one at a time; `*` is refused on every network) |
 | Network | Hedera testnet |
 | Facilitator | `https://x402.org/facilitator` |
 
@@ -282,4 +287,4 @@ chip402 tail                      # the same, refreshing every 2s
 
 ## License
 
-MIT. External dependency: [`@hashgraph/sdk`](https://www.npmjs.com/package/@hashgraph/sdk) (Apache-2.0), installed into `~/.local/state/chip402/runtime` and never vendored inside the plugin tree.
+MIT. External dependency: [`@hashgraph/sdk`](https://www.npmjs.com/package/@hashgraph/sdk) (Apache-2.0), pinned to an exact version in `runtime/package.json` and to a full integrity-hashed graph in `runtime/package-lock.json`. The code is installed into `~/.local/state/chip402/runtime` rather than vendored inside the plugin tree; the daemon refuses to load it if that directory was installed from any other lockfile.

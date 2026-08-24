@@ -361,6 +361,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: chip402.actionStatus !== "" || chip402.displayError !== "" || root.holdReason !== ""
             width: parent.width
             text: chip402.actionStatus !== ""
@@ -438,6 +439,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.ledgerRows.length === 0
               width: parent.width
               text: root.emptyLedgerText()
@@ -492,6 +494,7 @@ Panel {
             // Says how much the panel is not showing, and where the rest is. Without it the
             // trimming would read as "this is everything".
             Text {
+              textFormat: Text.PlainText
               visible: root.hiddenLabelText !== ""
               width: parent.width
               text: root.hiddenLabelText
@@ -519,6 +522,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Daily cap  ·  " + Model.formatUsd(chip402.dailyCapMicro)
               color: root.dim
@@ -543,6 +547,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Per request  ·  " + Model.formatUsd(chip402.perRequestMicro)
               color: root.dim
@@ -569,6 +574,7 @@ Panel {
             // Raising a cap is the most privileged act in the system, so it stays visible —
             // beside the sliders that did it, not interleaved with payments at equal weight.
             Text {
+              textFormat: Text.PlainText
               visible: root.auditSummaryText !== ""
               width: parent.width
               text: root.auditSummaryText
@@ -640,6 +646,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.setupTitle()
           color: root.foreground
@@ -649,6 +656,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: root.setupSubtitle()
           color: root.dim
@@ -741,6 +749,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: "Account"
         color: root.foreground
         opacity: 0.6
@@ -749,6 +758,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         Layout.fillWidth: true
         text: chip402.accountId
         color: root.foreground
@@ -806,6 +816,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: Model.ledgerGlyph(ledgerRow.row)
         color: ledgerRow.blocked ? root.dim : root.foreground
         font.family: root.fontFamily
@@ -823,6 +834,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: Model.ledgerTitle(ledgerRow.row)
             color: ledgerRow.blocked ? root.dim : root.foreground
@@ -832,6 +844,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: Model.ledgerTime(ledgerRow.row)
             color: root.dim
             font.family: root.fontFamily
@@ -844,6 +857,7 @@ Panel {
           // Not hidden when empty: a blocked row has no amount, and collapsing the slot
           // would slide its time out of the column the payments above it line up in.
           Text {
+            textFormat: Text.PlainText
             text: Model.ledgerAmount(ledgerRow.row)
             color: root.foreground
             font.family: root.fontFamily
@@ -857,6 +871,7 @@ Panel {
         // Only rows with something unusual about them get a second line, so a routine
         // receipt stays one line and anything that is not routine gains weight by being two.
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: text !== ""
           text: Model.ledgerNote(ledgerRow.row)
@@ -892,6 +907,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
+        textFormat: Text.PlainText
         text: root.denialsExpanded ? "󰅀" : "󰅂"
         color: root.dim
         font.family: root.fontFamily
@@ -900,6 +916,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         id: denialText
         Layout.fillWidth: true
         text: root.denialSummaryText
@@ -917,6 +934,7 @@ Panel {
     width: parent.width
     spacing: Style.space(8)
     Text {
+      textFormat: Text.PlainText
       text: label
       color: root.foreground
       opacity: 0.6
@@ -928,6 +946,7 @@ Panel {
       height: 1
     }
     Text {
+      textFormat: Text.PlainText
       text: value
       color: root.foreground
       font.family: root.fontFamily

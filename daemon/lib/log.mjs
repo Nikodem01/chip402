@@ -1,11 +1,31 @@
 import fs from "node:fs/promises";
-import { LOG_PATH, STATE_DIR } from "./paths.mjs";
+import { KEY_MODE, LOG_PATH, STATE_DIR } from "./paths.mjs";
+import { ensureOwnedDir, openVerifiedAppend } from "./safeio.mjs";
 
-await fs.mkdir(STATE_DIR, { recursive: true });
-try {
-  await fs.chmod(LOG_PATH, 0o600);
-} catch {
-  // Not created yet; the first append below makes it, and the daemon's umask keeps it tight.
+// One line per event, and the events are driven from outside: a mirror node that stays down
+// produces one every refresh. So the log is bounded like any other buffer — a byte ceiling per
+// line and a size ceiling for the file, after which it is rotated to a single .1 and started
+// again. Two files, never more.
+const MAX_LINE_BYTES = 4_000;
+const MAX_LOG_BYTES = 4_000_000;
+
+let handle = null;
+let written = 0;
+
+async function logHandle() {
+  if (handle) return handle;
+  await ensureOwnedDir(STATE_DIR);
+  handle = await openVerifiedAppend(LOG_PATH, KEY_MODE);
+  written = (await handle.stat()).size;
+  return handle;
+}
+
+async function rotate() {
+  const current = handle;
+  handle = null;
+  written = 0;
+  if (current) await current.close();
+  await fs.rename(LOG_PATH, `${LOG_PATH}.1`).catch(() => {});
 }
 
 // Anything that looks like key material or a signed transaction body never reaches the log.
@@ -29,10 +49,17 @@ export function redact(line) {
 }
 
 export async function log(...args) {
-  const line = redact(`[${new Date().toISOString()}] ${args.map(stringify).join(" ")}\n`);
+  let line = redact(`[${new Date().toISOString()}] ${args.map(stringify).join(" ")}`);
+  if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
+    line = `${Buffer.from(line, "utf8").subarray(0, MAX_LINE_BYTES).toString("utf8")}… [truncated]`;
+  }
+  line += "\n";
   process.stderr.write(line);
   try {
-    await fs.appendFile(LOG_PATH, line, { mode: 0o600 });
+    if (written >= MAX_LOG_BYTES) await rotate();
+    const fh = await logHandle();
+    await fh.write(line);
+    written += Buffer.byteLength(line, "utf8");
   } catch {
     // Logging must never take down the daemon.
   }

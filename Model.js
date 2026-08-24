@@ -28,6 +28,39 @@ function emptyState() {
   }
 }
 
+// Everything the panel renders arrives from outside it — seller hostnames, facilitator error
+// codes, mirror-node fields — and some of it ends up in host shell components this plugin
+// cannot set textFormat on. So the boundary is here: markup and control characters come off,
+// every string gets a length, every collection gets a count. Once, in one place.
+var MAX_LEDGER_ROWS = 50
+var MAX_ALLOW_HOSTS = 64
+var MAX_FIELD_CHARS = 240
+var MAX_ID_CHARS = 64
+
+function clamp(value, max) {
+  var text = String(value === undefined || value === null ? "" : value)
+  text = text.replace(/[\u0000-\u001f\u007f\u2028\u2029]/g, " ").replace(/[<>&]/g, "")
+  var limit = max === undefined ? MAX_FIELD_CHARS : max
+  if (text.length > limit) text = text.substring(0, limit) + "…"
+  return text
+}
+
+function clampRow(row) {
+  if (!row || typeof row !== "object") return null
+  var out = {}
+  for (var key in row) {
+    if (!Object.prototype.hasOwnProperty.call(row, key)) continue
+    var value = row[key]
+    if (typeof value === "string") out[key] = clamp(value)
+    else if (typeof value === "number" || typeof value === "boolean") out[key] = value
+  }
+  return out
+}
+
+function isMicro(value) {
+  return /^[0-9]{1,24}$/.test(String(value))
+}
+
 function parseState(raw) {
   var text = String(raw || "").trim()
   if (text === "") return emptyState()
@@ -42,12 +75,40 @@ function parseState(raw) {
     if (data.caps && data.caps.perRequestMicro) next.perRequestMicro = String(data.caps.perRequestMicro)
     if (data.dailyCapMicro) next.dailyCapMicro = String(data.dailyCapMicro)
     if (data.perRequestMicro) next.perRequestMicro = String(data.perRequestMicro)
-    if (!Array.isArray(next.ledger)) next.ledger = []
+
+    var rows = Array.isArray(next.ledger) ? next.ledger : []
+    next.ledger = []
+    for (var i = 0; i < rows.length && next.ledger.length < MAX_LEDGER_ROWS; i++) {
+      var row = clampRow(rows[i])
+      if (row !== null) next.ledger.push(row)
+    }
+    var hosts = Array.isArray(next.allowHosts) ? next.allowHosts : []
+    next.allowHosts = []
+    for (var h = 0; h < hosts.length && h < MAX_ALLOW_HOSTS; h++) {
+      next.allowHosts.push(clamp(hosts[h], MAX_ID_CHARS))
+    }
+
+    next.accountId = clamp(next.accountId, MAX_ID_CHARS)
+    next.evmAddress = clamp(next.evmAddress, MAX_ID_CHARS)
+    next.merchantAccountId = clamp(next.merchantAccountId, MAX_ID_CHARS)
+    next.merchantEvmAddress = clamp(next.merchantEvmAddress, MAX_ID_CHARS)
+    next.feePayer = clamp(next.feePayer, MAX_ID_CHARS)
+    next.hashscan = clamp(next.hashscan, 200)
+    next.facilitatorError = clamp(next.facilitatorError)
+    next.floatWarning = clamp(next.floatWarning)
+    next.lastError = clamp(next.lastError)
+    next.balanceMicro = isMicro(next.balanceMicro) ? String(next.balanceMicro) : "0"
+    next.spentTodayMicro = isMicro(next.spentTodayMicro) ? String(next.spentTodayMicro) : "0"
+    next.dailyCapMicro = isMicro(next.dailyCapMicro) ? String(next.dailyCapMicro) : "0"
+    next.perRequestMicro = isMicro(next.perRequestMicro) ? String(next.perRequestMicro) : "0"
+
     next.paused = data.paused === true
-    next.configured = data.configured === true || String(next.accountId || "") !== ""
+    next.configured = data.configured === true || next.accountId !== ""
     next.hollow = data.hollow === true
     next.balanceFresh = balanceIsFresh(next.balanceAt)
-    next.pendingMicro = pendingMicro(next.ledger)
+    // The daemon adds this up in integer micro-USDC. Prefer its answer over re-adding
+    // invoice amounts here, where the only arithmetic available is floating point.
+    next.pendingMicro = isMicro(data.pendingMicro) ? String(data.pendingMicro) : pendingMicro(next.ledger)
     return next
   } catch (e) {
     return emptyState()
@@ -67,13 +128,33 @@ function balanceIsFresh(balanceAt, nowMs) {
   return now - at <= 120000
 }
 
+// Decimal string addition rather than Number: an invoice amount is chosen by the seller, and
+// beyond 2^53 micro-USDC floating point starts rounding money.
+function addMicro(a, b) {
+  var x = String(a).replace(/^0+(?=\d)/, "")
+  var y = String(b).replace(/^0+(?=\d)/, "")
+  var out = ""
+  var carry = 0
+  for (var i = 0; i < Math.max(x.length, y.length) || carry; i++) {
+    var da = i < x.length ? Number(x.charAt(x.length - 1 - i)) : 0
+    var db = i < y.length ? Number(y.charAt(y.length - 1 - i)) : 0
+    var sum = da + db + carry
+    out = String(sum % 10) + out
+    carry = sum >= 10 ? 1 : 0
+  }
+  return out === "" ? "0" : out
+}
+
 function pendingMicro(ledger) {
   var rows = Array.isArray(ledger) ? ledger : []
-  var total = 0
+  var total = "0"
   for (var i = 0; i < rows.length; i++) {
-    if (rows[i] && rows[i].status === "pending") total += Number(String(rows[i].amountMicro || "0")) || 0
+    if (!rows[i] || rows[i].status !== "pending") continue
+    var amount = String(rows[i].amountMicro || "0")
+    if (!/^[0-9]{1,24}$/.test(amount)) continue
+    total = addMicro(total, amount)
   }
-  return String(total)
+  return total
 }
 
 function splitMicro(micro) {
@@ -118,7 +199,11 @@ function microToNumber(micro) {
 // No base means the daemon has not told us which network this is. Render no link at all
 // rather than guess an explorer that could belong to the wrong network.
 function hashscanBase(base) {
-  return String(base || "").replace(/\/$/, "")
+  var root = String(base || "").replace(/\/$/, "")
+  // Nothing but an https explorer base is a link. The panel hands the result to a browser
+  // launcher, so a base that arrived as anything else renders as no link at all.
+  if (root.indexOf("https://") !== 0 || /\s/.test(root) || root.length > 200) return ""
+  return root
 }
 
 function hashscanTx(txId, base) {
@@ -501,6 +586,7 @@ if (typeof module !== "undefined") {
     ledgerGlyph: ledgerGlyph,
     auditTitle: auditTitle,
     microToNumber: microToNumber,
+    clamp: clamp,
     humanError: humanError
   }
 }

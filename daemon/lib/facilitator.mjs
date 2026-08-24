@@ -126,7 +126,8 @@ export function createDiscovery({
       network,
       feePayer,
       kind,
-      extensions: Array.isArray(supported.extensions) ? supported.extensions : [],
+      // Held in a long-lived cache, so the list a facilitator advertises gets a count.
+      extensions: (Array.isArray(supported.extensions) ? supported.extensions : []).slice(0, 64),
       at: now(),
     };
     cache.set(id, entry);

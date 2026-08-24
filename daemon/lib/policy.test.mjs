@@ -57,8 +57,10 @@ test("allowlist matches loopback and refuses everything else", () => {
   assert.equal(hostAllowed("evil.example", ["localhost"]), false);
 });
 
-test("a literal * is honoured on testnet and refused on mainnet", () => {
-  assert.equal(hostAllowed("api.example", ["*"]), true);
+test("a literal * is refused on every network, testnet included", () => {
+  const testnet = checkHost({ url: "https://api.example/x", allowHosts: ["*"] });
+  assert.equal(testnet.ok, false);
+  assert.match(testnet.reason, /not honoured on hedera:testnet/);
   const denied = checkHost({ url: "https://api.example/x", allowHosts: ["*"], profile: MAINNET });
   assert.equal(denied.ok, false);
   assert.match(denied.reason, /not honoured on hedera:mainnet/);

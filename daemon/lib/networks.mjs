@@ -20,7 +20,10 @@ export const NETWORKS = {
     defaultMaxFloatUsdcMicro: "20000000",
     defaultMaxFloatHbarTinybars: "2000000000",
     hbarDustTinybars: "50000000",
-    allowWildcardHosts: true,
+    // A single `chip402 allow "*"` used to turn the host allowlist off on the network this
+    // build actually runs on — the one control that decides who can be paid at all. Hosts
+    // are named explicitly on every network now.
+    allowWildcardHosts: false,
   },
   "hedera:mainnet": {
     id: "hedera:mainnet",

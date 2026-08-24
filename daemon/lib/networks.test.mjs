@@ -23,7 +23,7 @@ test("testnet profile", () => {
   assert.equal(profile.usdc, "0.0.429274");
   assert.equal(profile.feePayer, "0.0.9185802");
   assert.match(profile.hashscan, /testnet/);
-  assert.equal(profile.allowWildcardHosts, true);
+  assert.equal(profile.allowWildcardHosts, false);
 });
 
 test("only USDC is a spend asset; HBAR is known but not spendable", () => {

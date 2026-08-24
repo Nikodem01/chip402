@@ -69,22 +69,45 @@ async function daemonUp() {
   return socketUp(target, { token });
 }
 
+// The dependency graph that gets installed is the one in this repository, at the SHA a
+// reviewer read: an exact version in runtime/package.json and every transitive package
+// pinned by integrity hash in runtime/package-lock.json. Those two files are copied into
+// the runtime directory and installed with `npm ci`, which fails rather than resolving
+// anything new, and with --ignore-scripts, so no package's lifecycle hook runs. There is no
+// fallback to `npm install`: an install that cannot be reproduced from the reviewed bytes
+// is an install this daemon refuses to make.
 async function ensureRuntime() {
-  await fs.mkdir(RUNTIME_DIR, { recursive: true });
-  const pkg = path.join(RUNTIME_DIR, "package.json");
+  const manifest = await readReviewed("package.json");
+  const lock = await readReviewed("package-lock.json");
+  await fs.mkdir(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+
+  const installed = await Promise.all([
+    readIfPresent(path.join(RUNTIME_DIR, "package.json")),
+    readIfPresent(path.join(RUNTIME_DIR, "package-lock.json")),
+    fs.access(path.join(RUNTIME_DIR, "node_modules", "@hashgraph", "sdk")).then(() => true, () => false),
+  ]);
+  if (installed[0] === manifest && installed[1] === lock && installed[2] === true) return;
+
+  await fs.writeFile(path.join(RUNTIME_DIR, "package.json"), manifest);
+  await fs.writeFile(path.join(RUNTIME_DIR, "package-lock.json"), lock);
+  console.error(`Installing the reviewed dependency set into ${RUNTIME_DIR} …`);
+  await run("npm", ["ci", "--omit=dev", "--ignore-scripts", "--no-fund", "--no-audit"], { cwd: RUNTIME_DIR });
+}
+
+async function readReviewed(name) {
+  const file = path.join(root, "runtime", name);
   try {
-    await fs.access(pkg);
+    return await fs.readFile(file, "utf8");
   } catch {
-    await fs.writeFile(
-      pkg,
-      `${JSON.stringify({ name: "chip402-runtime", private: true, type: "module", dependencies: { "@hashgraph/sdk": "^2.81.0" } }, null, 2)}\n`,
-    );
+    throw new Error(`Reviewed ${name} is missing at ${file}. chip402 installs only from its committed lockfile.`);
   }
+}
+
+async function readIfPresent(file) {
   try {
-    await fs.access(path.join(RUNTIME_DIR, "node_modules", "@hashgraph", "sdk"));
+    return await fs.readFile(file, "utf8");
   } catch {
-    console.error(`Installing @hashgraph/sdk into ${RUNTIME_DIR} …`);
-    await run("bash", ["-lc", "npm install --omit=dev --no-fund --no-audit"], { cwd: RUNTIME_DIR });
+    return null;
   }
 }
 
@@ -164,20 +187,27 @@ function newerThan(row, cutoff) {
   return Number.isFinite(at) && at >= cutoff;
 }
 
+// A ledger row carries a seller's hostname and a facilitator's error text. Printed to a
+// terminal as-is, an escape sequence in either one moves the cursor, repaints earlier lines
+// or retitles the window. The panel strips the same characters for the same reason.
+function plain(value) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, " ");
+}
+
 function printLogRow(row) {
   const when = new Date(row.ts).toLocaleString();
   if (row.kind === "audit") {
-    console.log(`${when}  audit    ${row.action}`);
-    if (row.detail) console.log(`  ${row.detail}`);
+    console.log(`${when}  audit    ${plain(row.action)}`);
+    if (row.detail) console.log(`  ${plain(row.detail)}`);
     return;
   }
   const amount = `${microToUsd(row.amountMicro)} USDC`.padStart(14);
-  const where = row.host || row.url || "";
-  console.log(`${when}  ${String(row.status || "").padEnd(8)}${amount}  ${where}${row.firstSight ? "  *new payee*" : ""}`);
+  const where = plain(row.host || row.url || "");
+  console.log(`${when}  ${plain(row.status).padEnd(8)}${amount}  ${where}${row.firstSight ? "  *new payee*" : ""}`);
   // The panel abbreviates these to a short label and drops them past today. Here they are whole.
-  if (row.reason) console.log(`  ${row.code ? `${row.code}: ` : ""}${row.reason}`);
-  if (row.txId) console.log(`  ${row.txId}`);
-  if (row.hashscan) console.log(`  ${row.hashscan}`);
+  if (row.reason) console.log(`  ${row.code ? `${plain(row.code)}: ` : ""}${plain(row.reason)}`);
+  if (row.txId) console.log(`  ${plain(row.txId)}`);
+  if (row.hashscan) console.log(`  ${plain(row.hashscan)}`);
 }
 
 function microToUsd(value) {
@@ -312,9 +342,9 @@ async function printStatus() {
   const status = await api("POST", "/refresh");
   const line = status.paused ? "PAUSED" : status.configured ? "LIVE" : "NEEDS FUNDING";
   console.log(`chip402  ${line}`);
-  console.log(`Network    ${status.network || TESTNET.id}`);
+  console.log(`Network    ${plain(status.network) || TESTNET.id}`);
   console.log(`Transport  ${tcp ? `127.0.0.1:${DEFAULT_PORT} (TCP)` : SOCKET_PATH}`);
-  console.log(`Account    ${status.accountId || "—"}  ${status.evmAddress || ""}`);
+  console.log(`Account    ${plain(status.accountId) || "—"}  ${plain(status.evmAddress)}`);
   console.log(
     `Balance    ${microToUsd(status.balanceMicro)} USDC${status.balanceFresh ? "" : "  (STALE — payments denied)"}`,
   );
@@ -323,14 +353,14 @@ async function printStatus() {
     console.log(`Pending    ${microToUsd(status.pendingMicro)} USDC in flight`);
   }
   console.log(`Per req    ${microToUsd(status.perRequestMicro)} USDC`);
-  console.log(`Fee payer  ${status.feePayer || "— (discovery failed; payments denied)"}`);
+  console.log(`Fee payer  ${plain(status.feePayer) || "— (discovery failed; payments denied)"}`);
   if (status.hollow) console.log("Account    hollow — no key on record yet, completing it");
   if (status.associated === false) console.log("USDC       not associated yet");
-  console.log(`Hosts      ${(status.allowHosts || []).join(", ")}`);
-  if (status.accountUrl) console.log(`HashScan   ${status.accountUrl}`);
-  if (status.floatWarning) console.log(`Float      ${status.floatWarning}`);
-  if (status.facilitatorError) console.log(`Facilitator ${status.facilitatorError}`);
-  if (status.lastError) console.log(`Error      ${status.lastError}`);
+  console.log(`Hosts      ${(status.allowHosts || []).map(plain).join(", ")}`);
+  if (status.accountUrl) console.log(`HashScan   ${plain(status.accountUrl)}`);
+  if (status.floatWarning) console.log(`Float      ${plain(status.floatWarning)}`);
+  if (status.facilitatorError) console.log(`Facilitator ${plain(status.facilitatorError)}`);
+  if (status.lastError) console.log(`Error      ${plain(status.lastError)}`);
 }
 
 const [cmd, ...rest] = process.argv.slice(2);

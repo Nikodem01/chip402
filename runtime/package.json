@@ -1,0 +1,11 @@
+{
+  "name": "chip402-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reviewed dependency set for the chip402 daemon. Installed with `npm ci` from the committed lockfile.",
+  "license": "MIT",
+  "dependencies": {
+    "@hashgraph/sdk": "2.81.0"
+  }
+}

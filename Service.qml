@@ -39,10 +39,14 @@ Item {
   readonly property string socketPath: Quickshell.env("CHIP402_SOCKET")
     || ((Quickshell.env("XDG_RUNTIME_DIR") || (root.stateDir + "/run")) + "/chip402.sock")
 
-  // Same override the daemon's paths.mjs honours, so the panel can be pointed at a fixture
-  // ledger without touching the real one.
+  // Same override the daemon's paths.mjs honours, so a second profile never touches the live
+  // state. Only the socket location is derived from it; the panel never reads state off disk.
   readonly property string stateDir:
     Quickshell.env("CHIP402_STATE_DIR") || (Quickshell.env("HOME") + "/.local/state/chip402")
+
+  // The daemon is `node <script>`. Which node that is comes from the session's PATH; set
+  // CHIP402_NODE when node lives somewhere only a login shell would have found (nvm, asdf).
+  readonly property string nodeBinary: Quickshell.env("CHIP402_NODE") || "node"
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property string phase: Model.setupPhase(evmAddress, accountId, hollow, associated, balanceMicro)
@@ -52,18 +56,11 @@ Item {
   readonly property string displayError: Model.humanError(lastError)
   readonly property string pluginDir: pluginPath()
 
-  property FileView stateFile: FileView {
-    path: root.stateDir + "/state.json"
-    watchChanges: true
-    printErrors: false
-    onFileChanged: reload()
-    onLoaded: root.applyState(text())
-    onLoadFailed: root.applyState("")
-  }
+  readonly property int maxErrorChars: 240
 
   function pluginPath() {
     var u = Qt.resolvedUrl(".").toString()
-    if (u.indexOf("file://") === 0) u = u.substring(7)
+    if (u.indexOf("file://") === 0) u = decodeURIComponent(u.substring(7))
     if (u.length > 0 && u.charAt(u.length - 1) === "/") u = u.substring(0, u.length - 1)
     return u
   }
@@ -81,50 +78,61 @@ Item {
     return n
   }
 
+  // Every field arrives already clamped and stripped by Model.parseState, because some of
+  // them end up in host shell components this plugin cannot set textFormat on.
   function applyState(raw) {
     var parsed = Model.parseState(raw)
     paused = parsed.paused === true
     configured = parsed.configured === true
     associated = parsed.associated === true
-    accountId = String(parsed.accountId || "")
-    evmAddress = String(parsed.evmAddress || "")
-    merchantAccountId = String(parsed.merchantAccountId || "")
-    balanceMicro = String(parsed.balanceMicro || "0")
-    spentTodayMicro = String(parsed.spentTodayMicro || "0")
-    dailyCapMicro = String(parsed.dailyCapMicro || "10000000")
-    perRequestMicro = String(parsed.perRequestMicro || "1000000")
+    accountId = parsed.accountId
+    evmAddress = parsed.evmAddress
+    merchantAccountId = parsed.merchantAccountId
+    balanceMicro = parsed.balanceMicro
+    spentTodayMicro = parsed.spentTodayMicro
+    dailyCapMicro = parsed.dailyCapMicro
+    perRequestMicro = parsed.perRequestMicro
     hollow = parsed.hollow === true
     balanceFresh = parsed.balanceFresh === true
-    pendingMicro = String(parsed.pendingMicro || "0")
-    feePayer = String(parsed.feePayer || "")
-    facilitatorError = String(parsed.facilitatorError || "")
-    floatWarning = String(parsed.floatWarning || "")
-    allowHosts = parsed.allowHosts || []
+    pendingMicro = parsed.pendingMicro
+    feePayer = parsed.feePayer
+    facilitatorError = parsed.facilitatorError
+    floatWarning = parsed.floatWarning
+    allowHosts = parsed.allowHosts
     // Whatever network the daemon is on — never a hardcoded explorer.
-    hashscan = String(parsed.hashscan || "")
-    ledger = parsed.ledger || []
-    lastError = String(parsed.lastError || "")
+    hashscan = parsed.hashscan
+    ledger = parsed.ledger
+    lastError = parsed.lastError
   }
 
-  function quote(value) {
-    return "'" + String(value || "").replace(/'/g, "'\\''") + "'"
-  }
-
+  // argv, never a shell string: nothing here is parsed by bash, so no quoting rule stands
+  // between a hostname in a ledger row and a command line. curl gets a deadline and a byte
+  // ceiling both, because the collector below has no limit of its own — the producer is the
+  // only place a limit can be enforced.
   function curlFor(path, body) {
-    return [
-      "bash", "-lc",
-      "exec curl -sS --fail-with-body --max-time 15 --unix-socket " + quote(socketPath)
-        + " -H 'content-type: application/json'"
-        + " -d " + quote(JSON.stringify(body || {}))
-        + " " + quote("http://chip402.local" + path)
+    var argv = [
+      "curl", "-sS", "--fail-with-body",
+      "--max-time", "15",
+      "--connect-timeout", "5",
+      "--max-filesize", "262144",
+      "--unix-socket", socketPath
     ]
+    if (body !== null && body !== undefined) {
+      argv.push("-H", "content-type: application/json")
+      argv.push("-d", JSON.stringify(body))
+    }
+    argv.push("http://chip402.local" + path)
+    return argv
   }
 
-  // Process is single-shot, so calls queue rather than clobbering one another.
+  // Process is single-shot, so calls queue rather than clobbering one another. The queue is
+  // bounded: a daemon that stops answering must not grow a backlog for the whole session.
   property var pending: []
+  readonly property int maxPending: 8
 
   function post(path, body, okMessage) {
-    pending.push({ path: path, body: body || {}, okMessage: okMessage || "" })
+    if (pending.length >= maxPending) return
+    pending.push({ path: path, body: body, okMessage: okMessage || "" })
     drain()
   }
 
@@ -138,9 +146,13 @@ Item {
     apiProcess.running = true
   }
 
+  // A read, not a write: GET /status returns the same view every mutating call returns, so
+  // the panel never has to open the daemon's state file to find out what happened.
   function refresh() {
-    if (!daemon.running) daemon.running = true
-    post("/refresh", {}, "")
+    for (var i = 0; i < pending.length; i++) {
+      if (pending[i].path === "/status") return
+    }
+    post("/status", null, "")
   }
 
   function pause() {
@@ -166,23 +178,31 @@ Item {
     post("/caps", { perRequestMicro: Model.usdToMicro(usd) })
   }
 
+  // These are account ids and explorer links — public identifiers, not secrets — so argv is
+  // where they belong. A password would have to go over stdin instead.
   function copy(text) {
     var value = String(text || "")
     if (value === "") return
-    Quickshell.execDetached(["bash", "-c", "printf %s " + quote(value) + " | wl-copy"])
+    Quickshell.execDetached(["wl-copy", "--", value])
     actionStatus = "Copied"
     actionStatusTimer.restart()
   }
 
+  // The launcher is handed whatever came back over the socket, so the shape is checked here
+  // rather than assumed: https only, no whitespace, and a length a real explorer link fits in.
   function openUrl(url) {
     var value = String(url || "")
-    if (value === "") return
+    if (value.indexOf("https://") !== 0) return
+    if (value.length > 512) return
+    if (/\s/.test(value)) return
     Quickshell.execDetached(["omarchy-launch-browser", value])
   }
 
+  // Rebuilt from the transaction id and the daemon's explorer base rather than taken from
+  // the row's own link field, so a seller-chosen string is never what gets launched.
   function openHashscan(row) {
     if (!row) return
-    var url = row.hashscan || Model.hashscanTx(row.txId, hashscan)
+    var url = Model.hashscanTx(row.txId, hashscan)
     if (url !== "") openUrl(url)
   }
 
@@ -195,7 +215,7 @@ Item {
     actionStatus = "Writing operator key…"
     actionStatusTimer.restart()
     setupProcess.running = false
-    setupProcess.command = ["bash", "-lc", "exec node " + quote(pluginDir + "/bin/chip402") + " setup"]
+    setupProcess.command = [nodeBinary, pluginDir + "/bin/chip402", "setup"]
     setupProcess.running = true
   }
 
@@ -215,23 +235,33 @@ Item {
     onTriggered: root.refresh()
   }
 
-  Timer {
-    id: delayedState
-    interval: 1500
-    running: true
-    onTriggered: root.stateFile.reload()
-  }
+  property int daemonAttempts: 0
+  readonly property int maxDaemonAttempts: 5
+  property bool daemonHandedOff: false
 
+  // No StdioCollector on this one, on purpose: it runs for the whole session, so a collector
+  // would buffer every line it ever writes inside the shell process with nothing draining it.
+  // The daemon keeps its own rotated log at ~/.local/state/chip402/chip402d.log.
   Process {
     id: daemon
     running: true
-    command: ["bash", "-lc", "exec node " + root.quote(root.pluginDir + "/daemon/chip402d.mjs")]
-    stdout: StdioCollector { waitForEnd: false }
-    stderr: StdioCollector { waitForEnd: false }
+    command: [root.nodeBinary, root.pluginDir + "/daemon/chip402d.mjs"]
     onRunningChanged: if (running) root.daemonUp = true
-    onExited: function(code) {
+    onExited: function (code) {
       root.daemonUp = false
-      if (code !== 0) restartDaemon.restart()
+      // Exit 0 means another chip402d already owns the socket. That one serves us, and
+      // starting ours again would spawn a node process on every refresh for the whole session.
+      if (code === 0) {
+        root.daemonHandedOff = true
+        return
+      }
+      if (root.daemonAttempts < root.maxDaemonAttempts) {
+        root.daemonAttempts += 1
+        restartDaemon.interval = 2000 * root.daemonAttempts
+        restartDaemon.restart()
+      } else {
+        root.lastError = "chip402d could not start — see ~/.local/state/chip402/chip402d.log"
+      }
     }
   }
 
@@ -239,7 +269,7 @@ Item {
     id: restartDaemon
     interval: 2000
     repeat: false
-    onTriggered: if (!daemon.running) daemon.running = true
+    onTriggered: if (!daemon.running && !root.daemonHandedOff) daemon.running = true
   }
 
   Process {
@@ -249,18 +279,19 @@ Item {
     command: []
     stdout: StdioCollector { id: apiOut; waitForEnd: true }
     stderr: StdioCollector { id: apiErr; waitForEnd: true }
-    onExited: function(code) {
+    onExited: function (code) {
       root.busy = false
       if (code === 0) {
-        root.lastError = ""
+        root.applyState(apiOut.text)
+        root.daemonAttempts = 0
         if (okMessage !== "") {
           root.actionStatus = okMessage
           actionStatusTimer.restart()
         }
       } else {
-        root.lastError = (apiOut.text || apiErr.text || "").trim() || ("Request failed (" + code + ")")
+        var message = String(apiOut.text || apiErr.text || "").trim() || ("Request failed (" + code + ")")
+        root.lastError = Model.clamp(message, root.maxErrorChars)
       }
-      root.stateFile.reload()
       root.drain()
     }
   }
@@ -269,9 +300,7 @@ Item {
     id: setupProcess
     running: false
     command: []
-    stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
-    onExited: function(code) {
+    onExited: function (code) {
       if (code === 0) {
         root.actionStatus = "Key ready — send a little HBAR to that address"
         root.refresh()

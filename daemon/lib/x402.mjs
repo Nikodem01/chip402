@@ -13,6 +13,23 @@ import {
   requestSignal,
 } from "./http.mjs";
 
+// A seller chooses how many headers to send and how long each one is. They travel back to
+// whoever called /fetch, so the count and the sizes are bounded here.
+const MAX_RESPONSE_HEADERS = 32;
+const MAX_HEADER_CHARS = 1_024;
+
+function boundedHeaders(headers) {
+  const out = {};
+  let n = 0;
+  for (const [name, value] of headers.entries()) {
+    if (n >= MAX_RESPONSE_HEADERS) break;
+    const text = String(value ?? "");
+    out[String(name).toLowerCase()] = text.length > MAX_HEADER_CHARS ? `${text.slice(0, MAX_HEADER_CHARS)}…` : text;
+    n += 1;
+  }
+  return out;
+}
+
 const PAYMENT_REQUIRED = "payment-required";
 const PAYMENT_SIGNATURE = "PAYMENT-SIGNATURE";
 const PAYMENT_RESPONSE = "payment-response";
@@ -272,7 +289,7 @@ export async function payAndFetch({
       paid: false,
       status: first.status,
       url: resourceUrl,
-      headers: Object.fromEntries(first.headers.entries()),
+      headers: boundedHeaders(first.headers),
       ...payload,
     };
   }

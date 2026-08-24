@@ -301,6 +301,61 @@ major issues; Entry point and Eye flow passed.
   each carry four or five of them), so per-group commits would not individually build. The
   split is engine-then-panel, and the gate passes on the final tree.
 
+## Marketplace hardening (2026-08-24)
+
+The maintainer's third round at `8b6b285` named one thing: the runtime manifest carried
+`@hashgraph/sdk: ^2.81.0` and installed it with `npm install` and no lockfile. Fixing only
+that would have bought exactly one more round — a re-review reads the whole tree at the new
+HEAD, and five of the six blocking classes still had live findings. So all of them were done
+in one pass.
+
+Fixed, with what was actually wrong:
+
+- **Supply chain.** `runtime/package.json` pins `2.81.0` exactly; `runtime/package-lock.json`
+  carries 329 integrity hashes. `ensureRuntime` copies both into the runtime directory and
+  runs `npm ci --omit=dev --ignore-scripts` as argv, with no `npm install` fallback.
+  `loadSdk` compares the installed lockfile against the committed one and refuses to
+  `require` anything installed from a different graph. Verified: a clean `npm ci
+  --ignore-scripts` installs 329 packages and the SDK loads.
+- **QML rich text.** No `textFormat` existed anywhere. All 20 `Text` items now set
+  `Text.PlainText`. That does not reach `PanelHero` or `PanelToolTip`, which belong to the
+  host shell, so `Model.parseState` also strips `<`, `>`, `&` and control characters and
+  clamps every string at the boundary.
+- **`FileView` on `state.json`.** Deleted. Every daemon route already returns the whole view,
+  so the panel reads `GET /status` over the socket it was already talking to. The shape that
+  was blocked at #1996, #2001, #2003, #2037, #2002 and #2017 is simply gone.
+- **File access.** `daemon/lib/safeio.mjs` opens with `O_NOFOLLOW` and decides on `fstat` of
+  that descriptor — regular file, owner, size, and mode for secrets. `CONFIG_DIR` and
+  `STATE_DIR` are `0700` and re-tightened through the descriptor. The key was being `stat`ed
+  by path and then read by path; the token was read *before* its mode was checked.
+- **Bounds.** `readCapped` no longer falls back to `res.text()`/`res.json()` — an unstreamable
+  body is refused. Item caps on accepts, mirror rows, response headers, extensions, ledger
+  rows. `/fetch` caps the url and pins the method to a known set.
+- **Command construction.** `Service.qml` runs argv only; the four `bash -lc` sites are gone,
+  which also removes the login shell that was sourcing the user's profile before every
+  payment. `openUrl` takes https and nothing else. curl gained `--max-filesize`.
+- **Two real bugs found on the way.** The ledger recorded whatever transaction id the
+  *facilitator* echoed, preferring it over the one chip402 signed — a seller could name an id
+  the mirror node has never seen, and the reservation would never settle, holding the daily
+  cap down forever. And the panel re-added pending amounts with `Number`, so a large invoice
+  amount would round; it now takes the daemon's integer total, and adds decimal strings if it
+  ever has to add them itself.
+- **Wildcard allowlist.** `allowWildcardHosts` was `true` on testnet — the only network this
+  build runs — so one `chip402 allow "*"` turned the host allowlist off. Refused everywhere now.
+
+Left standing, deliberately:
+
+- Any process running as this user can reach the socket, so it can raise a cap or resume as
+  easily as it can spend. That is the boundary the README already states; it cannot be closed
+  from inside the daemon. The IPC `resume()` on the panel adds nothing an attacker with socket
+  access does not already have.
+- The bar widget still starts the daemon when it loads. Restarts now back off and give up
+  after five attempts instead of respawning every two seconds forever.
+- README's mainnet instructions still tell the reader to `sed` the installed plugin, which
+  means the reviewed bytes are not the ones that would sign on mainnet. Mainnet is not armed,
+  so this is a documentation problem rather than a live one — but it wants rewriting into a
+  config value before mainnet is ever armed.
+
 ## Open
 
 - Fund and test on mainnet — the only remaining delta is `MAINNET_SHIPPED = true`, a funded

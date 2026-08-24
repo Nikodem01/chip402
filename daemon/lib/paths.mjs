@@ -1,8 +1,14 @@
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { HBAR, TESTNET } from "./networks.mjs";
 
 export const HOME = os.homedir();
+// The plugin checkout itself: the bytes a marketplace reviewer read at the submitted SHA.
+// The reviewed dependency manifest and lockfile live under it and are the only ones installed.
+export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+export const REVIEWED_MANIFEST = path.join(PLUGIN_ROOT, "runtime", "package.json");
+export const REVIEWED_LOCKFILE = path.join(PLUGIN_ROOT, "runtime", "package-lock.json");
 // Overridable so a test run, or a second profile, never touches the live config and state.
 export const CONFIG_DIR = process.env.CHIP402_CONFIG_DIR || path.join(HOME, ".config", "chip402");
 export const STATE_DIR = process.env.CHIP402_STATE_DIR || path.join(HOME, ".local", "state", "chip402");
@@ -46,6 +52,7 @@ export const DEFAULT_DAILY_MICRO = TESTNET.defaultDailyMicro;
 export const DEFAULT_PER_REQUEST_MICRO = TESTNET.defaultPerRequestMicro;
 export const DEMO_PRICE_MICRO = "10000"; // 0.01 USDC
 export const LEDGER_LIMIT = 50;
+export const DIR_MODE = 0o700;
 export const KEY_MODE = 0o600;
 export const SOCKET_MODE = 0o600;
 export const DEFAULT_ALLOW_HOSTS = ["127.0.0.1", "localhost", "[::1]"];

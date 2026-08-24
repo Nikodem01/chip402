@@ -3,6 +3,10 @@ import { loadSdk } from "./sdk.mjs";
 import { log } from "./log.mjs";
 import { FETCH_TIMEOUT_MS, cancelBody, readCappedJson, requestSignal } from "./http.mjs";
 
+// The mirror node is not hostile, but it is not this process either: a paginated answer that
+// comes back longer than asked for is truncated rather than walked to the end.
+const MAX_MIRROR_ROWS = 200;
+
 // docs.hedera.com/native/transactions/modify-fields: max network valid duration 180s, SDK
 // default 120s, minimum 15s. The protobuf response-code page still says 120 is the maximum;
 // it is stale — 180s transactions reach consensus on mainnet today. Do not "fix" this down.
@@ -133,7 +137,7 @@ export async function tokenBalance(accountId, tokenId, networkOrProfile = TESTNE
   if (res.status === 404) return { balance: "0", associated: false };
   if (res.status < 200 || res.status >= 300) throw new Error(`Mirror node ${res.status} for tokens of ${id}`);
   const body = res.json || {};
-  const tokens = Array.isArray(body.tokens) ? body.tokens : [];
+  const tokens = (Array.isArray(body.tokens) ? body.tokens : []).slice(0, MAX_MIRROR_ROWS);
   const hit = tokens.find((row) => String(row.token_id) === String(asset));
   if (!hit) return { balance: "0", associated: false };
   return { balance: String(hit.balance ?? "0"), associated: true };
@@ -181,7 +185,7 @@ export async function lookupTransaction(txId, networkOrProfile = TESTNET) {
   if (res.status === 404) return null;
   if (res.status < 200 || res.status >= 300) throw new Error(`Mirror node ${res.status} for transaction ${id}`);
   const body = res.json || {};
-  const rows = Array.isArray(body.transactions) ? body.transactions : [];
+  const rows = (Array.isArray(body.transactions) ? body.transactions : []).slice(0, MAX_MIRROR_ROWS);
   if (rows.length === 0) return null;
   const ok = rows.filter((entry) => String(entry.result || "") === "SUCCESS");
   // The parent is the row the caller asked about; children carry nonce > 0 and scheduled
@@ -193,8 +197,12 @@ export async function lookupTransaction(txId, networkOrProfile = TESTNET) {
     result: String(parent.result || ""),
     success: ok.length > 0,
     consensusTimestamp: String(parent.consensus_timestamp || ""),
-    tokenTransfers: ok.flatMap((entry) => (Array.isArray(entry.token_transfers) ? entry.token_transfers : [])),
-    transfers: ok.flatMap((entry) => (Array.isArray(entry.transfers) ? entry.transfers : [])),
+    tokenTransfers: ok
+      .flatMap((entry) => (Array.isArray(entry.token_transfers) ? entry.token_transfers : []))
+      .slice(0, MAX_MIRROR_ROWS),
+    transfers: ok
+      .flatMap((entry) => (Array.isArray(entry.transfers) ? entry.transfers : []))
+      .slice(0, MAX_MIRROR_ROWS),
     name: String(parent.name || ""),
     rows: rows.length,
   };

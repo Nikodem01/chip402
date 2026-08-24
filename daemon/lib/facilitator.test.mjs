@@ -12,12 +12,14 @@ const TESTNET_SUPPORTED = {
   signers: { "hedera:*": ["0.0.9185802"] },
 };
 
+// Real Response objects, because the daemon only ever reads a body by streaming it — a mock
+// that answers json() would not exercise the path production takes.
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
 function respond(status, body) {
-  return async () => ({
-    status,
-    ok: status >= 200 && status < 300,
-    json: async () => body,
-  });
+  return async () => jsonResponse(status, body);
 }
 
 test("the kind is matched on version, scheme and network together", () => {
@@ -41,7 +43,7 @@ test("a discovered fee payer is cached until the TTL expires, then re-fetched", 
     now: () => clock,
     fetchImpl: async () => {
       calls += 1;
-      return { status: 200, ok: true, json: async () => TESTNET_SUPPORTED };
+      return jsonResponse(200, TESTNET_SUPPORTED);
     },
   });
   const args = { facilitator: "https://f", network: "hedera:testnet" };
@@ -56,7 +58,7 @@ test("a discovered fee payer is cached until the TTL expires, then re-fetched", 
 
 test("a facilitator that stops advertising our network drops the cached fee payer", async () => {
   let body = TESTNET_SUPPORTED;
-  const discovery = createDiscovery({ fetchImpl: async () => ({ status: 200, ok: true, json: async () => body }) });
+  const discovery = createDiscovery({ fetchImpl: async () => jsonResponse(200, body) });
   const args = { facilitator: "https://f", network: "hedera:testnet" };
   await discovery.discover(args);
   body = { kinds: [], extensions: [], signers: {} };
@@ -96,7 +98,7 @@ test("the API key is sent as X-Api-Key when one is configured", async () => {
   const discovery = createDiscovery({
     fetchImpl: async (url, init) => {
       seen = init.headers;
-      return { status: 200, ok: true, json: async () => TESTNET_SUPPORTED };
+      return jsonResponse(200, TESTNET_SUPPORTED);
     },
   });
   await discovery.discover({ facilitator: "https://f", network: "hedera:testnet", apiKey: "b402_test" });

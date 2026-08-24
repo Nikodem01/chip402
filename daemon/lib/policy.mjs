@@ -139,8 +139,17 @@ export function transferMethodRecognized(item) {
   return KNOWN_ASSET_TRANSFER_METHODS.has(String(method));
 }
 
-export function pickHederaRequirement(paymentRequired, profile = TESTNET) {
+// A 402 that advertises more options than this is not a seller with a rich price list, it is
+// a seller trying to make the daemon do work. The first MAX_ACCEPTS are all that get read.
+export const MAX_ACCEPTS = 32;
+
+function boundedAccepts(paymentRequired) {
   const accepts = Array.isArray(paymentRequired?.accepts) ? paymentRequired.accepts : [];
+  return accepts.slice(0, MAX_ACCEPTS);
+}
+
+export function pickHederaRequirement(paymentRequired, profile = TESTNET) {
+  const accepts = boundedAccepts(paymentRequired);
   const exact = accepts.filter(
     (item) =>
       item &&
@@ -156,7 +165,7 @@ export function pickHederaRequirement(paymentRequired, profile = TESTNET) {
 // Why a 402 had nothing we could pay — so the ledger can say "escrow flow" instead of the
 // blank "no option advertised" that an unrecognized flow used to produce.
 export function describeSkipped(paymentRequired, profile = TESTNET) {
-  const accepts = Array.isArray(paymentRequired?.accepts) ? paymentRequired.accepts : [];
+  const accepts = boundedAccepts(paymentRequired);
   const hedera = accepts.filter((item) => item && item.network === profile.id);
   const flows = [...new Set(hedera.filter((item) => !flowRecognized(item)).map(paymentFlowOf))];
   const methods = [
@@ -297,4 +306,26 @@ export function isFirstSight(state, host, payTo) {
 
 function deny(code, reason) {
   return { ok: false, code, reason };
+}
+
+// Anything that carries an identity is refused rather than forwarded: chip402 pays with a
+// signed transfer, and a caller's cookie or bearer token has no business riding along —
+// least of all onto whatever host a seller names in a redirect.
+const FORWARDABLE_HEADERS = new Set(["accept", "accept-language", "content-type", "user-agent"]);
+const MAX_FORWARDED_HEADERS = 16;
+const MAX_HEADER_VALUE_CHARS = 1_024;
+
+export function forwardableHeaders(input) {
+  if (!input || typeof input !== "object") return {};
+  const out = {};
+  for (const [name, value] of Object.entries(input)) {
+    if (Object.keys(out).length >= MAX_FORWARDED_HEADERS) break;
+    const key = String(name).toLowerCase();
+    if (!FORWARDABLE_HEADERS.has(key)) continue;
+    const text = String(value ?? "");
+    if (text.length > MAX_HEADER_VALUE_CHARS) continue;
+    if (/[\r\n]/.test(text)) continue;
+    out[key] = text;
+  }
+  return out;
 }
