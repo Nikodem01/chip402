@@ -15,7 +15,7 @@ import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 
-import { DEMO_PRICE_MICRO, SOCKET_PATH } from "../daemon/lib/paths.mjs";
+import { DEMO_PRICE_MICRO, RUNTIME_DIR, SOCKET_PATH } from "../daemon/lib/paths.mjs";
 import { call, daemonTarget, daemonUp } from "../daemon/lib/client.mjs";
 import { loadConfig } from "../daemon/lib/state.mjs";
 import { lookupAccount, lookupTransaction, settledAmount } from "../daemon/lib/hedera.mjs";
@@ -26,11 +26,19 @@ const SELLER_PORT = Number(process.env.CHIP402_E2E_SELLER_PORT || 4413);
 const SELLER_URL = `http://127.0.0.1:${SELLER_PORT}/secret`;
 const PRICE = BigInt(DEMO_PRICE_MICRO);
 
-const target = daemonTarget();
+// Its own state directory and socket, sharing the real config directory. The suite signs with
+// the real key and spends real testnet USDC, but the ledger, caps and allowlist it churns
+// through are throwaway — it must not leave rows in the ledger the panel shows, add hosts to
+// the user's allowlist, or leave the daily cap lowered if a run is killed mid-test.
+const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "chip402-e2e-"));
+const socketPath = path.join(stateDir, "chip402.sock");
+// The Hedera SDK install lives under the state directory but is a cache, not state — share
+// the real one rather than making every run npm install into a temp directory.
+if (fs.existsSync(RUNTIME_DIR)) fs.symlinkSync(RUNTIME_DIR, path.join(stateDir, "runtime"));
+const target = daemonTarget({ socketPath });
 const spawned = [];
 let config;
 let funded = false;
-let reused = false;
 let baseline;
 
 function wait(ms) {
@@ -66,29 +74,28 @@ async function tcpUp(port, tries = 60) {
 
 before(async () => {
   config = await loadConfig();
-  // Reuse a running daemon rather than starting a second one: two daemons would race each
-  // other's writes to state.json. Restart chip402d after changing daemon code, or this suite
-  // silently tests the old build.
-  reused = await daemonUp(target);
-  if (!reused) {
-    start(path.join(root, "daemon", "chip402d.mjs"));
-    for (let i = 0; i < 60 && !(await daemonUp(target)); i += 1) await wait(250);
-  }
-  assert.ok(await daemonUp(target), `chip402d is not answering on ${SOCKET_PATH}`);
+  // Always started from current source, so the suite can never silently test a stale build
+  // the way reusing a long-running daemon could.
+  start(path.join(root, "daemon", "chip402d.mjs"), {
+    CHIP402_STATE_DIR: stateDir,
+    CHIP402_SOCKET: socketPath,
+  });
+  for (let i = 0; i < 60 && !(await daemonUp(target)); i += 1) await wait(250);
+  assert.ok(await daemonUp(target), `chip402d is not answering on ${socketPath}`);
   await call(target, "POST", "/refresh");
   start(path.join(root, "demo", "seller.mjs"), { CHIP402_SELLER_PORT: String(SELLER_PORT) });
   assert.ok(await tcpUp(SELLER_PORT), `demo seller did not start on :${SELLER_PORT}`);
   await call(target, "POST", "/allow-host", { host: "127.0.0.1" });
   baseline = await call(target, "GET", "/status");
   funded = BigInt(baseline.balanceMicro || "0") >= PRICE;
-  console.log(
-    `# daemon: ${reused ? "reused the one already running" : "started by this suite"} on ${SOCKET_PATH}`,
-  );
+  console.log(`# daemon: started by this suite on ${socketPath}`);
+  console.log(`# live state at ${SOCKET_PATH} is untouched; this run writes to ${stateDir}`);
   console.log(`# operator ${config.accountId} holds ${baseline.balanceMicro} micro-USDC`);
 });
 
 after(async () => {
   for (const child of spawned) child.kill("SIGTERM");
+  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 test("1. the operator account resolves from its EVM alias", async () => {
@@ -300,6 +307,7 @@ test("13. a daemon starting on a crashed state settles the reservation from the 
   assert.equal(status.spentTodayMicro, amountMicro, "the daily counter still reflects the spend");
   assert.equal(status.pendingMicro, "0");
   crashed.kill("SIGTERM");
+  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 test("12. a host that is not on the allowlist is refused", async () => {

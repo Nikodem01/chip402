@@ -36,8 +36,13 @@ Item {
   // The daemon listens on a unix socket, so filesystem permissions are the authorization and
   // no web page can reach it. QML's XMLHttpRequest speaks TCP only, so requests go through
   // curl --unix-socket instead.
-  readonly property string socketPath:
-    (Quickshell.env("XDG_RUNTIME_DIR") || (Quickshell.env("HOME") + "/.local/state/chip402/run")) + "/chip402.sock"
+  readonly property string socketPath: Quickshell.env("CHIP402_SOCKET")
+    || ((Quickshell.env("XDG_RUNTIME_DIR") || (root.stateDir + "/run")) + "/chip402.sock")
+
+  // Same override the daemon's paths.mjs honours, so the panel can be pointed at a fixture
+  // ledger without touching the real one.
+  readonly property string stateDir:
+    Quickshell.env("CHIP402_STATE_DIR") || (Quickshell.env("HOME") + "/.local/state/chip402")
 
   readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 15, 5, 3600)
   readonly property string phase: Model.setupPhase(evmAddress, accountId, hollow, associated, balanceMicro)
@@ -48,7 +53,7 @@ Item {
   readonly property string pluginDir: pluginPath()
 
   property FileView stateFile: FileView {
-    path: Quickshell.env("HOME") + "/.local/state/chip402/state.json"
+    path: root.stateDir + "/state.json"
     watchChanges: true
     printErrors: false
     onFileChanged: reload()

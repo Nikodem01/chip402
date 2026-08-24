@@ -16,6 +16,7 @@ Panel {
   property string focusSection: "header"
   property int ledgerIndex: 0
   property bool cursorActive: false
+  property bool denialsExpanded: false
   property int phraseIndex: 0
 
   readonly property var activePhrases: [
@@ -37,7 +38,26 @@ Panel {
   readonly property string toggleHint: chip402.paused ? "Let agents spend" : "Pause all agent spending"
   readonly property color barIconColor: chip402.active ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
-  readonly property bool showLedger: chip402.ledger.length > 0
+
+  // The panel shows the receipt book. Blocked attempts collapse into one line and setting
+  // changes move down beside the sliders that caused them; both stay in full in chip402 log.
+  readonly property var ledgerRows: Model.visiblePayments(chip402.ledger)
+  readonly property var denialsToday: Model.deniedToday(chip402.ledger)
+  readonly property string denialSummaryText: Model.denialSummary(root.denialsToday)
+  readonly property string auditSummaryText: Model.auditSummary(chip402.ledger)
+  readonly property int shownRows: root.ledgerRows.length + (root.denialsExpanded ? root.denialsToday.length : 0)
+  readonly property string hiddenLabelText: Model.hiddenLabel(Model.hiddenCount(chip402.ledger, root.shownRows))
+  readonly property bool showLedger: ledgerRows.length > 0
+
+  // Ordered top to bottom, so the cursor can walk the panel without a branch per pair.
+  readonly property var navSections: {
+    var out = ["header"]
+    if (!chip402.ready) out.push("fund")
+    if (chip402.configured) out.push("account")
+    if (root.denialsToday.length > 0) out.push("denials")
+    if (root.ledgerRows.length > 0) out.push("ledger")
+    return out
+  }
   // Conditions under which chip402 will refuse to spend even though nothing is paused. Caps
   // stay silent, but a refusal the user cannot see would just look like a broken plugin.
   readonly property string holdReason: {
@@ -108,12 +128,10 @@ Panel {
   }
 
   function ensureCursor() {
-    if (focusSection === "fund" && chip402.ready) focusSection = chip402.configured ? "account" : "header"
-    if (focusSection === "account" && !chip402.configured) focusSection = chip402.ready ? "header" : "fund"
-    if (focusSection === "ledger" && chip402.ledger.length === 0) {
-      focusSection = chip402.configured ? "account" : (chip402.ready ? "header" : "fund")
-    }
-    if (ledgerIndex >= chip402.ledger.length) ledgerIndex = Math.max(0, chip402.ledger.length - 1)
+    // A section can disappear under the cursor — the last payment ages out of the visible
+    // slice, the day rolls over and today's denials empty. Fall back rather than point at it.
+    if (root.navSections.indexOf(focusSection) < 0) focusSection = "header"
+    if (ledgerIndex >= root.ledgerRows.length) ledgerIndex = Math.max(0, root.ledgerRows.length - 1)
     if (ledgerIndex < 0) ledgerIndex = 0
   }
 
@@ -121,46 +139,25 @@ Panel {
     cursorActive = true
     ensureCursor()
     if (dy === 0) return
-    if (focusSection === "header") {
-      if (dy > 0 && !chip402.ready) focusSection = "fund"
-      else if (dy > 0 && chip402.configured) focusSection = "account"
-      else if (dy > 0 && chip402.ledger.length > 0) {
-        focusSection = "ledger"
-        ledgerIndex = 0
-        scrollCursorIntoView()
-      }
-      return
-    }
-    if (focusSection === "fund") {
-      if (dy < 0) setHeaderCursor()
-      else if (chip402.configured) focusSection = "account"
-      else if (chip402.ledger.length > 0) {
-        focusSection = "ledger"
-        ledgerIndex = 0
-      }
-      return
-    }
-    if (focusSection === "account") {
-      if (dy < 0) {
-        if (!chip402.ready) focusSection = "fund"
-        else setHeaderCursor()
-      } else if (chip402.ledger.length > 0) {
-        focusSection = "ledger"
-        ledgerIndex = 0
-        scrollCursorIntoView()
-      }
-      return
-    }
+    // Inside the ledger the cursor walks rows first, and only leaves the section once it
+    // runs off the top.
     if (focusSection === "ledger") {
-      if (dy < 0 && ledgerIndex === 0) {
-        if (chip402.configured) focusSection = "account"
-        else if (!chip402.ready) focusSection = "fund"
-        else setHeaderCursor()
+      var next = ledgerIndex + dy
+      if (next >= 0 && next < root.ledgerRows.length) {
+        ledgerIndex = next
+        scrollCursorIntoView()
         return
       }
-      ledgerIndex = Math.max(0, Math.min(chip402.ledger.length - 1, ledgerIndex + dy))
-      scrollCursorIntoView()
+      if (dy > 0) return
     }
+    var at = root.navSections.indexOf(focusSection)
+    if (at < 0) at = 0
+    var target = at + dy
+    if (target < 0 || target >= root.navSections.length) return
+    focusSection = root.navSections[target]
+    if (focusSection === "ledger") ledgerIndex = dy > 0 ? 0 : Math.max(0, root.ledgerRows.length - 1)
+    if (focusSection === "header" && panelFlick) panelFlick.contentY = 0
+    scrollCursorIntoView()
   }
 
   function setHeaderCursor() {
@@ -177,12 +174,13 @@ Panel {
       else chip402.copy(root.setupAddress())
     }
     else if (focusSection === "account") chip402.copy(chip402.accountId)
+    else if (focusSection === "denials") root.denialsExpanded = !root.denialsExpanded
     else if (focusSection === "ledger") chip402.openHashscan(selectedLedger())
   }
 
   function selectedLedger() {
-    if (chip402.ledger.length === 0) return null
-    return chip402.ledger[Math.max(0, Math.min(ledgerIndex, chip402.ledger.length - 1))]
+    if (root.ledgerRows.length === 0) return null
+    return root.ledgerRows[Math.max(0, Math.min(ledgerIndex, root.ledgerRows.length - 1))]
   }
 
   function setLedgerCursor(index) {
@@ -437,7 +435,7 @@ Panel {
             }
 
             Text {
-              visible: chip402.ledger.length === 0
+              visible: root.ledgerRows.length === 0
               width: parent.width
               text: root.emptyLedgerText()
               color: root.dim
@@ -447,6 +445,29 @@ Panel {
               horizontalAlignment: Text.AlignHCenter
             }
 
+            // A cap refusing a payment is chip402 working, so this is dim and counted rather
+            // than a run of alarm-coloured rows. The urgent colour stays for the hold line.
+            DenialSummary {
+              visible: root.denialsToday.length > 0
+              width: parent.width
+            }
+
+            Column {
+              visible: root.denialsExpanded && root.denialsToday.length > 0
+              width: parent.width
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.denialsToday
+                LedgerRow {
+                  required property var modelData
+                  width: parent.width
+                  row: modelData
+                  rowIndex: -1
+                }
+              }
+            }
+
             Column {
               id: ledgerColumn
               visible: root.showLedger
@@ -454,7 +475,7 @@ Panel {
               spacing: Style.space(6)
 
               Repeater {
-                model: chip402.ledger
+                model: root.ledgerRows
                 LedgerRow {
                   required property var modelData
                   required property int index
@@ -463,6 +484,18 @@ Panel {
                   rowIndex: index
                 }
               }
+            }
+
+            // Says how much the panel is not showing, and where the rest is. Without it the
+            // trimming would read as "this is everything".
+            Text {
+              visible: root.hiddenLabelText !== ""
+              width: parent.width
+              text: root.hiddenLabelText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
 
@@ -528,6 +561,18 @@ Panel {
                 var idx = Math.max(0, Math.min(marks.length - 1, Math.round(v)))
                 chip402.setPerRequestCap(marks[idx])
               }
+            }
+
+            // Raising a cap is the most privileged act in the system, so it stays visible —
+            // beside the sliders that did it, not interleaved with payments at equal weight.
+            Text {
+              visible: root.auditSummaryText !== ""
+              width: parent.width
+              text: root.auditSummaryText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
         }
@@ -733,15 +778,18 @@ Panel {
   component LedgerRow: CursorSurface {
     id: ledgerRow
     property var row: null
+    // -1 for the expanded denials, which are read, not selected.
     property int rowIndex: 0
-    hasCursor: root.cursorActive && root.focusSection === "ledger" && root.ledgerIndex === rowIndex
+    readonly property bool blocked: ledgerRow.row !== null && ledgerRow.row.status === "denied"
+    hasCursor: root.cursorActive && root.focusSection === "ledger" && rowIndex >= 0 && root.ledgerIndex === rowIndex
     foreground: root.foreground
     implicitHeight: ledgerContent.implicitHeight + Style.spacing.rowPaddingX
 
     MouseArea {
       anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
+      hoverEnabled: ledgerRow.rowIndex >= 0
+      cursorShape: ledgerRow.rowIndex >= 0 ? Qt.PointingHandCursor : Qt.ArrowCursor
+      enabled: ledgerRow.rowIndex >= 0
       onEntered: root.setLedgerCursor(ledgerRow.rowIndex)
       onClicked: chip402.openHashscan(ledgerRow.row)
     }
@@ -756,7 +804,7 @@ Panel {
 
       Text {
         text: Model.ledgerGlyph(ledgerRow.row)
-        color: (ledgerRow.row && ledgerRow.row.status === "denied") ? root.urgent : root.foreground
+        color: ledgerRow.blocked ? root.dim : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.icon
         Layout.alignment: Qt.AlignVCenter
@@ -767,13 +815,31 @@ Panel {
         Layout.fillWidth: true
         spacing: Style.space(1)
 
-        Text {
+        RowLayout {
           Layout.fillWidth: true
-          text: Model.ledgerTitle(ledgerRow.row)
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
+          spacing: Style.space(8)
+
+          Text {
+            Layout.fillWidth: true
+            text: Model.ledgerTitle(ledgerRow.row)
+            color: ledgerRow.blocked ? root.dim : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+
+          // Its own right-aligned column, so the money can be scanned straight down the
+          // panel instead of landing at a different x on every row.
+          Text {
+            text: Model.ledgerAmount(ledgerRow.row)
+            visible: text !== ""
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            horizontalAlignment: Text.AlignRight
+            Layout.minimumWidth: Style.space(72)
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+          }
         }
 
         Text {
@@ -784,6 +850,48 @@ Panel {
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
         }
+      }
+    }
+  }
+
+  component DenialSummary: CursorSurface {
+    id: denialSummary
+    hasCursor: root.cursorActive && root.focusSection === "denials"
+    foreground: root.foreground
+    implicitHeight: denialText.implicitHeight + Style.spacing.rowPaddingX
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: { root.cursorActive = true; root.focusSection = "denials" }
+      onClicked: root.denialsExpanded = !root.denialsExpanded
+    }
+
+    RowLayout {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      spacing: Style.space(8)
+
+      Text {
+        text: root.denialsExpanded ? "󰅀" : "󰅂"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+        Layout.alignment: Qt.AlignVCenter
+      }
+
+      Text {
+        id: denialText
+        Layout.fillWidth: true
+        text: root.denialSummaryText
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
       }
     }
   }

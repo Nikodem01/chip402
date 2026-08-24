@@ -133,6 +133,21 @@ chip402 pause
 chip402 resume
 ```
 
+## Reading the history
+
+The panel is a receipt book: the last few payments, one line counting what was not paid today,
+and cap changes summarised beside the sliders that made them. Nothing is discarded — the daemon
+retains the last 50 entries either way, and `chip402 log` prints them whole, with the reasons the
+panel abbreviates and the transaction ids.
+
+```bash
+chip402 log                       # everything retained
+chip402 log --kind denied         # only what was refused, with the full reason
+chip402 log --kind audit          # cap changes, pauses, hosts allowed
+chip402 log --since 6h --json     # for piping into jq
+chip402 tail                      # the same, refreshing every 2s
+```
+
 ## License
 
 MIT. External dependency: [`@hashgraph/sdk`](https://www.npmjs.com/package/@hashgraph/sdk) (Apache-2.0), installed into `~/.local/state/chip402/runtime` and never vendored inside the plugin tree.
