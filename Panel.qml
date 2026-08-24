@@ -109,12 +109,12 @@ Panel {
     if (chip402.phase === "need_hbar") return chip402.evmAddress || "Waiting for the EVM address"
     if (chip402.phase === "completing") return "One cheap self-signed transaction, then it can pay"
     if (chip402.phase === "associating") return "Needs a little HBAR for the association fee"
-    if (chip402.phase === "need_usdc") return chip402.accountId || chip402.evmAddress
+    if (chip402.phase === "need_usdc") return (chip402.evmAddress || chip402.accountId) + " · Circle faucet, Hedera Testnet"
     return chip402.evmAddress
   }
 
   function setupAddress() {
-    if (chip402.phase === "need_hbar" || chip402.phase === "need_key") return chip402.evmAddress
+    if (chip402.phase === "need_hbar" || chip402.phase === "need_key" || chip402.phase === "need_usdc") return chip402.evmAddress
     return chip402.accountId || chip402.evmAddress
   }
 
@@ -123,7 +123,7 @@ Panel {
     if (chip402.phase === "need_hbar") return "Send HBAR so Hedera creates the account, then pay a 402."
     if (chip402.phase === "completing") return "The account has no key on record yet, so the facilitator would reject every payment. chip402 is fixing that."
     if (chip402.phase === "associating") return "Waiting for USDC association before payments can settle."
-    if (chip402.phase === "need_usdc") return "Send testnet USDC, then try chip402 fetch."
+    if (chip402.phase === "need_usdc") return "Send testnet USDC, then try a Printwright model — see the README."
     return "No payments yet. Agents settle x402 invoices here."
   }
 
@@ -679,10 +679,10 @@ Panel {
       PanelActionButton {
         visible: chip402.phase === "need_usdc"
         iconText: "󰌁"
-        tooltipText: "Open account on HashScan"
+        tooltipText: "Open Circle USDC faucet"
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onClicked: chip402.openAccount()
+        onClicked: chip402.openUrl("https://faucet.circle.com/")
       }
     }
   }

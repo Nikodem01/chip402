@@ -6,7 +6,7 @@ import { RUNTIME_DIR } from "./paths.mjs";
 const runtimePackage = path.join(RUNTIME_DIR, "package.json");
 
 export function runtimeHint() {
-  return `cd ${RUNTIME_DIR} && npm install @hashgraph/sdk`;
+  return `cd ${RUNTIME_DIR} && npm install --omit=dev --no-fund --no-audit`;
 }
 
 export function loadSdk() {

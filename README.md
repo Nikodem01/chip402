@@ -40,13 +40,9 @@ omarchy plugin add https://github.com/Nikodem01/chip402 --enable --yes
 ~/.config/omarchy/plugins/chip402/bin/chip402 setup --watch
 ```
 
-`setup` prints an EVM address. Spend is **USDC** on Hedera testnet (`0.0.429274`).
+`setup` prints an EVM address (`0x…`). Spend is **USDC** on Hedera testnet (`0.0.429274`). Then [top it up](#top-up-testnet-hbar-and-usdc).
 
-1. Send a little **HBAR** from the [Hedera faucet](https://portal.hedera.com/faucet) so the account exists and can pay association fees.
-2. chip402 associates USDC on the next daemon refresh.
-3. Send **testnet USDC** to the same address (Circle faucet or HashPack).
-
-Then add the widget if the installer did not: `omarchy plugin enable chip402`.
+Add the widget if the installer did not: `omarchy plugin enable chip402`.
 
 Optional PATH helper:
 
@@ -55,7 +51,32 @@ mkdir -p ~/.local/bin
 ln -sf ~/.config/omarchy/plugins/chip402/bin/chip402 ~/.local/bin/chip402
 ```
 
-## Pay something
+## Top up (testnet HBAR and USDC)
+
+Play money only. The payments are real Hedera transactions; the value is not.
+
+`chip402 fund` reprints these addresses any time.
+
+### 1. HBAR — creates the account
+
+The first HBAR sent to the `0x…` address [auto-creates](https://docs.hedera.com/learn/core-concepts/accounts/auto-account-creation) a Hedera account.
+
+1. Copy the EVM address from `chip402 setup` or the panel.
+2. Open the [Hedera testnet faucet](https://portal.hedera.com/faucet).
+3. Paste the address and click **RECEIVE 100 TESTNET HBAR**.
+
+Docs: [Hedera Testnet Faucet](https://docs.hedera.com/learn/getting-started/testnet-faucet). Limit is 100 HBAR per day. The faucet creates a *hollow* account (id + alias, no key yet); chip402 completes it on the next refresh with one cheap self-signed transaction. You do not have to think about that.
+
+### 2. USDC — this is what invoices charge
+
+Token id **`0.0.429274`**, 6 decimals. Use the same `0x…` address.
+
+- **[Circle faucet](https://faucet.circle.com/)** — pick **Hedera Testnet**, paste the `0x…` address, request 20 USDC. One drip per address every 2 hours.
+- **HashPack** — switch the wallet to testnet and send USDC `0.0.429274` to the `0.0.n` account id once it exists (`chip402 status`).
+
+The panel's USDC step opens the Circle faucet. A few USDC is enough: the default per-request cap is 1 USDC.
+
+## Pay something (local demo)
 
 In one terminal:
 
@@ -70,6 +91,22 @@ chip402 fetch http://127.0.0.1:4403/secret
 ```
 
 The panel ledger should show the settlement. Click a row to open it on HashScan.
+
+## Try a real seller (Printwright)
+
+[Printwright](https://printwright.liftbyai.com) is an independent x402 marketplace for licensed 3D-printable models. Same Hedera testnet, same USDC, a facilitator chip402 did not write. Testnet play money; licenses here are not a commercial grant of rights.
+
+Printwright's invoices name fee payer `0.0.7162784`, advertised by `https://api.testnet.blocky402.com` — not the default `x402.org` facilitator. Point chip402 at that sponsor, allow the host, and fetch a cheap model (0.20 USDC, under the 1 USDC per-request cap):
+
+```bash
+chip402 allow printwright.liftbyai.com
+chip402 facilitator https://api.testnet.blocky402.com
+chip402 fetch 'https://printwright.liftbyai.com/api/v1/models/24/download?license=commercial_unit'
+```
+
+That URL is [Slide-On Bag Sealer](https://printwright.liftbyai.com/models/bag-sealer). Browse the catalog for others; anything over 1 USDC is refused by the cap unless you raise it. `chip402 facilitator default` restores `https://x402.org/facilitator`.
+
+## Agents
 
 Agents talk to the daemon over its unix socket. Filesystem permissions are the
 authorization, so there is no token to manage and nothing listening on a TCP port:
@@ -114,7 +151,7 @@ Removal does not write to any other Omarchy config unless you previously enabled
 
 1. An agent requests a URL.
 2. If the server returns HTTP 402, chip402 reads `PAYMENT-REQUIRED`, picks `exact` on `hedera:testnet`, and checks the kill switch, host allowlist, per-request cap, and daily cap.
-3. It builds a `TransferTransaction` whose `transactionId.accountId` is the x402 facilitator fee-payer (`0.0.9185802`), signs with the local operator key, and retries with `PAYMENT-SIGNATURE`.
+3. It builds a `TransferTransaction` whose `transactionId.accountId` is the fee payer advertised by the facilitator (discovered from `/supported`), signs with the local operator key, and retries with `PAYMENT-SIGNATURE`.
 4. The facilitator co-signs and submits. Network fees are not paid by the operator.
 5. The panel watches `~/.local/state/chip402/state.json` and appends a ledger row.
 
@@ -152,10 +189,9 @@ accounts, with each settlement confirmed against the mirror node rather than tak
 seller's word — but the money is testnet money.
 
 It has been proven against a seller it did not author. [Printwright](https://printwright.liftbyai.com)
-is an independent x402 marketplace for licensed 3D-printable models, settling through a
-different facilitator (`api.testnet.blocky402.com`, fee payer `0.0.7162784`) than chip402's
-default. Point chip402 at that facilitator and it discovers the new sponsor, pays, and gets a
-real licence back:
+is an independent x402 marketplace — [try it](#try-a-real-seller-printwright). Settlements go
+through `api.testnet.blocky402.com` (fee payer `0.0.7162784`), not chip402's default facilitator.
+These are the ones that already landed:
 
 | What happened | Proof |
 | --- | --- |
@@ -224,6 +260,7 @@ verify or settle a payment. The code paths are unit-tested against stubs. The ne
 chip402 cap daily 0.5
 chip402 cap request 0.01
 chip402 allow api.example.com
+chip402 facilitator https://api.testnet.blocky402.com
 chip402 pause
 chip402 resume
 ```

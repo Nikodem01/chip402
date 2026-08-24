@@ -48,6 +48,7 @@ Usage:
   chip402 cap request <usdc>
   chip402 allow <host>
   chip402 network [testnet|mainnet]
+  chip402 facilitator [url|default]
   chip402 token
   chip402 fund
   chip402 demo
@@ -83,7 +84,7 @@ async function ensureRuntime() {
     await fs.access(path.join(RUNTIME_DIR, "node_modules", "@hashgraph", "sdk"));
   } catch {
     console.error(`Installing @hashgraph/sdk into ${RUNTIME_DIR} …`);
-    await run("bash", ["-lc", "npm install @hashgraph/sdk"], { cwd: RUNTIME_DIR });
+    await run("bash", ["-lc", "npm install --omit=dev --no-fund --no-audit"], { cwd: RUNTIME_DIR });
   }
 }
 
@@ -265,7 +266,7 @@ async function setup(watch) {
     if (changed) await saveConfig(next);
     if (next.accountId) {
       console.log("Account is on-chain. Associating USDC happens on daemon refresh.");
-      console.log("Then send testnet USDC to the operator (Circle faucet or HashPack).");
+      console.log("Then send testnet USDC (Circle faucet, Hedera Testnet, or HashPack).");
       return;
     }
     await new Promise((r) => setTimeout(r, 4000));
@@ -274,21 +275,33 @@ async function setup(watch) {
 
 function printFund(config) {
   const profile = resolveNetwork(config.network || TESTNET.id);
+  const evm = config.evmAddress || "(run chip402 setup)";
+  const account = config.accountId || "(appears after the HBAR lands)";
   console.log(`
 chip402 is a prepaid card for Omarchy agents on ${profile.id}.
-Spend assets: USDC ${profile.usdc} and HBAR 0.0.0 (USDC invoices in this build).
+Invoices in this build charge testnet USDC ${profile.usdc} (no real money).
 
-  1. Create the account with a little HBAR (association fees):
-     ${profile.faucetHbar}
-     ${config.evmAddress || "(run chip402 setup)"}
+1. HBAR — creates the account
+   Copy the EVM address:
+     ${evm}
+   Paste it at ${profile.faucetHbar || "the Hedera faucet"}
+   Click RECEIVE 100 TESTNET HBAR.
+   https://docs.hedera.com/learn/getting-started/testnet-faucet
+   chip402 completes the hollow account on the next refresh.
 
-  2. After the account exists, chip402 associates USDC automatically.
+2. USDC — this is what invoices charge
+   Circle faucet (Hedera Testnet in the dropdown, 20 USDC / 2 hours):
+     ${profile.faucetUsdc || "https://faucet.circle.com/"}
+     paste the same 0x address
+   Or send USDC ${profile.usdc} from HashPack (testnet) to:
+     ${account}
 
-  3. Top up this operator from HashPack or the faucet — keep real funds in HashPack.
-
-Merchant (demo seller):
-
-     ${config.merchantEvmAddress || "(none)"}
+3. Try a real seller — Printwright, also Hedera testnet
+   chip402 allow printwright.liftbyai.com
+   chip402 facilitator https://api.testnet.blocky402.com
+   chip402 fetch 'https://printwright.liftbyai.com/api/v1/models/24/download?license=commercial_unit'
+   That is Slide-On Bag Sealer at 0.20 USDC, under the default 1 USDC per-request cap.
+   Browse the catalog: https://printwright.liftbyai.com
 
 Config: ${CONFIG_DIR}
 `);
@@ -369,6 +382,26 @@ try {
     } else {
       const profile = resolveNetwork(rest[0]);
       console.log(profile.id);
+    }
+  } else if (cmd === "facilitator") {
+    const config = await loadConfig();
+    const profile = resolveNetwork(config.network);
+    if (!rest[0] || rest[0] === "show") {
+      console.log(config.facilitator);
+    } else {
+      const raw = rest[0] === "default" ? profile.facilitator : String(rest[0]).trim();
+      let parsed;
+      try {
+        parsed = new URL(raw);
+      } catch {
+        throw new Error("usage: chip402 facilitator <https-url|default>");
+      }
+      if (parsed.protocol !== "https:") throw new Error("facilitator URL must be https");
+      const value = parsed.toString().replace(/\/+$/, "");
+      config.facilitator = value;
+      await saveConfig(config);
+      console.log(value);
+      if (await daemonUp()) await api("POST", "/refresh");
     }
   } else if (cmd === "token") {
     const value = crypto.randomBytes(32).toString("hex");
