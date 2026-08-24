@@ -6,6 +6,13 @@ Agents can pay [x402](https://x402.org) invoices on Hedera testnet. You set a da
 
 This is not a general-purpose wallet. It is pocket-money chips for agents.
 
+> **Prototype.** chip402 works end to end — real x402 invoices, real USDC, settlements
+> confirmed on the Hedera mirror node — but it runs on **testnet** and has been exercised by
+> its author and its test suite, not by other people's agents against other people's sellers.
+> Mainnet is written and deliberately not armed; see
+> [Testnet only, on purpose](#testnet-only-on-purpose). Treat it as something to try and
+> take apart, not as production money infrastructure.
+
 ![chip402 panel](preview.png)
 
 ![Kill switch](assets/demo.gif)
@@ -134,8 +141,33 @@ shut. What has *not* happened is a single call to a mainnet facilitator's `/veri
 it is a build making a promise it has not kept, so `resolveNetwork` refuses the network
 outright instead.
 
-Flipping `MAINNET_SHIPPED` in `daemon/lib/networks.mjs` is the whole delta, and deliberately
-requires editing source rather than a setting.
+### Turning it on anyway
+
+Flipping the switch is deliberately a source edit, not a setting, so nobody arrives on mainnet
+by clicking something. If you want to run it there, understand that you are the first:
+
+```bash
+# 1. Arm the build
+sed -i 's/export const MAINNET_SHIPPED = false;/export const MAINNET_SHIPPED = true;/' \
+  ~/.config/omarchy/plugins/chip402/daemon/lib/networks.mjs
+
+# 2. Point it at mainnet — facilitator https://api.blocky402.com, USDC 0.0.456858
+chip402 network mainnet
+
+# 3. A facilitator API key is required on mainnet; put it in the config
+#    ~/.config/chip402/config.json -> "facilitatorApiKey": "b402_..."
+
+# 4. Fund the operator with real HBAR (account creation + association) and real USDC
+chip402 status
+```
+
+The mainnet profile ships tighter defaults than testnet — **1 USDC daily, 0.10 per request**,
+and `*` wildcard hosts are refused outright. The fee payer is discovered from the
+facilitator's `/supported` at runtime and never pinned, so a facilitator key rotation is
+picked up rather than hardcoded.
+
+What you are accepting by doing this: no mainnet facilitator has ever been asked by chip402 to
+verify or settle a payment. The code paths are unit-tested against stubs. The network is not.
 
 ## Defaults
 
