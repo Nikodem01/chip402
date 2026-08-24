@@ -116,6 +116,23 @@ Settled transaction ids from this iteration:
 - `state.json` is 0600, the log is 0600, and both key files are 600.
 - `omarchy plugin validate .` exits 0.
 
+### The panel, in a running shell (2026-08-24)
+
+Driven through `omarchy restart shell` + `omarchy-shell chip402 open`, captured with `grim`,
+keyboard-navigated with `wtype`. Screenshots in the session scratchpad.
+
+- Five receipts, the collapsed blocked line, the footer count, and both LIMITS sliders with
+  the cap-change summary all fit in one panel with no scrolling.
+- Down/Down/Down/Return reaches the blocked line and expands it; the ten denials render dim,
+  their times in the same column as the payments above them.
+- `journalctl --user` shows no QML errors across the reload. The remaining warnings (xkb,
+  xdg-desktop-portal, dbus) predate chip402 and are unrelated.
+
+**`omarchy-shell shell rescanPlugins` is not enough to load changed QML.** It calls
+`Qt.clearComponentCache()`, but the panel kept rendering the previous build across three
+rescans; only `omarchy restart shell` picked up the change. Any future "verified in the shell"
+claim has to go through a restart, or it is verifying the old build.
+
 ### Still true from the first build
 
 - Plugin = git repo + `manifest.json` at root, QML loaded into the long-lived `omarchy-shell`.
@@ -188,7 +205,20 @@ All fixed in this iteration.
   already failing before this iteration. Local is right for a panel that says "today"; the
   test was wrong.
 
----
+Found while reworking the panel:
+
+- **The ledger clock was UTC while "today" was local.** The row time was substringed out of
+  the ISO string, so a payment made at 04:57 local displayed as 19:27 — beside a daily
+  counter that rolls over on the local day. Now formatted from a `Date`, with a test pinning
+  it.
+- **The e2e suite ran against the live daemon and the live state.** 21 of the 26 rows in the
+  ledger that prompted the rework were the suite's own, and a run killed between test 10 and
+  its `finally` would have left the real daily cap at 59999 micro-USDC. The suite now takes
+  its own state directory and socket, sharing only the config directory so it still signs
+  with the real key and spends real testnet USDC. It symlinks the real `runtime/` because the
+  Hedera SDK install lives under the state directory but is a cache, not state. (The
+  allowlist was never actually widened — `127.0.0.1` is a default host, so the suite's
+  `/allow-host` call was a no-op.)
 
 ## Still assumed — not verified
 
@@ -201,10 +231,11 @@ All fixed in this iteration.
 - HBAR-denominated payments: `signExactTransfer` can build one, but `isSpendAsset` no longer
   selects HBAR, so the path is unreachable by design. Amounts would be tinybars against
   micro-USDC caps. Enabling it means making caps asset-denominated first.
-- The panel has not been looked at in a running shell this iteration. `qmllint` parses
-  `Panel.qml`, `Service.qml` and `ChipIcon.qml` without errors and `Model.js` is unit-tested,
-  but the curl-over-socket `Process` path in `Service.qml` has not been exercised by
-  Quickshell itself.
+- The panel has now been driven in the running shell (see "The panel, in a running shell"
+  above), but only in two states: five settled payments with a day of blocked attempts, and
+  the same with the attempts pruned away. The setup phases (`need_key`, `need_hbar`,
+  `completing`, `associating`, `need_usdc`), a `pending` row, and the hold line have been
+  unit-tested through `Model.js` but never rendered.
 - The TCP fallback's `authorize()` is unit-tested in isolation; no daemon has been run
   end-to-end with `tcp: true` and a real token.
 - Facilitator key rotation mid-run is unit-tested with a fake clock, not observed.
@@ -219,6 +250,34 @@ All fixed in this iteration.
 ## Decisions taken this iteration
 
 Per BUILD.md, "everything else: decide it, note it".
+
+### The panel ledger (2026-08-24, after Nikodem asked what the long list was worth)
+
+Two critiques from the designer-skills pack (`~/.grok/vendor/designer-skills`) drove this:
+`critique-visual-hierarchy` and `critique-information-density`, run against the panel as it
+stood. Both rated Weight, Emphasis, Scanning, Cognitive load and Progressive disclosure as
+major issues; Entry point and Eye flow passed.
+
+- **The panel is a receipt book, not a log.** It shows settled and in-flight payments. Blocked
+  attempts collapse to one line, cap changes move beside the sliders. Nothing is discarded —
+  `chip402 log` was added in the same commit so the panel's omissions are recoverable, and
+  the daemon still retains 50 rows either way.
+- **A blocked payment is dim, not urgent.** A cap refusing a payment is chip402 working. In
+  the ledger that prompted this, 11 of 26 rows carried the alarm colour; emphasis on 42% of
+  rows is not emphasis, and it teaches the reader to distrust their own safety net. `urgent`
+  now belongs to the hold line and `displayError` alone.
+- **"not paid", not "blocked".** The daemon files a seller that never answered
+  (`code: "failed"`) under the same `denied` status as a cap refusal, and only one of those is
+  chip402 deciding something. Fixing that properly means splitting the status in the daemon;
+  the panel wording is honest in the meantime.
+- **One reason on the summary line, the rest counted.** Two reasons elided mid-word at 380px.
+- **A routine receipt is one line.** The second line appears only for in-flight, new-payee or
+  blocked rows, which is also what gives those rows more weight than the ones around them.
+- **The panel ceiling went from `Style.space(560)` to `680`** so the sliders stopped needing a
+  scroll. `fittedContentHeight` clamps to the screen, so it cannot overflow.
+- **The header money block was left alone.** `Balance`, the `left` pill, `Today` and
+  `Per request` compete at one weight and the largest value is not the actionable one. Noted,
+  out of scope, still true.
 
 - **HBAR removed from the spendable assets.** It was unreachable (denied at `evaluateSpend`)
   but selectable by `pickHederaRequirement`, and its tinybar amounts would have been compared
@@ -250,6 +309,9 @@ Per BUILD.md, "everything else: decide it, note it".
   in real use.
 - Marketplace issue (HANCORE-linux/omarchy-plugin-marketplace) only after Nikodem says so — it
   is an issue, not a registry PR. **Nothing has been pushed to GitHub.**
-- The installed plugin copy at `~/.config/omarchy/plugins/chip402/` is a snapshot; re-run
-  `omarchy plugin add /home/niko/Work/chip402 --enable --yes` to pick up this build. Until
-  then its daemon speaks the old TCP API and will contend for `state.json`.
+- Splitting the daemon's `denied` status so a policy refusal and a failed request stop sharing
+  one code path. The panel says "not paid" because of it.
+- The installed plugin at `~/.config/omarchy/plugins/chip402/` is a clone whose `origin` is
+  this repo, currently clean at `HEAD`. `git -C ~/.config/omarchy/plugins/chip402 fetch &&
+  git reset --hard origin/master`, then **`omarchy restart shell`** — `rescanPlugins` will not
+  pick up changed QML.
