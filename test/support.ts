@@ -23,6 +23,7 @@ import type { Invoice, PolicyConfig } from "../src/policy.ts";
 import { dayStart } from "../src/policy.ts";
 import type { PurseState } from "../src/purse.ts";
 import { Purse } from "../src/purse.ts";
+import { Labels } from "../src/labels.ts";
 
 export const testnet = NETWORKS["hedera:testnet"]!;
 export const OUR_ACCOUNT = "0.0.10193689";
@@ -78,6 +79,12 @@ export function invoice(overrides: Partial<Invoice> = {}): Invoice {
 
 export function scratch(): string {
   return mkdtempSync(join(tmpdir(), "chip402-test-"));
+}
+
+// A label store in a temp file. Every test that renders a row or makes a payment needs one, and
+// none of them care what is in it, so this keeps the noise out of the tests themselves.
+export function labelStore(dir: string = scratch()): Labels {
+  return Labels.open(join(dir, "labels.jsonl"));
 }
 
 export const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -327,6 +334,7 @@ import { guard, refresh, settle } from "../src/wallet.ts";
 // for, by a sleep; test/seller.test.ts drives the wire for real.
 export function stubWallet(
   purse: Purse,
+  labels: Labels,
   mirror: Mirror,
   price: bigint,
   delayMs = 0,
@@ -350,6 +358,7 @@ export function stubWallet(
       let receipt: Receipt | null = null;
       const signer = guard(inner, purse, walletConfig, seen, (charged) => {
         receipt = charged;
+        labels.record(charged.txId, charged.host);
       });
       // Stands in for the 402 round trip: the gap that makes two concurrent payments a race if
       // the daemon does not serialize them.
@@ -400,8 +409,8 @@ export async function startTestDaemon(
     configPath: join(dir, "config.json"),
     stateDir: dir,
     runtimeDir: join(dir, "run"),
-    makeWallet: (_config, purse) => {
-      const wallet = stubWallet(purse, mirror, price, delayMs);
+    makeWallet: (_config, purse, labels) => {
+      const wallet = stubWallet(purse, labels, mirror, price, delayMs);
       signatures = wallet.signatures;
       return wallet;
     },

@@ -8,14 +8,20 @@
 // `setup --import` and charged today's allowance for them. Nothing was attacking it. A second
 // copy is a second answer.
 //
-// So: what is on disk is policy — set by root, changeable only over the admin socket. What is in
-// memory is the chain's last answer, held by `observe` and thrown away on restart. And `settling`
-// is neither: it is a lock, held only while a transaction we signed has not yet shown up.
+// So: what is on disk here is policy and only policy — four numbers and a flag, set by root and
+// changeable only over the admin socket. What is in memory is the chain's last answer, held by
+// `observe` and thrown away on restart. And `settling` is neither: it is a lock, held only while
+// a transaction we signed has not yet shown up.
+//
+// The host names used to be in this file too. They are in labels.ts now, because a file that must
+// refuse to start when it cannot be read has no business also holding something that grows and is
+// worthless if lost — see the table at the top of that file.
 
 import type { AssetKey, NetworkRow } from "./networks.ts";
 import { ASSET_KEYS } from "./networks.ts";
 import type { Ledger, Payment } from "./chain.ts";
 import { VALID_DURATION_MS } from "./chain.ts";
+import type { Label, Labels } from "./labels.ts";
 import { dayEnd } from "./policy.ts";
 import { parseUnits } from "./money.ts";
 import { readJson, writeAtomic } from "./safe.ts";
@@ -36,29 +42,6 @@ export type Settling = {
   readonly txId: string | null;
   readonly deadline: number;
 };
-
-// The chain knows we paid 0.0.9584959; it does not know that was printwright.liftbyai.com. This
-// is the one piece of local memory that survives, and it is decoration: it is written after the
-// signature, it is read only by the snapshot, and there is no path from it to a decision.
-//
-// Decoration that earns its place, though. "$1.60 to printwright.liftbyai.com" is a line you can
-// read; "$1.60 to 0.0.9584959" is a line you have to go and look up. Being able to see where the
-// agent's money went at a glance is most of why the panel exists, so the label map is kept
-// generously and carried across an upgrade rather than treated as disposable.
-export type Label = { readonly txId: string; readonly host: string };
-
-// Comfortably more than the payment rows one day can produce and still show — chain.ts will read
-// at most twelve pages of a hundred transactions, and a day of pocket money is a handful.
-//
-// It is also bounded from above by something less obvious, so it is worth writing down: purse.json
-// is read whole, and readJson refuses a file over MAX_JSON_BYTES. A full map at this limit is
-// about 64 kB, four times inside that. Somewhere north of two thousand labels the file would cross
-// the cap and the daemon would refuse to *start* — not to write, to start, on the next boot, long
-// after whoever raised the number had stopped looking. test/purse.test.ts pins the margin.
-//
-// So this is the wrong container for a long history of names. If that is ever wanted, it wants an
-// append-only file of its own, not a limit raised here.
-const LABEL_LIMIT = 500;
 
 // How many payment rows the status frame carries per asset. The panel draws six and the CLI five,
 // so this is headroom rather than a constraint on either — what it bounds is the frame itself.
@@ -101,6 +84,13 @@ function budgetFromJson(raw: unknown): Budget {
   };
 }
 
+// --- one read of shapes this file no longer writes ------------------------------------------
+//
+// Host names used to live in purse.json: first on each receipt, later in a `labels` array. Both
+// are lifted out once, handed to the label store on first start, and then gone — `persist` below
+// writes neither, so the first write after an upgrade drops them for good. Only the two strings
+// are taken. Not the amounts, not the counters, not whether the seller claimed it settled: the
+// chain answers all three, and reading them back is exactly the mistake this rewrite removed.
 function labelsFromJson(raw: unknown): Label[] {
   if (!Array.isArray(raw)) return [];
   const labels: Label[] = [];
@@ -109,18 +99,9 @@ function labelsFromJson(raw: unknown): Label[] {
       labels.push({ txId: entry["txId"], host: entry["host"] });
     }
   }
-  return labels.slice(-LABEL_LIMIT);
+  return labels;
 }
 
-// One read of a shape this file no longer writes. The build before this one kept a list of
-// receipts per asset, and every row carried the host it had paid — the single part of that list
-// worth keeping, because it is the part the chain cannot answer. Losing it on upgrade would turn
-// a purse's whole history from names into account numbers for no reason.
-//
-// What is taken is exactly the two strings. Not the amounts, not the counters, not whether the
-// seller claimed it settled — those are the chain's to answer now, and the first write after this
-// drops the old shape from the file for good. So this is a migration of labels, not of a ledger:
-// nothing it returns can reach a number, because nothing reads a label but the snapshot.
 function labelsFromLegacyReceipts(raw: Record<string, unknown> | undefined): Label[] {
   const labels: Label[] = [];
   for (const key of ASSET_KEYS) {
@@ -132,19 +113,21 @@ function labelsFromLegacyReceipts(raw: Record<string, unknown> | undefined): Lab
       }
     }
   }
-  return labels.slice(-LABEL_LIMIT);
+  return labels;
 }
 
 export class Purse {
   readonly #path: string;
   readonly #state: PurseState;
-  #labels: Label[];
+  // Host names carried out of an older purse.json, for the label store to adopt on first start.
+  // Never written back, never read by anything here — see `legacyLabels`.
+  readonly #carried: Label[];
   #onChange: (() => void) | undefined;
 
-  constructor(path: string, state: PurseState, labels: Label[] = []) {
+  constructor(path: string, state: PurseState, carried: Label[] = []) {
     this.#path = path;
     this.#state = state;
-    this.#labels = labels;
+    this.#carried = carried;
   }
 
   // Missing file means a machine that has been installed but never configured: start paused with
@@ -199,21 +182,10 @@ export class Purse {
     this.#onChange?.();
   }
 
-  // The host behind a transaction id, written after the signature. It is a label and never an
-  // input: no number, no limit and no decision can be reached from this map.
-  label(txId: string, host: string): void {
-    this.#labels = this.#labels.filter((entry) => entry.txId !== txId);
-    this.#labels.push({ txId, host });
-    if (this.#labels.length > LABEL_LIMIT) this.#labels = this.#labels.slice(-LABEL_LIMIT);
-    this.persist();
-  }
-
-  hostFor(txId: string): string | null {
-    return this.#labels.find((entry) => entry.txId === txId)?.host ?? null;
-  }
-
-  get labels(): readonly Label[] {
-    return this.#labels;
+  // What an older purse.json had in it, for labels.ts to adopt once. Reading this is the whole
+  // of the migration; nothing writes it back, so the next `persist` drops the old shape.
+  get legacyLabels(): readonly Label[] {
+    return this.#carried;
   }
 
   // Pause is on the cheap side of the fence and resume is not — that asymmetry lives in
@@ -236,7 +208,6 @@ export class Purse {
           paused: this.#state.paused,
           usdc: budgetToJson(this.#state.usdc),
           hbar: budgetToJson(this.#state.hbar),
-          labels: this.#labels,
         },
         null,
         2,
@@ -276,7 +247,13 @@ function paymentToJson(payment: Payment, host: string | null): Record<string, un
 // SECURITY: there is no branch of this function that can reach the key — the wallet does not
 // appear in it at all. And every number under `spent`, `balance` and `payments` came off the
 // mirror node in this process's last read; none of them is stored anywhere.
-export function snapshot(purse: Purse, network: NetworkRow, identity: Identity, now: number): Record<string, unknown> {
+export function snapshot(
+  purse: Purse,
+  labels: Labels,
+  network: NetworkRow,
+  identity: Identity,
+  now: number,
+): Record<string, unknown> {
   const state = purse.state;
   const ledger = state.ledger;
   const assets: Record<string, unknown> = {};
@@ -299,7 +276,7 @@ export function snapshot(purse: Purse, network: NetworkRow, identity: Identity, 
       payments: (ledger?.payments ?? [])
         .filter((payment) => payment.asset === key)
         .slice(0, PANEL_ROWS)
-        .map((payment) => paymentToJson(payment, purse.hostFor(payment.txId))),
+        .map((payment) => paymentToJson(payment, labels.hostFor(payment.txId))),
     };
   }
   return {

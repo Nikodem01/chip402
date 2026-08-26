@@ -15,6 +15,7 @@ import { digits, parseUnits } from "./money.ts";
 import { dayStart, decide } from "./policy.ts";
 import type { PolicyConfig } from "./policy.ts";
 import type { Purse } from "./purse.ts";
+import type { Labels } from "./labels.ts";
 import type { Limits, Sighting } from "./fetch.ts";
 import { LIMITS, hardenedFetch } from "./fetch.ts";
 import { credentialPath, readSecret } from "./safe.ts";
@@ -152,8 +153,10 @@ export function guard(
       const validStart = txId === null ? null : validStartOf(txId);
       purse.beginSettling(txId, validStart ?? now);
 
+      // The host is recorded by the caller, not here — see payer(). The guard is about the key
+      // and the decision; a display label is neither, and does not belong on the same side of
+      // this door.
       const host = new URL(seen.finalUrl).host;
-      if (txId !== null) purse.label(txId, host);
       onCharge({ txId, at: now, asset: decision.asset.key, amount: amount.toString(), host, url: seen.finalUrl, onChain: false });
       return payload;
     },
@@ -247,6 +250,7 @@ export function payer(
   inner: ClientHederaSigner,
   config: PolicyConfig,
   purse: Purse,
+  labels: Labels,
   refreshChain: () => Promise<void>,
   limits: Limits = LIMITS,
   patienceMs: number = SETTLE_WAIT_MS,
@@ -264,6 +268,9 @@ export function payer(
     let charged: Receipt | null = null;
     const signer = guard(inner, purse, config, seen, (receipt) => {
       charged = receipt;
+      // One short append, the moment the transaction id and the host are both known. It cannot
+      // fail a payment: the store's whole contract is that losing it costs names and nothing else.
+      labels.record(receipt.txId, receipt.host);
     });
 
     const usdcAsset = network.assets.usdc;
@@ -328,7 +335,7 @@ export function payer(
   };
 }
 
-export function openWallet(config: PolicyConfig, purse: Purse): Wallet {
+export function openWallet(config: PolicyConfig, purse: Purse, labels: Labels): Wallet {
   // The key is read once, from the tmpfs systemd decrypted the TPM2-sealed credential into. It
   // lives in this closure and is never stored on the Wallet object, so nothing that holds a
   // wallet holds a key.
@@ -394,7 +401,7 @@ export function openWallet(config: PolicyConfig, purse: Purse): Wallet {
     get verified() {
       return verified;
     },
-    pay: payer(inner, config, purse, refreshChain),
+    pay: payer(inner, config, purse, labels, refreshChain),
     refresh: refreshChain,
   };
 }

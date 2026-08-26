@@ -87,10 +87,10 @@ then reconciles the two.
 
 The rule is not "keep nothing locally", and it is worth being exact about that, because chip402
 *does* keep one thing: a `txId → host` map, so a row can read `printwright.liftbyai.com` instead
-of `0.0.9584959`. Two properties make that legitimate where `spentToday` was not:
+of `0.0.9584959`. Two properties make that legitimate where a local spend counter was not:
 
 - **The chain does not know it and cannot.** There is no second copy to drift from, because there
-  is no first copy anywhere else. `spentToday` was a duplicate of something Hedera already
+  is no first copy anywhere else. The counter was a duplicate of something Hedera already
   answered; a hostname is not.
 - **It cannot reach a decision.** `hostFor` is called by the snapshot and by nothing else. No
   limit, no sum, no policy path touches it. Lose the whole map and the worst outcome is rows that
@@ -98,6 +98,35 @@ of `0.0.9584959`. Two properties make that legitimate where `spentToday` was not
 
 So the two rules that actually survive are: *never keep a local copy of a number the chain owns*,
 and *never let local state reach a decision*. The label map breaks neither.
+
+### Two files, because they want opposite things when they break
+
+Those names lived inside `purse.json` at first, and that was a defect regardless of how small the
+file was — one this project's own thesis should have caught sooner:
+
+| | `purse.json` — policy | `labels.jsonl` — host names |
+|---|---|---|
+| size | ~250 bytes, fixed | grows with every payment |
+| written by | root, over the admin socket | the daemon, on every payment |
+| **if it cannot be read** | **refuse to start** — "I do not know the limits" must never become "there are no limits" | **carry on with fewer names.** Losing all of them costs nothing |
+
+Sharing a file meant sharing a failure mode, and the shared one had to be the strict one. So a
+growing pile of decoration could push the file past the size the daemon agrees to read — and then
+the daemon would refuse to **start**, on some later boot, over host names. A display nicety must
+never be able to stop a payment daemon. That is the same shape of bug as a check that gates
+nothing, pointed the other way: something inert reaching something critical.
+
+Apart, each file gets what it actually wants. `purse.json` is four numbers and a flag with a hard
+cap three hundred times what it needs, and an unreadable one still stops everything. `labels.jsonl`
+is append-only — one short line at the end of a file per payment, rather than an atomic rewrite of
+the limits — and **nothing about it can stop the daemon**: truncated, corrupt, half-written, too
+big to read whole, or a directory where the file should be are all survivable, and each costs
+names and only names. `test/labels.test.ts` asserts every one of those, with the contrasting
+`purse.json` case sitting next to them so the difference is visible in one place.
+
+It also removes the ceiling. Names are no longer capped at five hundred to fit inside somebody
+else's size limit; the file holds a hundred thousand — twenty payments a day for thirteen years —
+and past that it is read from the end and compacted, losing the oldest rather than refusing.
 
 This is not tidiness. The previous build kept its own `spentToday` counters and its own receipt
 list, and that ledger was **already wrong** — with no attacker involved:
@@ -587,7 +616,7 @@ fixed column so hosts align however long the amount is.
 
 ## The code
 
-Ten core files, each with one job, each meant to be read aloud: 1,266 lines of code, 1,965 with
+Eleven core files, each with one job, each meant to be read aloud: 1,377 lines of code, 2,194 with
 the comments, which are part of the deliverable rather than decoration. `grep -rn "SECURITY:"
 src/ ui/` is the outline of the security half.
 
@@ -595,11 +624,12 @@ src/ ui/` is the outline of the security half.
 |---|---|---|
 | `src/networks.ts` | Two frozen rows: mirror node, both token ids, and the panel's preset ladders (a ladder, not a ceiling). **The mainnet switch.** | 72 / 109 |
 | `src/money.ts` | `bigint` base units, decimals-aware. No function takes two assets, so no function can need a price. | 36 / 61 |
-| `src/safe.ts` | `readSecret` (`O_NOFOLLOW` + `fstat`), `writeAtomic` (temp, flush, rename), `readJson` (size-capped through the descriptor). | 70 / 111 |
+| `src/safe.ts` | `readSecret` (`O_NOFOLLOW` + `fstat`), `writeAtomic` (temp, flush, rename), `readJson` (size-capped, refuses), `appendLine`/`readTail` (append-only, never refuses). | 101 / 162 |
 | `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also where local midnight is defined, because that is the one thing about "today" that is ours. | 70 / 160 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK. Manual redirects, byte cap, deadline, `accepts[]` cap. | 83 / 132 |
 | `src/chain.ts` | **What the chain says, and the only place it is asked.** The x402-payment filter, today's spend, the three-state key check, and "has this transaction happened yet". | 198 / 303 |
-| `src/purse.ts` | Limits, `paused`, a bounded label map (carried across an upgrade) and the settling lane. No spending state, on disk or otherwise. | 200 / 328 |
+| `src/purse.ts` | Limits, `paused` and the settling lane — and on disk, **only** the limits and `paused`. No spending state, no host names, nothing that grows. | 191 / 310 |
+| `src/labels.ts` | The `txId → host` names, append-only in a file of their own. Structurally incapable of stopping the daemon. | 65 / 132 |
 | `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement wait. | 268 / 402 |
 | `src/protocol.ts` | The NDJSON contract: two frozen verb sets, plus the client the CLI and MCP server use. | 75 / 112 |
 | `src/daemon.ts` | Two listeners in one process. The plane is the listener. Payments serialized through one chain. | 214 / 298 |
@@ -619,7 +649,8 @@ missing rather than passing quietly.
 | `money.test.ts` | Float rejection, both decimal boundaries, overflow, and that no exported function sees two assets. |
 | `chain.test.ts` | The payment filter, against a **verbatim capture of the public testnet mirror node**: $1.62 and ℏ0.00 to the unit, failures and owner-initiated transactions dropped, incoming transfers not counted as spending — and the ℏ0.02 regression, which moves to the wallet that actually made it when the account id changes. Plus the three states of the key check, including `ANTI-BRICK`. |
 | `policy.test.ts` | The decision table, run twice — once per asset — plus the cross-asset cases. The security proof. Includes: a chain that has never answered denies rather than reading as zero, a settling payment denies, `verified === null` **allows**. |
-| `purse.test.ts` | That `purse.json` holds policy and labels and nothing else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, that upgrading from the old build keeps the host names and *only* those, and that a truncated temp file never becomes the purse. |
+| `purse.test.ts` | That `purse.json` holds policy and *nothing* else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, that upgrading from the old build carries the host names out and *only* those, and that a truncated temp file never becomes the purse. |
+| `labels.test.ts` | That nothing about the label store can stop the daemon — truncated, corrupt, oversized, or a directory where the file should be — with the contrasting `purse.json` refusal asserted beside it. Plus append-only behaviour, last-line-wins, and the one-time migration out of the old file. |
 | `seller.test.ts` | The hostile-seller table, against real HTTP servers, the real SDK wrapper and a mirror node on loopback — including a seller that takes a signature and never settles, which costs nothing. |
 | `planes.test.ts` | The authority proof: disjoint verb sets, admin verbs refused on the spend socket, the plane is never read from a field. |
 | `signer.test.ts` | The enforcement proof: every denial leaves the stub signer uncalled, no lane closed and nothing recorded. Plus a second signature in one payment throwing, and both ways the settling lane reopens. |

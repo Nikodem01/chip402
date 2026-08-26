@@ -21,6 +21,7 @@ import {
   OUR_PUBLIC_KEY,
   SELLER,
   fakeMirror,
+  labelStore,
   scratch,
   testSigner,
   testnet,
@@ -140,7 +141,7 @@ test("an agent pays a URL it has never seen, through one MCP tool call", async (
     runtimeDir,
     // The real payment path, with a stub where the Hedera key would be. Everything above it —
     // the hardened fetch, the guarded signer, the policy, the chain read — is the shipping code.
-    makeWallet: (_walletConfig, purse) => {
+    makeWallet: (_walletConfig, purse, labels) => {
       const refreshChain = async (): Promise<void> => {
         purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS), false);
       };
@@ -150,7 +151,7 @@ test("an agent pays a URL it has never seen, through one MCP tool call", async (
         accountWithChecksum: OUR_ACCOUNT + "-wkdxo",
         verified: true,
         refresh: refreshChain,
-        pay: payer(inner, walletConfig, purse, refreshChain, undefined, 0),
+        pay: payer(inner, walletConfig, purse, labels, refreshChain, undefined, 0),
       };
     },
   });

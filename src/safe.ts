@@ -81,11 +81,12 @@ export function writeAtomic(path: string, data: string, mode = 0o600): void {
   }
 }
 
-// The purse and the config are a few hundred bytes each. The cap is here for the same reason the
-// one on readSecret is: pointing this function at something large should be a refusal rather
-// than a memory spike, and the size is taken off the descriptor we already opened rather than
-// off a path that could be something else by the time we read it.
-export const MAX_JSON_BYTES = 256 * 1024;
+// The purse and the config are a few hundred bytes each — four numbers, a flag and a network
+// name. This cap is three hundred times that, and it is a real guard precisely because nothing
+// that grows lives in either file: growing things live in an append-only log with a cap of its
+// own, which degrades instead of refusing. The size is taken off the descriptor we already
+// opened rather than off a path that could be something else by the time we read it.
+export const MAX_JSON_BYTES = 64 * 1024;
 
 // Read a small JSON file, or undefined when it is simply not there. Anything else — a parse
 // error, a permissions problem, a file too big to be limits — is thrown, because "I could not
@@ -105,6 +106,56 @@ export function readJson(path: string): unknown {
     const buffer = Buffer.alloc(info.size);
     readSync(fd, buffer, 0, info.size, 0);
     return JSON.parse(buffer.toString("utf8"));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+
+// --- the append-only side: state that grows, and must never stop the daemon ------------------
+
+// Add one line to a file, creating it if it is not there. O_APPEND means the kernel places the
+// write at the end atomically, so there is no read-modify-write and no window in which a crash
+// loses what was already there — which is the whole reason growing state does not live in a file
+// that gets rewritten whole.
+export function appendLine(path: string, line: string, mode = 0o600): void {
+  const fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT, mode);
+  try {
+    writeSync(fd, line.endsWith("\n") ? line : line + "\n");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// Read at most the last `maxBytes` of a file, as whole lines. A file bigger than that is not an
+// error: it is read from the end and the first, probably-partial line is dropped. Missing file is
+// an empty list.
+//
+// SECURITY-adjacent, and the point of the whole exercise: this function has no failure that stops
+// a caller. Everything it holds is decoration — lose all of it and the worst outcome is rows that
+// name an account id instead of a hostname — so a truncated, oversized or half-written file must
+// cost fewer lines and never a refusal to start. That is exactly the property the limits file
+// must NOT have, which is why the two no longer share a file.
+export function readTail(path: string, maxBytes: number): string[] {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY);
+  } catch {
+    return [];
+  }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size === 0) return [];
+    const length = Math.min(info.size, maxBytes);
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, info.size - length);
+    const text = buffer.toString("utf8");
+    const lines = text.split("\n");
+    // Read from the middle of the file, so the first line is very likely half of one.
+    if (length < info.size) lines.shift();
+    return lines.filter((line) => line.trim() !== "");
+  } catch {
+    return [];
   } finally {
     closeSync(fd);
   }

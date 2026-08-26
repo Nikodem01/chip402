@@ -8,15 +8,15 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Purse, snapshot } from "../src/purse.ts";
-import { MAX_JSON_BYTES } from "../src/safe.ts";
 import { dayEnd } from "../src/policy.ts";
-import { NOW, ledger, scratch, testnet } from "./support.ts";
+import { NOW, labelStore, ledger, scratch, testnet } from "./support.ts";
 
 function open(dir: string): Purse {
   return Purse.open(join(dir, "purse.json"));
 }
 
 const identity = { accountId: "0.0.10193689", accountWithChecksum: "0.0.10193689-wkdxo", evmAddress: null, verified: null };
+const labels = labelStore();
 
 test("a machine with no purse.json starts paused and cannot spend a cent", () => {
   const purse = open(scratch());
@@ -38,21 +38,23 @@ test("a purse.json with a hand-edited limit that is not an integer is refused", 
   assert.throws(() => open(dir), /not an integer amount/);
 });
 
-test("purse.json holds policy and labels, and nothing that bounds spending", () => {
+test("purse.json holds policy and nothing else at all", () => {
   // The whole rewrite, as a shape assertion. A number here that says what was spent is a second
-  // copy of something the chain already knows, and a second copy is a second answer.
+  // copy of something the chain already knows, and a second copy is a second answer. Host names
+  // are gone too — not because they are a copy of anything, but because a file that must refuse
+  // to start when it cannot be read may not also hold something that grows. See labels.test.ts.
   const dir = scratch();
   const purse = open(dir);
   purse.setPaused(false);
   purse.setLimit("usdc", "allowance", 2_000_000n);
   purse.setLimit("usdc", "maxPayment", 250_000n);
-  purse.label("0.0.9185802@1.0", "a.example");
 
   const written = JSON.parse(readFileSync(join(dir, "purse.json"), "utf8")) as Record<string, any>;
-  assert.deepEqual(Object.keys(written).sort(), ["hbar", "labels", "paused", "usdc"]);
+  assert.deepEqual(Object.keys(written).sort(), ["hbar", "paused", "usdc"]);
   assert.deepEqual(Object.keys(written["usdc"]).sort(), ["allowance", "maxPayment"]);
-  assert.deepEqual(written["labels"], [{ txId: "0.0.9185802@1.0", host: "a.example" }]);
-  assert.doesNotMatch(JSON.stringify(written), /spent|receipt|balance|resetsAt|settl/i);
+  assert.doesNotMatch(JSON.stringify(written), /spent|receipt|balel|balance|resetsAt|settl|label|host/i);
+  // Four numbers, a flag, and room to spare inside what the daemon will agree to read.
+  assert.ok(readFileSync(join(dir, "purse.json"), "utf8").length < 400);
 });
 
 test("there is no local spending state anywhere in src/", () => {
@@ -88,26 +90,6 @@ test("nothing restored from disk carries a fact about the chain", () => {
   assert.equal(reloaded.state.settling, null);
 });
 
-test("a label is decoration: it names a host and reaches nothing", () => {
-  const purse = open(scratch());
-  purse.label("0.0.9185802@1.0", "a.example");
-  purse.label("0.0.9185802@2.0", "b.example");
-  assert.equal(purse.hostFor("0.0.9185802@1.0"), "a.example");
-  assert.equal(purse.hostFor("0.0.9185802@9.9"), null, "an unlabelled payment is not an error");
-  // Re-labelling the same id replaces rather than accumulates.
-  purse.label("0.0.9185802@1.0", "c.example");
-  assert.equal(purse.labels.length, 2);
-  assert.equal(purse.hostFor("0.0.9185802@1.0"), "c.example");
-});
-
-test("labels are bounded, so a busy day cannot grow the file without limit", () => {
-  const purse = open(scratch());
-  for (let i = 0; i < 600; i++) purse.label(`0.0.9185802@${i}.0`, `host${i}.example`);
-  assert.equal(purse.labels.length, 500);
-  assert.equal(purse.hostFor("0.0.9185802@599.0"), "host599.example");
-  assert.equal(purse.hostFor("0.0.9185802@1.0"), null, "the oldest labels are dropped");
-});
-
 test("upgrading from the old build keeps the host names and nothing else", () => {
   // A verbatim excerpt of the purse.json this machine was actually running before the rewrite,
   // wrong ℏ0.02 and all. What survives is the two strings a human reads a row by; the counters,
@@ -138,8 +120,9 @@ test("upgrading from the old build keeps the host names and nothing else", () =>
   );
 
   const purse = open(dir);
-  assert.equal(purse.hostFor("0.0.7162784@1787718561.825914914"), "printwright.liftbyai.com");
-  assert.equal(purse.hostFor("0.0.9185802@1787712043.742467199"), "127.0.0.1:4403");
+  const carried = Object.fromEntries(purse.legacyLabels.map((l) => [l.txId, l.host]));
+  assert.equal(carried["0.0.7162784@1787718561.825914914"], "printwright.liftbyai.com");
+  assert.equal(carried["0.0.9185802@1787712043.742467199"], "127.0.0.1:4403");
   // The limits are policy and come across; the ℏ0.02 that was wrong does not exist to come across.
   assert.equal(purse.state.usdc.allowance, 10_000_000n);
   assert.equal(purse.state.hbar.maxPayment, 100_000_000n);
@@ -148,31 +131,10 @@ test("upgrading from the old build keeps the host names and nothing else", () =>
   // And the first write drops the old shape for good.
   purse.persist();
   const written = JSON.parse(readFileSync(join(dir, "purse.json"), "utf8")) as Record<string, any>;
-  assert.deepEqual(Object.keys(written).sort(), ["hbar", "labels", "paused", "usdc"]);
-  assert.equal(written["labels"].length, 2);
-  assert.doesNotMatch(JSON.stringify(written), /spentToday|receipts|resetsAt|settled|fresh/);
-
-  // Re-reading the new file is the ordinary path, not the migration one.
-  assert.equal(open(dir).hostFor("0.0.7162784@1787718561.825914914"), "printwright.liftbyai.com");
-});
-
-test("an explicit label list is never overwritten by a stale receipts array", () => {
-  // The migration only runs when there is nothing to migrate onto. A file that already has
-  // labels is a file the new build wrote, and whatever is left of the old shape beside it is
-  // debris rather than a source.
-  const dir = scratch();
-  writeFileSync(
-    join(dir, "purse.json"),
-    JSON.stringify({
-      paused: false,
-      usdc: { allowance: "1", maxPayment: "1", receipts: [{ txId: "0.0.1@1.0", host: "stale.example" }] },
-      labels: [{ txId: "0.0.2@2.0", host: "current.example" }],
-    }),
-  );
-  const purse = open(dir);
-  assert.equal(purse.labels.length, 1);
-  assert.equal(purse.hostFor("0.0.2@2.0"), "current.example");
-  assert.equal(purse.hostFor("0.0.1@1.0"), null);
+  assert.deepEqual(Object.keys(written).sort(), ["hbar", "paused", "usdc"]);
+  assert.doesNotMatch(JSON.stringify(written), /spentToday|receipts|resetsAt|settled|fresh|label|host/);
+  // Nothing to carry a second time: the names are the label store's now.
+  assert.equal(open(dir).legacyLabels.length, 0);
 });
 
 test("the lane closes on a signature and only the chain or the clock opens it", () => {
@@ -199,9 +161,9 @@ test("the snapshot the panel sees is the chain's answer, with no key material in
     }),
     false,
   );
-  purse.label("0.0.7162784@1787718561.825914914", "printwright.liftbyai.com");
+  labels.record("0.0.7162784@1787718561.825914914", "printwright.liftbyai.com");
 
-  const frame = snapshot(purse, testnet, identity, NOW) as Record<string, any>;
+  const frame = snapshot(purse, labels, testnet, identity, NOW) as Record<string, any>;
   assert.equal(frame["type"], "status");
   assert.equal(frame["assets"].usdc.balance, "4120000");
   assert.equal(frame["assets"].usdc.spent, "1620000");
@@ -234,7 +196,7 @@ test("the frame carries a bounded number of rows, and the sum is not one of them
   }));
   purse.observe(ledger({ payments: many, spent: { usdc: 200_000n, hbar: 0n } }), false);
 
-  const frame = snapshot(purse, testnet, identity, NOW) as Record<string, any>;
+  const frame = snapshot(purse, labels, testnet, identity, NOW) as Record<string, any>;
   assert.equal(frame["assets"].usdc.payments.length, 20, "the frame is unbounded");
   // Newest first, so a cut keeps the rows a human would actually be shown.
   assert.equal(frame["assets"].usdc.payments[0].txId, many[0]!.txId);
@@ -244,7 +206,7 @@ test("the frame carries a bounded number of rows, and the sum is not one of them
 
 test("before the chain has answered the snapshot says so rather than showing a zero", () => {
   const purse = open(scratch());
-  const frame = snapshot(purse, testnet, identity, NOW) as Record<string, any>;
+  const frame = snapshot(purse, labels, testnet, identity, NOW) as Record<string, any>;
   assert.equal(frame["chainAt"], 0);
   assert.equal(frame["assets"].usdc.payments.length, 0);
 });
@@ -258,23 +220,6 @@ test("a truncated temp file never becomes the purse", () => {
   writeFileSync(join(dir, "purse.json.tmp"), '{"paused":false,"usdc":{"allo');
   const reloaded = open(dir);
   assert.equal(reloaded.state.usdc.allowance, 2_000_000n);
-});
-
-test("a full label map stays well inside the size the daemon will agree to read", () => {
-  // A quiet trap, pinned. purse.json is read whole and readJson refuses anything over
-  // MAX_JSON_BYTES, so LABEL_LIMIT is bounded from above by a constant in a different file. Raise
-  // it far enough and the daemon stops *starting* — on some later boot, with an error about file
-  // size that says nothing about labels. This fails first instead.
-  const dir = scratch();
-  const purse = open(dir);
-  purse.setLimit("usdc", "allowance", 10_000_000n);
-  for (let i = 0; i < 600; i++) {
-    purse.label(`0.0.9185802@178771872${i % 10}.${String(i).padStart(9, "0")}`, `some-fairly-long-seller-hostname${i}.example.com`);
-  }
-  const size = readFileSync(join(dir, "purse.json"), "utf8").length;
-  assert.ok(size < MAX_JSON_BYTES / 2, `a full label map is ${size} bytes, over half the ${MAX_JSON_BYTES} readJson allows`);
-  // And it still round-trips, which is the thing the size cap would silently take away.
-  assert.equal(open(dir).labels.length, 500);
 });
 
 test("a purse.json too large to be limits is refused rather than read", () => {

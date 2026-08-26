@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/money.test.ts test/chain.test.ts test/policy.test.ts test/purse.test.ts test/seller.test.ts test/signer.test.ts test/planes.test.ts test/daemon.test.ts test/mcp.test.ts test/panel.test.ts",
+    "test": "node --test test/money.test.ts test/chain.test.ts test/labels.test.ts test/policy.test.ts test/purse.test.ts test/seller.test.ts test/signer.test.ts test/planes.test.ts test/daemon.test.ts test/mcp.test.ts test/panel.test.ts",
     "push": "sudo install -m0644 -t /usr/local/lib/chip402/src src/*.ts && sudo systemctl restart chip402",
     "test:live": "CHIP402_LIVE=1 node --test test/live.test.ts"
   },

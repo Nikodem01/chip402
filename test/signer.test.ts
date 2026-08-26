@@ -19,6 +19,7 @@ import {
   SELLER,
   config,
   fakeMirror,
+  labelStore,
   ledger,
   scratch,
   testSigner,
@@ -56,13 +57,19 @@ function harness(purse: Purse, seen: Partial<Sighting> = {}) {
   const inner = testSigner();
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2, ...seen };
   const charged: (string | null)[] = [];
-  const signer = guard(inner, purse, config, sighting, (receipt) => charged.push(receipt.txId));
-  return { signer, charged, calls: inner.calls };
+  const labels = labelStore();
+  // The guard no longer writes labels — payer() does, from the same callback — so the harness
+  // stands in for that, and the assertion below is about where the host comes from either way.
+  const signer = guard(inner, purse, config, sighting, (receipt) => {
+    charged.push(receipt.txId);
+    labels.record(receipt.txId, receipt.host);
+  });
+  return { signer, charged, calls: inner.calls, labels };
 }
 
 test("the transaction id on the receipt is ours, read out of the bytes we signed", async () => {
   const purse = readyPurse();
-  const { signer, charged, calls } = harness(purse);
+  const { signer, charged, calls, labels } = harness(purse);
   const payload = await signer.createPartiallySignedTransferTransaction(requirements());
   assert.equal(calls(), 1);
   assert.equal(charged.length, 1);
@@ -70,7 +77,7 @@ test("the transaction id on the receipt is ours, read out of the bytes we signed
   // cannot change and the seller never had a say in.
   assert.equal(charged[0], inspectHederaTransaction(payload).transactionId);
   assert.equal(purse.state.settling?.txId, charged[0], "the lane did not close on the signature");
-  assert.equal(purse.hostFor(String(charged[0])), "api.example.com");
+  assert.equal(labels.hostFor(String(charged[0])), "api.example.com");
 });
 
 test("SECURITY: a second signature inside one payment throws", async () => {

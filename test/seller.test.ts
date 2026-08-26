@@ -25,6 +25,7 @@ import {
   OUR_PUBLIC_KEY,
   SELLER,
   fakeMirror,
+  labelStore,
   scratch,
   testSigner,
   testnet,
@@ -82,15 +83,17 @@ function readyPurse(): Purse {
 // the real policy, the real chain read and the real settlement wait.
 function pipeline(purse: Purse, mirror: Mirror, limits: Partial<Limits> = {}) {
   const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
+  const labels = labelStore();
   const inner = testSigner(mirror);
   const refreshChain = async (): Promise<void> => {
     purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS), false);
   };
   // Patience of zero: this mirror indexes instantly, so a payment that will be seen is seen on
   // the first check, and one that will not needs no waiting for.
-  const pay = payer(inner, walletConfig, purse, refreshChain, { ...LIMITS, ...limits }, 0);
+  const pay = payer(inner, walletConfig, purse, labels, refreshChain, { ...LIMITS, ...limits }, 0);
   return {
     pay,
+    labels,
     signatures: inner.calls,
     // What the chain says we have spent today, which is the only number that bounds anything.
     spent: async () => (await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS)).spent,
@@ -137,13 +140,13 @@ test("a same-origin redirect is followed, and the URL that answered is the one p
   });
   t.after(() => shop.close());
 
-  const { pay, signatures, purse } = await bench(t);
+  const { pay, signatures, labels } = await bench(t);
   const result = await pay(`${shop.base}/old`);
   assert.equal(result.body, "the goods");
   assert.equal(signatures(), 1);
   assert.match(String(result.receipt?.url), /\/secret$/);
   // The label follows the URL that answered too, so the row a human reads names the right host.
-  assert.equal(purse.hostFor(String(result.receipt?.txId)), new URL(`${shop.base}/secret`).host);
+  assert.equal(labels.hostFor(String(result.receipt?.txId)), new URL(`${shop.base}/secret`).host);
 });
 
 test("an unbounded 402 body is cut off before it can be parsed", async (t) => {

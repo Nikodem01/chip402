@@ -12,6 +12,7 @@ import { parse } from "./money.ts";
 import type { Plane } from "./protocol.ts";
 import { MAX_LINE_BYTES, fail, ok, parseLine, serialize, verbsFor } from "./protocol.ts";
 import { Purse, snapshot } from "./purse.ts";
+import { Labels } from "./labels.ts";
 import { readJson } from "./safe.ts";
 import type { Wallet } from "./wallet.ts";
 import { denialReason, openWallet } from "./wallet.ts";
@@ -24,7 +25,7 @@ export type DaemonOptions = {
   runtimeDir: string;
   // Swapped for a stub in the tests, so the plane and concurrency proofs run from the checkout
   // with no install, no key and no network.
-  makeWallet?: (config: { network: NetworkRow; accountId: string }, purse: Purse) => Wallet;
+  makeWallet?: (config: { network: NetworkRow; accountId: string }, purse: Purse, labels: Labels) => Wallet;
 };
 
 export type Daemon = { spendPath: string; adminPath: string; close: () => Promise<void> };
@@ -73,6 +74,11 @@ function assetKey(value: unknown): AssetKey {
 export async function start(options: DaemonOptions): Promise<Daemon> {
   const config = loadConfig(options.configPath);
   const purse = Purse.open(join(options.stateDir, "purse.json"));
+  // Two files, because they want two different things when they cannot be read: purse.json is the
+  // limits and a bad one stops the daemon; labels.jsonl is host names and a bad one costs names.
+  // On the first start after an upgrade the store adopts whatever purse.json used to carry, and
+  // purse.json stops carrying it on its next write.
+  const labels = Labels.open(join(options.stateDir, "labels.jsonl"), () => purse.legacyLabels);
   const clients = new Set<Socket>();
 
   // Built on the first payment, not at start-up, so a machine that has been installed but not
@@ -82,7 +88,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     if (!config.accountId) throw new Error("no account yet — run `sudo chip402ctl setup`");
     if (!wallet) {
       const make = options.makeWallet ?? openWallet;
-      wallet = make({ network: config.network, accountId: config.accountId }, purse);
+      wallet = make({ network: config.network, accountId: config.accountId }, purse, labels);
     }
     return wallet;
   }
@@ -96,7 +102,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     evmAddress: wallet ? wallet.evmAddress : config.evmAddress,
     verified: wallet ? wallet.verified : null,
   });
-  const statusFrame = (): string => serialize(snapshot(purse, config.network, identity(), Date.now()));
+  const statusFrame = (): string => serialize(snapshot(purse, labels, config.network, identity(), Date.now()));
 
   // Every change pushes a fresh frame to everyone connected, which is why the panel has no
   // refresh interval and no polling loop.
@@ -126,7 +132,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
       case "purse":
         // The same frame the panel is pushed, but carrying the request id so a client that
         // asked for it can tell it apart from an unsolicited update.
-        return serialize({ id, ...snapshot(purse, config.network, identity(), Date.now()) });
+        return serialize({ id, ...snapshot(purse, labels, config.network, identity(), Date.now()) });
 
       case "pause":
         purse.setPaused(true);
