@@ -85,7 +85,7 @@ export function writeAtomic(path: string, data: string, mode = 0o600): void {
 // one on readSecret is: pointing this function at something large should be a refusal rather
 // than a memory spike, and the size is taken off the descriptor we already opened rather than
 // off a path that could be something else by the time we read it.
-const MAX_JSON_BYTES = 256 * 1024;
+export const MAX_JSON_BYTES = 256 * 1024;
 
 // Read a small JSON file, or undefined when it is simply not there. Anything else — a parse
 // error, a permissions problem, a file too big to be limits — is thrown, because "I could not

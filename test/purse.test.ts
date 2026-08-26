@@ -8,6 +8,7 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Purse, snapshot } from "../src/purse.ts";
+import { MAX_JSON_BYTES } from "../src/safe.ts";
 import { dayEnd } from "../src/policy.ts";
 import { NOW, ledger, scratch, testnet } from "./support.ts";
 
@@ -257,6 +258,23 @@ test("a truncated temp file never becomes the purse", () => {
   writeFileSync(join(dir, "purse.json.tmp"), '{"paused":false,"usdc":{"allo');
   const reloaded = open(dir);
   assert.equal(reloaded.state.usdc.allowance, 2_000_000n);
+});
+
+test("a full label map stays well inside the size the daemon will agree to read", () => {
+  // A quiet trap, pinned. purse.json is read whole and readJson refuses anything over
+  // MAX_JSON_BYTES, so LABEL_LIMIT is bounded from above by a constant in a different file. Raise
+  // it far enough and the daemon stops *starting* — on some later boot, with an error about file
+  // size that says nothing about labels. This fails first instead.
+  const dir = scratch();
+  const purse = open(dir);
+  purse.setLimit("usdc", "allowance", 10_000_000n);
+  for (let i = 0; i < 600; i++) {
+    purse.label(`0.0.9185802@178771872${i % 10}.${String(i).padStart(9, "0")}`, `some-fairly-long-seller-hostname${i}.example.com`);
+  }
+  const size = readFileSync(join(dir, "purse.json"), "utf8").length;
+  assert.ok(size < MAX_JSON_BYTES / 2, `a full label map is ${size} bytes, over half the ${MAX_JSON_BYTES} readJson allows`);
+  // And it still round-trips, which is the thing the size cap would silently take away.
+  assert.equal(open(dir).labels.length, 500);
 });
 
 test("a purse.json too large to be limits is refused rather than read", () => {

@@ -85,6 +85,20 @@ local midnight falls. Facts live on the chain: the balance, what has been spent,
 and whether a payment happened at all.** The daemon shows those; it never keeps a second copy and
 then reconciles the two.
 
+The rule is not "keep nothing locally", and it is worth being exact about that, because chip402
+*does* keep one thing: a `txId → host` map, so a row can read `printwright.liftbyai.com` instead
+of `0.0.9584959`. Two properties make that legitimate where `spentToday` was not:
+
+- **The chain does not know it and cannot.** There is no second copy to drift from, because there
+  is no first copy anywhere else. `spentToday` was a duplicate of something Hedera already
+  answered; a hostname is not.
+- **It cannot reach a decision.** `hostFor` is called by the snapshot and by nothing else. No
+  limit, no sum, no policy path touches it. Lose the whole map and the worst outcome is rows that
+  name account ids.
+
+So the two rules that actually survive are: *never keep a local copy of a number the chain owns*,
+and *never let local state reach a decision*. The label map breaks neither.
+
 This is not tidiness. The previous build kept its own `spentToday` counters and its own receipt
 list, and that ledger was **already wrong** — with no attacker involved:
 

@@ -48,9 +48,16 @@ export type Settling = {
 export type Label = { readonly txId: string; readonly host: string };
 
 // Comfortably more than the payment rows one day can produce and still show — chain.ts will read
-// at most twelve pages of a hundred transactions, and a day of pocket money is a handful. At
-// roughly seventy bytes a row this is a few tens of kilobytes, well inside the cap readJson puts
-// on the file.
+// at most twelve pages of a hundred transactions, and a day of pocket money is a handful.
+//
+// It is also bounded from above by something less obvious, so it is worth writing down: purse.json
+// is read whole, and readJson refuses a file over MAX_JSON_BYTES. A full map at this limit is
+// about 64 kB, four times inside that. Somewhere north of two thousand labels the file would cross
+// the cap and the daemon would refuse to *start* — not to write, to start, on the next boot, long
+// after whoever raised the number had stopped looking. test/purse.test.ts pins the margin.
+//
+// So this is the wrong container for a long history of names. If that is ever wanted, it wants an
+// append-only file of its own, not a limit raised here.
 const LABEL_LIMIT = 500;
 
 // How many payment rows the status frame carries per asset. The panel draws six and the CLI five,
