@@ -40,9 +40,18 @@ export type Settling = {
 // The chain knows we paid 0.0.9584959; it does not know that was printwright.liftbyai.com. This
 // is the one piece of local memory that survives, and it is decoration: it is written after the
 // signature, it is read only by the snapshot, and there is no path from it to a decision.
+//
+// Decoration that earns its place, though. "$1.60 to printwright.liftbyai.com" is a line you can
+// read; "$1.60 to 0.0.9584959" is a line you have to go and look up. Being able to see where the
+// agent's money went at a glance is most of why the panel exists, so the label map is kept
+// generously and carried across an upgrade rather than treated as disposable.
 export type Label = { readonly txId: string; readonly host: string };
 
-const LABEL_LIMIT = 100;
+// Comfortably more than the payment rows one day can produce and still show — chain.ts will read
+// at most twelve pages of a hundred transactions, and a day of pocket money is a handful. At
+// roughly seventy bytes a row this is a few tens of kilobytes, well inside the cap readJson puts
+// on the file.
+const LABEL_LIMIT = 500;
 
 export type PurseState = {
   paused: boolean;
@@ -88,6 +97,29 @@ function labelsFromJson(raw: unknown): Label[] {
   return labels.slice(-LABEL_LIMIT);
 }
 
+// One read of a shape this file no longer writes. The build before this one kept a list of
+// receipts per asset, and every row carried the host it had paid — the single part of that list
+// worth keeping, because it is the part the chain cannot answer. Losing it on upgrade would turn
+// a purse's whole history from names into account numbers for no reason.
+//
+// What is taken is exactly the two strings. Not the amounts, not the counters, not whether the
+// seller claimed it settled — those are the chain's to answer now, and the first write after this
+// drops the old shape from the file for good. So this is a migration of labels, not of a ledger:
+// nothing it returns can reach a number, because nothing reads a label but the snapshot.
+function labelsFromLegacyReceipts(raw: Record<string, unknown> | undefined): Label[] {
+  const labels: Label[] = [];
+  for (const key of ASSET_KEYS) {
+    const rows = (raw?.[key] as Record<string, unknown> | undefined)?.["receipts"];
+    if (!Array.isArray(rows)) continue;
+    for (const row of rows as Record<string, unknown>[]) {
+      if (typeof row?.["txId"] === "string" && typeof row["host"] === "string") {
+        labels.push({ txId: row["txId"], host: row["host"] });
+      }
+    }
+  }
+  return labels.slice(-LABEL_LIMIT);
+}
+
 export class Purse {
   readonly #path: string;
   readonly #state: PurseState;
@@ -113,7 +145,8 @@ export class Purse {
       mismatch: false,
       settling: null,
     };
-    return new Purse(path, state, labelsFromJson(raw?.["labels"]));
+    const labels = labelsFromJson(raw?.["labels"]);
+    return new Purse(path, state, labels.length > 0 ? labels : labelsFromLegacyReceipts(raw));
   }
 
   get state(): PurseState {

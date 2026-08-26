@@ -69,11 +69,18 @@ export function decide(invoice: Invoice, purse: PurseState, config: PolicyConfig
   // The kill switch comes first so that a paused purse gives one reason and not a queue of them.
   if (purse.paused) return deny("paused");
 
-  // SECURITY: the key check that used to gate nothing. Three consecutive readings a minute apart
-  // that this account is controlled by a key we do not hold means signing is pointless at best
-  // and, on an account somebody else now controls, worse. Only a positively-parsed, positively
-  // different key gets here — anything we could not read is `null` upstream and never denies,
-  // because bricking a working purse over an unrecognised key shape is the larger failure.
+  // SECURITY: is the account we are reading the chain *about* the account this key can spend
+  // *from*? That is the whole question, and deriving spending from the chain made it matter more
+  // rather than less. `config.accountId` is the id chain.ts queries, so a config naming somebody
+  // else's account produces a purse that reads a stranger's balance, measures the day's allowance
+  // against a stranger's transactions, and invites top-ups to an account it could never spend
+  // from. Every payment it signs is refused at consensus for a bad signature, so nothing is
+  // stolen — but nothing works either, and the panel says otherwise the whole time. Denying with
+  // a reason that names the fix turns that from a mystery into an instruction.
+  //
+  // Only a positively-parsed, positively different key gets here, and only after three readings
+  // a minute apart. Anything we could not read is `null` upstream and never denies, because
+  // bricking a working purse over an unrecognised key shape is the larger failure.
   if (purse.mismatch) {
     return deny("the chain says a different key controls this account — re-import it with `sudo chip402ctl setup --import`");
   }

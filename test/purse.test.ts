@@ -55,18 +55,22 @@ test("purse.json holds policy and labels, and nothing that bounds spending", () 
 });
 
 test("there is no local spending state anywhere in src/", () => {
-  // The grep the plan is written around, as a test. `spentToday` was the counter and `receipts`
-  // was the list; `annotate` and `confirm` were the machinery for arguing with them. If any of
-  // them comes back, so does the drift.
+  // The grep the plan is written around, as a test. `spentToday` was the counter; `annotate` and
+  // `confirm` were the machinery for arguing with it. If any of them comes back, so does the
+  // drift. The word `receipts` is deliberately not banned — purse.ts reads that field exactly
+  // once, to lift host labels out of a file written by the previous build, and the shape test
+  // above is what proves it is never written back.
   const files = readdirSync(new URL("../src/", import.meta.url)).filter((name) => name.endsWith(".ts"));
   for (const name of files) {
     const source = readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8");
-    assert.doesNotMatch(source, /spentToday|\breceipts\b|\bannotate\b/, `${name} keeps a spending ledger`);
+    assert.doesNotMatch(source, /spentToday|\bannotate\b|\bconfirm\(/, `${name} keeps a spending ledger`);
   }
   // And in the purse itself, no number moves at all: every field it holds is assigned outright
   // by root over the admin socket, or read whole from the chain.
   const purse = readFileSync(new URL("../src/purse.ts", import.meta.url), "utf8");
   assert.doesNotMatch(purse, /[+\-]=/, "the purse does arithmetic on something it keeps");
+  // Exactly one read of the legacy shape, and it is the label migration.
+  assert.equal((purse.match(/"receipts"/g) ?? []).length, 1, "purse.ts touches the old receipts list more than once");
 });
 
 test("nothing restored from disk carries a fact about the chain", () => {
@@ -97,10 +101,77 @@ test("a label is decoration: it names a host and reaches nothing", () => {
 
 test("labels are bounded, so a busy day cannot grow the file without limit", () => {
   const purse = open(scratch());
-  for (let i = 0; i < 250; i++) purse.label(`0.0.9185802@${i}.0`, `host${i}.example`);
-  assert.equal(purse.labels.length, 100);
-  assert.equal(purse.hostFor("0.0.9185802@249.0"), "host249.example");
+  for (let i = 0; i < 600; i++) purse.label(`0.0.9185802@${i}.0`, `host${i}.example`);
+  assert.equal(purse.labels.length, 500);
+  assert.equal(purse.hostFor("0.0.9185802@599.0"), "host599.example");
   assert.equal(purse.hostFor("0.0.9185802@1.0"), null, "the oldest labels are dropped");
+});
+
+test("upgrading from the old build keeps the host names and nothing else", () => {
+  // A verbatim excerpt of the purse.json this machine was actually running before the rewrite,
+  // wrong ℏ0.02 and all. What survives is the two strings a human reads a row by; the counters,
+  // the amounts and the seller's settled claim do not, because the chain answers all three.
+  const dir = scratch();
+  writeFileSync(
+    join(dir, "purse.json"),
+    JSON.stringify({
+      paused: false,
+      resetsAt: 1787754600000,
+      usdc: {
+        allowance: "10000000",
+        maxPayment: "5000000",
+        spentToday: "1620000",
+        receipts: [
+          { id: 5, at: 1787718566933, host: "printwright.liftbyai.com", url: "https://printwright.liftbyai.com/api/v1/models/8/download", amount: "1600000", txId: "0.0.7162784@1787718561.825914914", settled: true, fresh: true },
+        ],
+      },
+      hbar: {
+        allowance: "2500000000",
+        maxPayment: "100000000",
+        spentToday: "2000000",
+        receipts: [
+          { id: 1, at: 1787712048202, host: "127.0.0.1:4403", amount: "1000000", txId: "0.0.9185802@1787712043.742467199", settled: true, fresh: true },
+        ],
+      },
+    }),
+  );
+
+  const purse = open(dir);
+  assert.equal(purse.hostFor("0.0.7162784@1787718561.825914914"), "printwright.liftbyai.com");
+  assert.equal(purse.hostFor("0.0.9185802@1787712043.742467199"), "127.0.0.1:4403");
+  // The limits are policy and come across; the ℏ0.02 that was wrong does not exist to come across.
+  assert.equal(purse.state.usdc.allowance, 10_000_000n);
+  assert.equal(purse.state.hbar.maxPayment, 100_000_000n);
+  assert.equal(purse.state.ledger, null, "a spending figure survived the upgrade");
+
+  // And the first write drops the old shape for good.
+  purse.persist();
+  const written = JSON.parse(readFileSync(join(dir, "purse.json"), "utf8")) as Record<string, any>;
+  assert.deepEqual(Object.keys(written).sort(), ["hbar", "labels", "paused", "usdc"]);
+  assert.equal(written["labels"].length, 2);
+  assert.doesNotMatch(JSON.stringify(written), /spentToday|receipts|resetsAt|settled|fresh/);
+
+  // Re-reading the new file is the ordinary path, not the migration one.
+  assert.equal(open(dir).hostFor("0.0.7162784@1787718561.825914914"), "printwright.liftbyai.com");
+});
+
+test("an explicit label list is never overwritten by a stale receipts array", () => {
+  // The migration only runs when there is nothing to migrate onto. A file that already has
+  // labels is a file the new build wrote, and whatever is left of the old shape beside it is
+  // debris rather than a source.
+  const dir = scratch();
+  writeFileSync(
+    join(dir, "purse.json"),
+    JSON.stringify({
+      paused: false,
+      usdc: { allowance: "1", maxPayment: "1", receipts: [{ txId: "0.0.1@1.0", host: "stale.example" }] },
+      labels: [{ txId: "0.0.2@2.0", host: "current.example" }],
+    }),
+  );
+  const purse = open(dir);
+  assert.equal(purse.labels.length, 1);
+  assert.equal(purse.hostFor("0.0.2@2.0"), "current.example");
+  assert.equal(purse.hostFor("0.0.1@1.0"), null);
 });
 
 test("the lane closes on a signature and only the chain or the clock opens it", () => {

@@ -472,6 +472,16 @@ by EVM alias, and **that check now costs something**: three consecutive readings
 that a *different* key controls the account, and payment is refused with a reason naming
 `sudo chip402ctl setup --import`. The panel stops showing the address at the first such reading.
 
+It is worth being precise about what that check is for, because "the chain is the ledger" makes
+it easy to assume it is a leftover from when there was a second one. It is not. It asks a
+different question — **is the account we read the chain *about* the account this key can spend
+*from*?** — and deriving spending from the chain made it matter *more*, not less. `accountId` is
+the id every mirror query is built from, so a purse naming somebody else's account reads a
+stranger's balance, measures the day's allowance against a stranger's transactions, and offers a
+top-up address for an account it could never spend from. Nothing is stolen — every payment it
+signs is refused at consensus for a bad signature — but nothing works either, and the panel
+insists otherwise the whole time. That is the failure the deny converts into an instruction.
+
 The reason it took three readings and a rewrite to get there is the failure mode in the other
 direction. The check used to be a two-state boolean, so everything it did not *recognise* —
 a threshold account, a `KeyList`, a `ProtobufEncoded` key, a mirror node having a bad minute —
@@ -507,9 +517,17 @@ something the daemon keeps — it is the mirror node's answer to "what did this 
 local midnight", so there is no row for a payment that did not settle and no link that fails to
 resolve. The transaction id is ours, read out of the bytes the daemon signed, and never the
 seller's claim. The host beside the amount *is* ours: a label written after signing, because the
-chain knows the counterparty is `0.0.9584959` and not that it was `printwright.liftbyai.com`. It
-is decoration — no number and no decision can be reached from it — and where there is no label,
-the account id is shown instead.
+chain knows the counterparty is `0.0.9584959` and not that it was `printwright.liftbyai.com`.
+
+That label is decoration in the sense that matters — no number and no decision can be reached
+from it — but it is not disposable. "$1.60 to printwright.liftbyai.com" is a line you can read;
+"$1.60 to 0.0.9584959" is a line you have to go and look up, and seeing where the agent's money
+went without a deep dive is most of what the panel is for. So the map is kept generously (500
+rows, comfortably more than a day can show) and is **carried across an upgrade**: `Purse.open`
+reads host names out of the previous build's receipt list once, takes the two strings and nothing
+else — not the amounts, not the counters, not the seller's settled claim, all of which the chain
+answers now — and the first write afterwards drops the old shape for good. Where there genuinely
+is no label, the account id is shown instead.
 
 **Pause is one click and no prompt; resume raises the polkit dialog.** The asymmetry shows up as
 a different button, never as an explanation printed at the user. When the daemon is not running
@@ -535,10 +553,10 @@ src/ ui/` is the outline of the security half.
 | `src/networks.ts` | Two frozen rows: mirror node, both token ids, and the panel's preset ladders (a ladder, not a ceiling). **The mainnet switch.** | 72 / 109 |
 | `src/money.ts` | `bigint` base units, decimals-aware. No function takes two assets, so no function can need a price. | 36 / 61 |
 | `src/safe.ts` | `readSecret` (`O_NOFOLLOW` + `fstat`), `writeAtomic` (temp, flush, rename), `readJson` (size-capped through the descriptor). | 70 / 111 |
-| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also where local midnight is defined, because that is the one thing about "today" that is ours. | 70 / 153 |
+| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also where local midnight is defined, because that is the one thing about "today" that is ours. | 70 / 160 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK. Manual redirects, byte cap, deadline, `accepts[]` cap. | 83 / 132 |
 | `src/chain.ts` | **What the chain says, and the only place it is asked.** The x402-payment filter, today's spend, the three-state key check, and "has this transaction happened yet". | 198 / 303 |
-| `src/purse.ts` | Limits, `paused`, a bounded label map, and the settling lane. No spending state, on disk or otherwise. | 180 / 284 |
+| `src/purse.ts` | Limits, `paused`, a bounded label map (carried across an upgrade) and the settling lane. No spending state, on disk or otherwise. | 200 / 328 |
 | `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement wait. | 268 / 402 |
 | `src/protocol.ts` | The NDJSON contract: two frozen verb sets, plus the client the CLI and MCP server use. | 75 / 112 |
 | `src/daemon.ts` | Two listeners in one process. The plane is the listener. Payments serialized through one chain. | 214 / 298 |
@@ -557,7 +575,7 @@ and recoloured to whatever theme is on), `ui/chip402.policy` (three polkit actio
 | `money.test.ts` | Float rejection, both decimal boundaries, overflow, and that no exported function sees two assets. |
 | `chain.test.ts` | The payment filter, against a **verbatim capture of the public testnet mirror node**: $1.62 and ℏ0.00 to the unit, failures and owner-initiated transactions dropped, incoming transfers not counted as spending — and the ℏ0.02 regression, which moves to the wallet that actually made it when the account id changes. Plus the three states of the key check, including `ANTI-BRICK`. |
 | `policy.test.ts` | The decision table, run twice — once per asset — plus the cross-asset cases. The security proof. Includes: a chain that has never answered denies rather than reading as zero, a settling payment denies, `verified === null` **allows**. |
-| `purse.test.ts` | That `purse.json` holds policy and labels and nothing else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, and that a truncated temp file never becomes the purse. |
+| `purse.test.ts` | That `purse.json` holds policy and labels and nothing else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, that upgrading from the old build keeps the host names and *only* those, and that a truncated temp file never becomes the purse. |
 | `seller.test.ts` | The hostile-seller table, against real HTTP servers, the real SDK wrapper and a mirror node on loopback — including a seller that takes a signature and never settles, which costs nothing. |
 | `planes.test.ts` | The authority proof: disjoint verb sets, admin verbs refused on the spend socket, the plane is never read from a field. |
 | `signer.test.ts` | The enforcement proof: every denial leaves the stub signer uncalled, no lane closed and nothing recorded. Plus a second signature in one payment throwing, and both ways the settling lane reopens. |
