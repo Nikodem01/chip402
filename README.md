@@ -534,6 +534,20 @@ a different button, never as an explanation printed at the user. When the daemon
 the panel offers **START**; when it is running but this login predates your `chip402` group
 membership, it says so and offers nothing, because no button would help.
 
+**And when the daemon comes back, the panel comes back.** That sentence was false for most of
+this project's life, in a way nothing here caught. A Quickshell `Socket` that has once *failed*
+to connect is wedged: assigning `connected = true` again does nothing, because the desired-state
+flag it writes already holds that value, and reassigning `path` does not reset it either — both
+measured, against a socket taken away and put back. So the five-second retry fired forever and
+reconnected never. One `systemctl restart chip402` left the panel showing **START** for as long
+as the shell ran, and pressing START then spent a password asking systemd to start a daemon that
+was already up.
+
+The retry now destroys the `Socket` and builds a new one, which is the only thing that recovers
+it. `test/panel.test.ts` is the guard: it runs the real `ui/Purse.qml` under Quickshell against a
+socket that goes away, stays away long enough for one retry to find nothing there — a shorter gap
+reconnects even on the broken build, which is what made this hard to see — and then comes back.
+
 Layout notes, since the panel is part of the deliverable. Both limit rows sit on one five-column
 module: every chip is the same width, the custom field is exactly one cell — so it reads as one
 more chip, the one you fill in yourself — and the tick is half a cell, because a single glyph
@@ -568,7 +582,8 @@ and recoloured to whatever theme is on), `ui/chip402.policy` (three polkit actio
 
 ## Tests
 
-`npm test` — no network, no install, no key.
+`npm test` — no network, no install, no key. One file needs Quickshell, and says so when it is
+missing rather than passing quietly.
 
 | File | Proves |
 |---|---|
@@ -581,6 +596,7 @@ and recoloured to whatever theme is on), `ui/chip402.policy` (three polkit actio
 | `signer.test.ts` | The enforcement proof: every denial leaves the stub signer uncalled, no lane closed and nothing recorded. Plus a second signature in one payment throwing, and both ways the settling lane reopens. |
 | `daemon.test.ts` | Two concurrent payments against a cap that allows one → exactly one pays, bounded by the chain rather than by a counter. The indexing gap denying and then clearing. No TCP port. No key in any reply. A misshapen `accountId` refusing to start. |
 | `mcp.test.ts` | The product, end to end and out of process: a real MCP client → `bin/mcp.ts` → daemon → hardened fetch → a real x402 seller. Only the signature is a stub. The seller's body is a fence-forgery attempt, and it stays in its own block. |
+| `panel.test.ts` | The real `ui/Purse.qml`, under Quickshell, against a daemon that goes away and comes back: it must reconnect on its own. Skipped, loudly, where Quickshell is not installed. |
 | `live.test.ts` | A real testnet payment, then the same mirror query the daemon makes, asked independently — the panel and the chain must agree for both assets. Off unless `CHIP402_LIVE=1`. |
 
 ## Not built, on purpose

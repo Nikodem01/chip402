@@ -151,7 +151,7 @@ Item {
   // The kill switch. One line on the cheap socket, no password, no confirmation — an agent that
   // pauses the purse has only denied itself, so there is nothing to protect here.
   function pause() {
-    if (socket.connected) socket.write(JSON.stringify({ cmd: "pause" }) + "\n")
+    if (root.linked) link.item.write(JSON.stringify({ cmd: "pause" }) + "\n")
   }
 
   // Everything privileged goes the other way, through polkit. argv only, never a shell string:
@@ -183,28 +183,52 @@ Item {
     if (frame.type === "status") root.status = frame
   }
 
-  Socket {
-    id: socket
-    path: root.spendSocket
-    connected: true
-    parser: SplitParser {
-      splitMarker: "\n"
-      onRead: function (line) { root.ingest(line) }
+  // Whether we currently have a live connection to the daemon. Read through the Loader, because
+  // the Socket underneath is replaced rather than reused — see the retry below.
+  readonly property bool linked: link.item ? link.item.connected === true : false
+
+  // A daemon restart, or a machine where it has not been started yet. Retry quietly; the panel
+  // says which of the two it is rather than showing a code nobody can act on.
+  //
+  // The retry has to build a *new* Socket, which is why this one lives in a Loader. A Quickshell
+  // Socket that has once failed to connect stays wedged: assigning `connected = true` again is a
+  // no-op, because the desired-state flag it writes is already true, and reassigning `path` does
+  // not reset it either. Both were measured against a socket taken away and put back — neither
+  // reconnected, and destroying the object was the only thing that did.
+  //
+  // This was a real three-hour outage on my own machine and not a theoretical one. A single
+  // `systemctl restart chip402` left the panel showing START for as long as the shell ran, and
+  // pressing START then spent a password asking systemd to start a daemon that was already up.
+  // test/panel.test.ts drives this file against a socket that goes away and comes back.
+  Loader {
+    id: link
+    active: true
+    sourceComponent: Component {
+      Socket {
+        path: root.spendSocket
+        connected: true
+        parser: SplitParser {
+          splitMarker: "\n"
+          onRead: function (line) { root.ingest(line) }
+        }
+        onConnectionStateChanged: {
+          if (!connected) root.status = null
+          else root.socketError = -1
+        }
+        onError: function (code) { root.socketError = code }
+      }
     }
-    // A daemon restart, or a machine where it has not been started yet. Retry quietly; the panel
-    // says which of the two it is rather than showing a code nobody can act on.
-    onConnectionStateChanged: {
-      if (!connected) root.status = null
-      else root.socketError = -1
-    }
-    onError: function (code) { root.socketError = code }
   }
 
   Timer {
     interval: 5000
-    running: !socket.connected
+    running: !root.linked
     repeat: true
-    onTriggered: socket.connected = true
+    onTriggered: {
+      root.status = null
+      link.active = false
+      link.active = true
+    }
   }
 
   // No stdout is read from this on purpose: the answer the panel cares about arrives as a fresh
