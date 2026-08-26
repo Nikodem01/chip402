@@ -1,0 +1,26 @@
+{
+  "name": "chip402",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agentic pocket money: a small, hard-capped Hedera purse a local AI agent can spend from without asking.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=26.7.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/money.test.ts test/chain.test.ts test/policy.test.ts test/purse.test.ts test/seller.test.ts test/signer.test.ts test/planes.test.ts test/daemon.test.ts test/mcp.test.ts",
+    "push": "sudo install -m0644 -t /usr/local/lib/chip402/src src/*.ts && sudo systemctl restart chip402",
+    "test:live": "CHIP402_LIVE=1 node --test test/live.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@x402/fetch": "2.23.0",
+    "@x402/hedera": "2.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}

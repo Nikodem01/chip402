@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<!--
+  Three privileged actions, one per admin verb, so the password dialog can name the concrete
+  effect rather than saying "authentication is required". A prompt I did not ask for is then
+  recognisable as such — which is the only defence a human-judgment boundary has.
+
+  Every one is auth_admin and never auth_admin_keep, so it prompts every single time. polkit
+  cannot be forged: authentication is performed by polkitd, and an unprivileged agent only
+  relays the conversation. An agent can raise this dialog; it cannot answer it.
+-->
+<policyconfig>
+  <vendor>chip402</vendor>
+
+  <action id="dev.chip402.resume">
+    <description>Resume chip402 agent spending</description>
+    <message>Authentication is required to let local agents spend from the chip402 purse again.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/chip402ctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">resume</annotate>
+  </action>
+
+  <action id="dev.chip402.allowance">
+    <description>Change the chip402 daily allowance</description>
+    <message>Authentication is required to change how much local agents may spend per day.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/chip402ctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">allowance</annotate>
+  </action>
+
+  <action id="dev.chip402.max">
+    <description>Change the chip402 per-payment limit</description>
+    <message>Authentication is required to change the most local agents may spend in one payment.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/chip402ctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">max</annotate>
+  </action>
+</policyconfig>

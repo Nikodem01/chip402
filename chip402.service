@@ -1,0 +1,76 @@
+# The uid boundary, as a unit file. Everything below exists so that an agent running as me
+# cannot read the key, cannot stop the daemon, and cannot reach anything the daemon can reach.
+
+[Unit]
+Description=chip402 — a capped Hedera purse for local agents
+Documentation=https://github.com/nikodem/chip402
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated system user. This is the boundary that actually stops `grep -r` in my home from
+# finding a key, and it is the only one that needs no judgment from me at runtime.
+User=chip402
+Group=chip402
+
+# systemd decrypts the TPM2-sealed blob into /run/credentials/chip402.service/ — a read-only
+# tmpfs, dr-x------, owned by this service user. Plaintext never touches disk, and the sealed
+# file is useless on any other machine.
+LoadCredentialEncrypted=chip402-key:/var/lib/chip402/key.cred
+
+# 0750: the chip402 group can walk in to reach the sockets but cannot create or unlink anything
+# in here, so nobody can delete the socket to force a fallback path.
+RuntimeDirectory=chip402
+RuntimeDirectoryMode=0750
+StateDirectory=chip402
+StateDirectoryMode=0700
+
+# Node's own permission model, on top of systemd's. Five readable paths, two writable, and no
+# ability to spawn a process at all — --permission denies child processes unless asked for.
+# /run/chip402 needs read as well as write: binding a unix socket stats the path first.
+# Not /usr/bin/node: the daemon runs as another uid with ProtectHome=yes, so install.sh takes a
+# root-owned copy of the node I am actually using into the same directory as the code.
+ExecStart=/usr/local/lib/chip402/node --permission \
+  --allow-net \
+  --allow-fs-read=/usr/local/lib/chip402 \
+  --allow-fs-read=/etc/chip402 \
+  --allow-fs-read=%d \
+  --allow-fs-read=/var/lib/chip402 \
+  --allow-fs-read=/run/chip402 \
+  --allow-fs-write=/var/lib/chip402 \
+  --allow-fs-write=/run/chip402 \
+  /usr/local/lib/chip402/src/daemon.ts
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+# The daemon cannot see my home directory at all, which is why it runs from /usr/local/lib and
+# not from the checkout.
+ProtectHome=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Unix sockets for the two planes, TCP only outbound to the seller and the mirror node. There is
+# no listening port anywhere in this project.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+# Deliberately NOT MemoryDenyWriteExecute: V8 flips pages between writable and executable to
+# JIT, so it would either kill the daemon or force --jitless. The rest of this list is the part
+# that costs nothing.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

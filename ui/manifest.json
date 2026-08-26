@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "chip402",
+  "name": "chip402",
+  "version": "0.1.0",
+  "author": "Nikodem Dominiak",
+  "license": "MIT",
+  "description": "A small, hard-capped Hedera purse local agents can spend from, with a live view of the spending and a one-click kill switch.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Chip.qml" },
+  "barWidget": {
+    "displayName": "chip402",
+    "description": "Agent pocket money: balance, today's spend from the chain, and pause.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
