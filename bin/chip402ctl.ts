@@ -316,6 +316,17 @@ async function setup(): Promise<void> {
 
 if (verb === "setup") {
   await setup();
+} else if (verb === "start") {
+  // The panel's START button, routed through this binary rather than straight at systemd. It
+  // moves nothing and changes no limit; what it buys is the polkit dialog. `pkexec systemctl
+  // start chip402` matches no action of ours, so polkit falls back to
+  // org.freedesktop.policykit.exec and asks "Authentication is required to run a program as
+  // another user" — which explains nothing, and reads exactly the same as `pkexec` of anything
+  // else. Going through chip402ctl means the prompt names what it is for, and it means every
+  // privileged thing the panel can ask for is bound by exec.path to this one root-owned file.
+  // The generic prompt is then always anomalous, instead of being the normal case for START.
+  execFileSync("systemctl", ["start", "chip402"], { stdio: "inherit" });
+  console.log("done.");
 } else if (verb === "resume") {
   await admin({ cmd: "resume" });
 } else if (verb === "allowance" || verb === "max") {
@@ -328,6 +339,6 @@ if (verb === "setup") {
   // flag, so there is no way for the two to disagree.
   await admin({ cmd: verb, asset, amount });
 } else {
-  console.error("usage: chip402ctl setup [--import [<accountId>]] | resume | allowance <usdc|hbar> <amt> | max <usdc|hbar> <amt>");
+  console.error("usage: chip402ctl setup [--import [<accountId>]] | start | resume | allowance <usdc|hbar> <amt> | max <usdc|hbar> <amt>");
   process.exit(2);
 }

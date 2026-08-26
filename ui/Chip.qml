@@ -191,6 +191,22 @@ Panel {
             font.pixelSize: Style.font.body
           }
 
+          // What the button is going to do, said before it is pressed rather than only in the
+          // password dialog afterwards. Starting the daemon is the one privileged action here
+          // that changes no limit, and a prompt is worth a sentence of warning either way: the
+          // whole defence of a human-judgment boundary is that an unexpected dialog is
+          // recognisable, and that needs you to know which ones to expect.
+          Text {
+            visible: purse.notRunning
+            width: parent.width
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            text: qsTr("Starting it asks for your password. It changes no limit — the purse comes back exactly as you left it.")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
           Button {
             visible: purse.notRunning
             width: parent.width

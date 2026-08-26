@@ -163,13 +163,13 @@ Item {
     privileged.running = true
   }
 
-  // The one privileged action that is not ours: starting the unit. It goes through the same
-  // polkit path as everything else, so it costs a password and an agent cannot answer it.
-  function startDaemon() {
-    if (privileged.running) return
-    privileged.command = ["pkexec", "systemctl", "start", "chip402"]
-    privileged.running = true
-  }
+  // Starting the unit, through the same root-owned binary as every other privileged verb — not
+  // `pkexec systemctl start chip402`, which is what this used to be. That form matches none of
+  // our polkit actions, so the dialog fell back to "Authentication is required to run a program
+  // as another user": a caption that says nothing about chip402 and looks the same as `pkexec` of
+  // anything else. Every privileged thing this file can ask for is now bound by exec.path to
+  // /usr/local/bin/chip402ctl, so a prompt without a chip402 sentence on it is a prompt to refuse.
+  function startDaemon() { authorise(["start"]) }
 
   function resume() { authorise(["resume"]) }
   function setAllowance(key, amount) { authorise(["allowance", key, amount]) }

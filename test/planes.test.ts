@@ -2,7 +2,7 @@
 // every way an agent might try to talk itself onto the control plane. If this file passes, the
 // sentence "authority is which socket accepted the connection" is true rather than intended.
 
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ADMIN_VERBS, SPEND_VERBS, verbsFor } from "../src/protocol.ts";
@@ -156,4 +156,82 @@ test("garbage on either socket is answered, not crashed on", async (t) => {
   // Still alive afterwards.
   assert.equal((await spend.send({ cmd: "purse" }))["type"], "status");
   spend.close();
+});
+
+// --- the privileged surface the panel can reach -----------------------------------------------
+
+// Everything the panel can hand to pkexec, read out of the QML rather than listed by hand — a
+// list written by hand is a list that goes stale the moment somebody adds a button.
+function panelVerbs(): { verbs: string[]; rawPkexec: string[] } {
+  const source = readFileSync(new URL("../ui/Purse.qml", import.meta.url), "utf8");
+  // `authorise([...])` is the one sanctioned route: pkexec chip402ctl <verb> ...
+  const verbs = [...source.matchAll(/authorise\(\s*\[\s*"([a-z]+)"/g)].map((m) => m[1]!);
+  // And any other pkexec command assembled anywhere in the file.
+  const rawPkexec = [...source.matchAll(/\[\s*"pkexec"\s*,([^\]]*)\]/g)].map((m) => m[1]!.trim());
+  return { verbs, rawPkexec };
+}
+
+function policyActions(): Map<string, { path: string; argv1: string; message: string; defaults: string[] }> {
+  const xml = readFileSync(new URL("../ui/chip402.policy", import.meta.url), "utf8");
+  const actions = new Map<string, { path: string; argv1: string; message: string; defaults: string[] }>();
+  for (const block of xml.split("<action ").slice(1)) {
+    const id = /id="([^"]+)"/.exec(block)?.[1] ?? "";
+    actions.set(id, {
+      path: /exec\.path">([^<]+)</.exec(block)?.[1] ?? "",
+      argv1: /exec\.argv1">([^<]+)</.exec(block)?.[1] ?? "",
+      message: /<message>([^<]*)<\/message>/.exec(block)?.[1] ?? "",
+      defaults: [...block.matchAll(/<allow_\w+>([^<]+)<\/allow_\w+>/g)].map((m) => m[1]!),
+    });
+  }
+  return actions;
+}
+
+test("every privileged thing the panel can ask for has a polkit action that says what it is", () => {
+  // SECURITY: this is the test that would have caught a real one. The START button ran
+  // `pkexec systemctl start chip402`, which matches none of our actions — so polkit fell back to
+  // org.freedesktop.policykit.exec and asked "Authentication is required to run a program as
+  // another user". That caption says nothing about chip402 and reads identically to `pkexec` of
+  // anything at all, which is exactly the cover a malicious prompt wants. The defence of a
+  // human-judgment boundary is that an unexpected dialog is recognisable; a dialog that explains
+  // nothing is not.
+  const { verbs, rawPkexec } = panelVerbs();
+  const actions = policyActions();
+  assert.ok(verbs.length > 0, "no privileged verbs found in the panel at all");
+
+  for (const verb of verbs) {
+    const action = actions.get(`dev.chip402.${verb}`);
+    assert.ok(action, `the panel can ask for "${verb}" and no polkit action declares it`);
+    assert.equal(action.path, "/usr/local/bin/chip402ctl", `${verb} is not bound to the root-owned binary`);
+    assert.equal(action.argv1, verb);
+    // A caption a human can act on, naming chip402 rather than "a program".
+    assert.match(action.message, /chip402/, `the dialog for "${verb}" does not name chip402`);
+    assert.ok(action.message.length > 40, `the dialog for "${verb}" explains nothing`);
+  }
+
+  // And only that one route exists: no pkexec anywhere in the panel that runs something else.
+  for (const command of rawPkexec) {
+    assert.match(command, /chip402ctl/, `the panel hands pkexec something that is not chip402ctl: ${command}`);
+  }
+});
+
+test("no chip402 action is auth_admin_keep, so none of them can be silently reused", () => {
+  // The one thing that must never be reusable is the authority to raise a cap. systemd's own
+  // manage-units action is auth_admin_keep, which is why a cached authorization can stop the
+  // daemon without a second prompt — fail-closed, and the reason chip402's own verbs do not
+  // borrow that setting.
+  const actions = policyActions();
+  assert.ok(actions.size >= 4);
+  for (const [id, action] of actions) {
+    assert.equal(action.defaults.length, 3, `${id} does not state all three defaults`);
+    for (const value of action.defaults) {
+      assert.equal(value, "auth_admin", `${id} allows ${value} — a cap change must prompt every time`);
+    }
+  }
+});
+
+test("the panel cannot reach an admin verb without going through pkexec", () => {
+  // The socket write path takes exactly one verb, and it is the free one.
+  const source = readFileSync(new URL("../ui/Purse.qml", import.meta.url), "utf8");
+  const written = [...source.matchAll(/write\(JSON\.stringify\(\{\s*cmd:\s*"([a-z]+)"/g)].map((m) => m[1]!);
+  assert.deepEqual(written, ["pause"], "the panel writes a verb other than pause straight to the socket");
 });

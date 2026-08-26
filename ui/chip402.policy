@@ -2,9 +2,16 @@
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
 <!--
-  Three privileged actions, one per admin verb, so the password dialog can name the concrete
-  effect rather than saying "authentication is required". A prompt I did not ask for is then
-  recognisable as such — which is the only defence a human-judgment boundary has.
+  Four privileged actions, one per verb the panel can ask for, so the password dialog names the
+  concrete effect rather than saying "authentication is required". A prompt I did not ask for is
+  then recognisable as such — which is the only defence a human-judgment boundary has.
+
+  `start` is here for that reason alone: it moves nothing and changes no limit, but the panel used
+  to reach it as `pkexec systemctl start chip402`, which matches none of these and so fell back to
+  org.freedesktop.policykit.exec — "Authentication is required to run a program as another user".
+  That prompt explains nothing and reads identically to `pkexec` of anything at all. With every
+  privileged thing the panel can ask for bound by exec.path to one root-owned binary, the generic
+  prompt stops being normal for anything, and starts being a reason to say no.
 
   Every one is auth_admin and never auth_admin_keep, so it prompts every single time. polkit
   cannot be forged: authentication is performed by polkitd, and an unprivileged agent only
@@ -12,6 +19,18 @@
 -->
 <policyconfig>
   <vendor>chip402</vendor>
+
+  <action id="dev.chip402.start">
+    <description>Start the chip402 purse</description>
+    <message>Authentication is required to start chip402. While it is running, local agents may spend from the purse, within the limits already set.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/chip402ctl</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">start</annotate>
+  </action>
 
   <action id="dev.chip402.resume">
     <description>Resume chip402 agent spending</description>
@@ -27,7 +46,7 @@
 
   <action id="dev.chip402.allowance">
     <description>Change the chip402 daily allowance</description>
-    <message>Authentication is required to change how much local agents may spend per day.</message>
+    <message>Authentication is required to change how much local agents may spend per day from the chip402 purse.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
@@ -39,7 +58,7 @@
 
   <action id="dev.chip402.max">
     <description>Change the chip402 per-payment limit</description>
-    <message>Authentication is required to change the most local agents may spend in one payment.</message>
+    <message>Authentication is required to change the most local agents may spend in one payment from the chip402 purse.</message>
     <defaults>
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
