@@ -399,7 +399,7 @@ Panel {
         }
 
         PanelSeparator {
-          visible: purse.live && !purse.awaitingFunding && root.asset !== null && root.asset.payments.length > 0
+          visible: purse.live && !purse.awaitingFunding && root.asset !== null
           foreground: root.foreground
         }
 
@@ -486,6 +486,38 @@ Panel {
               }
             }
           }
+
+          // Nothing today is a real answer, and it should read as one rather than as an empty
+          // space that might be a bug.
+          Text {
+            visible: root.asset !== null && root.asset.payments.length === 0
+            width: parent.width
+            textFormat: Text.PlainText
+            text: qsTr("nothing paid today")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        // ---------- Everything, from somewhere that is not this panel ----------
+        // The list above is today, filtered to what the agent actually bought. This goes to the
+        // whole account on a public explorer: every transaction, no filter and no host names,
+        // because the names are chip402's own label for a counterparty the chain knows only as
+        // 0.0.9584959. Deliberately a link rather than more rows in here — the panel's job is the
+        // named, recent view, and "everything, ever" is a question better answered by a source
+        // that is not us. There is no local log to read instead; that is the point of the rewrite.
+        Text {
+          visible: purse.live && !purse.awaitingFunding && purse.accountId !== ""
+          width: parent.width
+          textFormat: Text.PlainText
+          text: qsTr("full history on HashScan ↗")
+          color: historyHover.hovered ? root.foreground : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+
+          HoverHandler { id: historyHover; cursorShape: Qt.PointingHandCursor }
+          TapHandler { onTapped: purse.openAccount() }
         }
 
         // ---------- The button ----------

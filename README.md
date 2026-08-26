@@ -385,6 +385,7 @@ selector over data the panel is holding — no new verb, no round trip.
 │  [ $    ][✓]                         │
 │  ────────────────────────────────────│
 │  $0.01  api.example.com           ↗  │   ← a row the mirror node returned
+│  full history on HashScan ↗          │
 │  [        ⏻  PAUSE        ]          │
 └──────────────────────────────────────┘
 ```
@@ -511,6 +512,20 @@ touches the QR — it is a paste into a faucet or an exchange.
 
 What is *not* covered: something already running as root, or a compromised TPM. Both own the
 daemon outright, at which point the purse is the least of it.
+
+**Six rows, and then a link.** The list is today's, newest first, hard-capped at six — the panel
+is a glance, not a ledger viewer, so it neither scrolls nor grows. The status frame is capped too,
+at twenty rows per asset: the *figure* is summed from every transaction the chain returned, but
+there is no reason to push a busy day's worth down the socket on every change so that six of them
+can be drawn.
+
+Underneath sits **full history on HashScan ↗**, and that is deliberately a link rather than more
+rows. Everything the panel could show further back it would have to show worse: the host names are
+chip402's own labels, capped at five hundred and written after signing, because the chain knows
+the counterparty as `0.0.9584959` and not as `printwright.liftbyai.com`. So the panel keeps the
+named, filtered, recent view, and "everything, ever" is answered by a public explorer — which is
+also the honest place for it, being a source that is not us. There is no local log to offer
+instead, and that is the point rather than an omission.
 
 **Every row opens on HashScan, and every row is a transaction that happened.** The list is not
 something the daemon keeps — it is the mirror node's answer to "what did this account pay since

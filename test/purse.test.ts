@@ -219,6 +219,28 @@ test("the snapshot the panel sees is the chain's answer, with no key material in
   assert.doesNotMatch(text, /[0-9a-f]{60,}/i, "something key-shaped reached the panel");
 });
 
+test("the frame carries a bounded number of rows, and the sum is not one of them", () => {
+  // The panel draws six rows and the CLI five, so a busy day must not push hundreds down the
+  // socket on every change. What must never be truncated is the figure: it is summed from every
+  // row the chain returned, upstream of this cut.
+  const purse = open(scratch());
+  const many = Array.from({ length: 200 }, (_, i) => ({
+    txId: `0.0.9185802@${1_800_000_000 + i}.0`,
+    at: NOW - i * 1000,
+    asset: "usdc" as const,
+    amount: 1_000n,
+    payTo: "0.0.5005",
+  }));
+  purse.observe(ledger({ payments: many, spent: { usdc: 200_000n, hbar: 0n } }), false);
+
+  const frame = snapshot(purse, testnet, identity, NOW) as Record<string, any>;
+  assert.equal(frame["assets"].usdc.payments.length, 20, "the frame is unbounded");
+  // Newest first, so a cut keeps the rows a human would actually be shown.
+  assert.equal(frame["assets"].usdc.payments[0].txId, many[0]!.txId);
+  // And the number the limits are measured against is the whole day, not the twenty.
+  assert.equal(frame["assets"].usdc.spent, "200000");
+});
+
 test("before the chain has answered the snapshot says so rather than showing a zero", () => {
   const purse = open(scratch());
   const frame = snapshot(purse, testnet, identity, NOW) as Record<string, any>;

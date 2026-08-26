@@ -53,6 +53,14 @@ export type Label = { readonly txId: string; readonly host: string };
 // on the file.
 const LABEL_LIMIT = 500;
 
+// How many payment rows the status frame carries per asset. The panel draws six and the CLI five,
+// so this is headroom rather than a constraint on either — what it bounds is the frame itself.
+// Today's spending is summed from every row the chain returned before this cut, so the number is
+// never affected; only the list a human reads is. Without it a busy day would push the whole
+// day's transactions to every connected client on every change, which is a lot of bytes to move
+// so that six of them can be drawn.
+const PANEL_ROWS = 20;
+
 export type PurseState = {
   paused: boolean;
   usdc: Budget;
@@ -283,6 +291,7 @@ export function snapshot(purse: Purse, network: NetworkRow, identity: Identity, 
       balance: (ledger?.balances[key] ?? 0n).toString(),
       payments: (ledger?.payments ?? [])
         .filter((payment) => payment.asset === key)
+        .slice(0, PANEL_ROWS)
         .map((payment) => paymentToJson(payment, purse.hostFor(payment.txId))),
     };
   }
