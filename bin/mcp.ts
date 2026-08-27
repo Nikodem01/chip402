@@ -7,9 +7,7 @@ import { randomBytes } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { open } from "../src/protocol.ts";
-
-const RUNTIME = process.env["CHIP402_RUNTIME_DIR"] ?? "/run/chip402";
+import { open, spendSocket } from "../src/protocol.ts";
 
 // What comes back from a seller is attacker-controlled text on its way into a model's context.
 // It is capped and fenced, and the containment that actually matters is elsewhere: a manipulated
@@ -21,6 +19,23 @@ const RUNTIME = process.env["CHIP402_RUNTIME_DIR"] ?? "/run/chip402";
 // handing back three quarters of something you just bought is the worst of both worlds: the
 // agent cannot tell that the tail is missing, and the money is gone either way.
 const MAX_RETURNED_BYTES = 256 * 1024;
+
+// Bytes, said and then counted. `slice` counts UTF-16 code units, so the cap and the notice were
+// both in a unit the word "bytes" does not mean: a body of CJK or emoji is two to four bytes per
+// unit, so a "256 KB" answer could be most of a megabyte and "12 of 400,000 bytes withheld" could
+// be off by a factor of three. Harmless — fetch.ts caps the wire at a megabyte either way — but a
+// number handed to an agent should be the number it is called.
+//
+// The cut is walked back off a UTF-8 continuation byte (10xxxxxx) so the block never ends in half
+// a character. At most three bytes are given up for that, which is cheaper than handing a model a
+// replacement character and calling it content.
+function clipToBytes(text: string, maxBytes: number): { kept: string; total: number; withheld: number } {
+  const encoded = Buffer.from(text, "utf8");
+  if (encoded.byteLength <= maxBytes) return { kept: text, total: encoded.byteLength, withheld: 0 };
+  let end = maxBytes;
+  while (end > 0 && (encoded[end]! & 0xc0) === 0x80) end--;
+  return { kept: encoded.subarray(0, end).toString("utf8"), total: encoded.byteLength, withheld: encoded.byteLength - end };
+}
 
 // SECURITY: the boundary the seller must not be able to forge. The old fence was the fixed
 // literal "--- untrusted content from <url> ---" wrapped around the body in one text block, so a
@@ -66,7 +81,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const session = await open(`${RUNTIME}/spend.sock`);
+  const session = await open(spendSocket());
   try {
     if (request.params.name === "purse") {
       const status = await session.ask({ cmd: "purse" });
@@ -82,8 +97,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     const full = String(reply["body"] ?? "");
-    const body = full.slice(0, MAX_RETURNED_BYTES);
-    const cut = full.length - body.length;
+    const { kept: body, total, withheld: cut } = clipToBytes(full, MAX_RETURNED_BYTES);
     const receipt = reply["receipt"] as Record<string, unknown> | null;
     const nonce = fence();
     const note =
@@ -109,7 +123,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           text:
             `--- end of seller response ${nonce} ---` +
             (cut > 0
-              ? `\nTRUNCATED: ${cut} of ${full.length} bytes withheld. This response was paid for; ` +
+              ? `\nTRUNCATED: ${cut} of ${total} bytes withheld. This response was paid for; ` +
                 `re-fetch it from the seller with the handle it gave you rather than assuming this ` +
                 `is all of it.`
               : ""),

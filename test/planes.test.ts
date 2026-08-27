@@ -3,9 +3,10 @@
 // sentence "authority is which socket accepted the connection" is true rather than intended.
 
 import { readFileSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ADMIN_VERBS, SPEND_VERBS, verbsFor } from "../src/protocol.ts";
+import { ADMIN_VERBS, RUNTIME_DIR, SPEND_VERBS, verbsFor } from "../src/protocol.ts";
 import type { Purse } from "../src/purse.ts";
 import { connect, startTestDaemon } from "./support.ts";
 
@@ -146,6 +147,39 @@ test("the socket modes are what the plane split rests on", async (t) => {
   assert.equal(statSync(daemon.adminPath).mode & 0o777, 0o600);
 });
 
+test("the runtime directory is 0750 whatever the umask says", async (t) => {
+  // The unit sets UMask=0077, and `mkdirSync(…, { mode })` is subject to it — so the mkdir alone
+  // produces 0700 and the group cannot reach spend.sock at all. In production the directory is
+  // already there, created by `RuntimeDirectory=chip402` at 0750 before node starts, so nothing
+  // ever showed; off that path the comment was simply wrong. Run under the unit's own umask so
+  // this is the daemon's doing and not the test runner's.
+  const umask = process.umask(0o077);
+  try {
+    const test402 = await startTestDaemon(ready);
+    t.after(() => test402.close());
+    const dir = dirname(test402.daemon.spendPath);
+    assert.equal(statSync(dir).mode & 0o777, 0o750, "the group cannot walk in to reach the sockets");
+    // And the group still cannot create or unlink anything in it, which is what stops the socket
+    // from being deleted to force a fallback path.
+    assert.equal(statSync(dir).mode & 0o020, 0, "the group can write in the runtime directory");
+  } finally {
+    process.umask(umask);
+  }
+});
+
+test("the panel and the daemon agree where the sockets are", () => {
+  // `/run/chip402` was written out five times. Four of them are one constant now; the fifth is in
+  // QML, which cannot import it, so it is checked here rather than kept in step by hand.
+  const qml = readFileSync(new URL("../ui/Purse.qml", import.meta.url), "utf8");
+  const declared = /property string spendSocket: "([^"]+)"/.exec(qml)?.[1];
+  assert.equal(declared, `${RUNTIME_DIR}/spend.sock`, "the panel looks for the socket somewhere else");
+  // And nothing else in src/ or bin/ spells the directory out any more.
+  for (const name of ["../src/daemon.ts", "../bin/mcp.ts", "../bin/chip402.ts", "../bin/chip402ctl.ts"]) {
+    const source = readFileSync(new URL(name, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /"\/run\/chip402/, `${name} carries its own copy of the runtime directory`);
+  }
+});
+
 test("garbage on either socket is answered, not crashed on", async (t) => {
   const test402 = await startTestDaemon(ready);
   t.after(() => test402.close());
@@ -214,6 +248,24 @@ test("every privileged thing the panel can ask for has a polkit action that says
   }
 });
 
+test("every prose that counts the polkit actions counts the ones that are there", () => {
+  // install.sh and the README both describe this surface in words, and the description is the
+  // only thing a reader has before they open the XML. It said "three" for a while after `start`
+  // was added — a small drift, and exactly the kind that makes the rest of the document harder
+  // to trust. Counted rather than proof-read, so adding a fifth action fails here.
+  const spelled: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+  const actual = policyActions().size;
+  for (const name of ["../install.sh", "../README.md"]) {
+    const text = readFileSync(new URL(name, import.meta.url), "utf8");
+    const counts = [...text.matchAll(/\b(one|two|three|four|five|six|seven|eight|nine|ten|\d+) polkit action/gi)];
+    assert.ok(counts.length > 0, `${name} never says how many polkit actions there are`);
+    for (const [phrase, word] of counts) {
+      const claimed = spelled[String(word).toLowerCase()] ?? Number(word);
+      assert.equal(claimed, actual, `${name} says "${phrase}" and ui/chip402.policy declares ${actual}`);
+    }
+  }
+});
+
 test("no chip402 action is auth_admin_keep, so none of them can be silently reused", () => {
   // The one thing that must never be reusable is the authority to raise a cap. systemd's own
   // manage-units action is auth_admin_keep, which is why a cached authorization can stop the
@@ -227,6 +279,34 @@ test("no chip402 action is auth_admin_keep, so none of them can be silently reus
       assert.equal(value, "auth_admin", `${id} allows ${value} — a cap change must prompt every time`);
     }
   }
+});
+
+test("a definite key mismatch hides the address the panel would ask you to fund", () => {
+  // SECURITY, and a claim the README makes that nothing checked. Money sent to an account this key
+  // does not control is money nobody can move, so on a positively-parsed, positively *different*
+  // key the top-up block is not shown at all and no QR is rendered. "We could not tell" is `null`
+  // and must still show the address — hiding a working purse's top-up over an unrecognised key
+  // shape would be the larger failure, and it is the same three-state rule `readKeyMatch` keeps.
+  //
+  // Asserted against the source rather than against a running panel: `ui/Chip.qml` needs Omarchy's
+  // own shell components to load at all, so there is no standalone harness for it the way there is
+  // for `ui/Purse.qml`. What that buys is a guard on the binding itself — the check being deleted,
+  // or quietly turned into a truthy test that a `null` would also fail, fails here.
+  const qml = readFileSync(new URL("../ui/Chip.qml", import.meta.url), "utf8");
+  const gates = qml
+    .split("\n")
+    .filter((line) => line.includes("accountVerified") && !line.trim().startsWith("//"))
+    .map((line) => line.trim());
+  assert.ok(gates.length >= 2, "the funding block and the QR are not both gated on accountVerified");
+  for (const gate of gates) {
+    // Either direction is fine — the funding block shows on `!== false`, `makeQr()` bails on
+    // `=== false`. What is not fine is a truthy test, which would also hide a purse whose key
+    // shape we simply could not read.
+    assert.match(gate, /accountVerified\s*(!==|===)\s*false/, `a truthy test would also hide it on null: ${gate}`);
+  }
+  // And the row that is gated is the one carrying the address and the QR.
+  const funding = qml.slice(qml.indexOf("visible: purse.accountVerified !== false"));
+  assert.match(funding.slice(0, 4000), /evmAddress|qrPath|accountWithChecksum/, "the gated block is not the funding block");
 });
 
 test("the panel cannot reach an admin verb without going through pkexec", () => {

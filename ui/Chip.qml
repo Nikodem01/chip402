@@ -543,9 +543,6 @@ Panel {
   // Presets *and* a free-text amount. The ladder is there because pocket money is chosen
   // coarsely and one tap is one password prompt; the field is there because a ladder that suits
   // me is not a ladder that suits everyone, and the daemon validates the number regardless.
-  // Presets *and* a free-text amount. The ladder is there because pocket money is chosen
-  // coarsely and one tap is one password prompt; the field is there because a ladder that suits
-  // me is not a ladder that suits everyone, and the daemon validates the number regardless.
   //
   // Both rows are laid out on one five-column module, so the chips are all the same width and
   // the second row starts on the same left edge as the first. Ragged chip widths were the single

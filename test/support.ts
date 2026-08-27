@@ -115,12 +115,21 @@ export type Mirror = {
   // While true, a recorded payment is held back — the indexing gap between a transaction
   // reaching consensus and the mirror node answering for it.
   indexing: boolean;
+  // Hold the balances endpoint back by this long. `readLedger` fires both of its requests at once,
+  // so this is how a test makes one leg of a reading resolve long after the other — which is what
+  // lets a read issued early land after a read issued late.
+  accountsDelayMs: number;
   held: MirrorRow[];
   // Let everything held through, as the mirror node catching up would.
   catchUp(): void;
   // Record an x402 payment exactly as the chain shows one: SUCCESS, the facilitator as fee
   // payer, and our account down by `amount` in that asset.
   record(txId: string, asset: AssetKey, amount: bigint, at?: number): MirrorRow;
+  // Somebody else sending us one unit, `count` times, one millisecond apart starting at `at`.
+  // Every row is a transaction the account appears in and the filter then discards — which is
+  // exactly what made this a denial of service worth paying for. The payer is a stranger, so
+  // nothing here is ours.
+  dust(count: number, asset: AssetKey, at: number): void;
   requests: string[];
   close(): Promise<void>;
 };
@@ -144,6 +153,24 @@ function withinRange(row: MirrorRow, query: URLSearchParams): boolean {
   return true;
 }
 
+// The mirror node's `type=credit|debit` filter, as the public testnet node actually behaves.
+// Checked against `0.0.10193689`'s real history on 2026-08-27: `type=debit` keeps token-only
+// debits — every x402 payment is one, because the facilitator pays the HBAR fee and our account
+// has no HBAR entry at all — and drops incoming HBAR credits and an incoming USDC transfer. So
+// the filter reads both transfer lists, not just the HBAR one.
+//
+// A row that both credits and debits the same account in one transaction is not in that capture,
+// so "any negative entry means debit" is this stand-in's reading rather than a verified one. It
+// is also unreachable: every debit of our account needs our signature, so nobody else can build
+// one. chain.ts only ever uses `type=debit` as a fallback from a query that would otherwise be
+// refused outright, which is why an imprecision here cannot widen anything.
+function matchesType(row: MirrorRow, query: URLSearchParams, account: string): boolean {
+  const type = query.get("type");
+  if (type !== "credit" && type !== "debit") return true;
+  const mine = [...row.transfers, ...row.token_transfers].filter((entry) => entry.account === account);
+  return type === "debit" ? mine.some((entry) => entry.amount < 0) : mine.some((entry) => entry.amount > 0);
+}
+
 export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "key" | "evmAddress">> = {}): Promise<Mirror> {
   const state = {
     balances: overrides.balances ?? { usdc: 5_000_000n, hbar: 50_000_000_000n },
@@ -152,6 +179,7 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     rows: [] as MirrorRow[],
     held: [] as MirrorRow[],
     indexing: false,
+    accountsDelayMs: 0,
     requests: [] as string[],
   };
 
@@ -163,15 +191,18 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     };
 
     if (url.pathname.startsWith("/api/v1/accounts/")) {
-      send(200, {
-        account: OUR_ACCOUNT,
-        evm_address: state.evmAddress === null ? null : `0x${state.evmAddress}`,
-        key: state.key,
-        balance: {
-          balance: Number(state.balances.hbar),
-          tokens: [{ token_id: testnet.assets.usdc.id, balance: Number(state.balances.usdc) }],
-        },
-      });
+      const answer = (): void =>
+        send(200, {
+          account: OUR_ACCOUNT,
+          evm_address: state.evmAddress === null ? null : `0x${state.evmAddress}`,
+          key: state.key,
+          balance: {
+            balance: Number(state.balances.hbar),
+            tokens: [{ token_id: testnet.assets.usdc.id, balance: Number(state.balances.usdc) }],
+          },
+        });
+      if (state.accountsDelayMs > 0) setTimeout(answer, state.accountsDelayMs);
+      else answer();
       return;
     }
 
@@ -189,7 +220,7 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     if (url.pathname === "/api/v1/transactions") {
       const limit = Number(url.searchParams.get("limit") ?? "25");
       const matching = state.rows
-        .filter((row) => withinRange(row, url.searchParams))
+        .filter((row) => withinRange(row, url.searchParams) && matchesType(row, url.searchParams, OUR_ACCOUNT))
         .sort((a, b) => Number(b.consensus_timestamp) - Number(a.consensus_timestamp))
         .slice(0, limit);
       send(200, { transactions: matching, links: { next: null } });
@@ -236,6 +267,12 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     set indexing(value: boolean) {
       state.indexing = value;
     },
+    get accountsDelayMs() {
+      return state.accountsDelayMs;
+    },
+    set accountsDelayMs(value: number) {
+      state.accountsDelayMs = value;
+    },
     get requests() {
       return state.requests;
     },
@@ -268,6 +305,29 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
       state.balances = { ...state.balances, [asset]: state.balances[asset] - amount };
       (state.indexing ? state.held : state.rows).push(row);
       return row;
+    },
+    dust(count: number, asset: AssetKey, at: number) {
+      const native = asset === "hbar";
+      for (let i = 0; i < count; i++) {
+        state.rows.push({
+          transaction_id: `0.0.4444444-${Math.floor((at + i) / 1000)}-${String((at + i) % 1000).padStart(3, "0")}000001`,
+          consensus_timestamp: consensusOf(at + i),
+          result: "SUCCESS",
+          name: "CRYPTOTRANSFER",
+          transfers: native
+            ? [
+                { account: "0.0.4444444", amount: -1 },
+                { account: OUR_ACCOUNT, amount: 1 },
+              ]
+            : [],
+          token_transfers: native
+            ? []
+            : [
+                { token_id: testnet.assets.usdc.id, account: "0.0.4444444", amount: -1 },
+                { token_id: testnet.assets.usdc.id, account: OUR_ACCOUNT, amount: 1 },
+              ],
+        });
+      }
     },
     close: () =>
       new Promise((resolve) => {
@@ -385,8 +445,15 @@ export function stubWallet(
 export type TestDaemon = {
   daemon: Daemon;
   mirror: Mirror;
+  // Where purse.json, labels.jsonl and settling.json live, so a test can look at what a restart
+  // would actually find rather than at what the daemon remembers.
+  stateDir: string;
   reload: () => Purse;
   signatures: () => number;
+  // Stop the daemon and start another one on the same state directory, the same runtime directory
+  // and the same mirror node — `systemctl restart chip402`, with nothing else changed. What the
+  // second daemon knows is exactly what the first one left on disk.
+  restart: () => Promise<void>;
   close: () => Promise<void>;
 };
 
@@ -404,26 +471,43 @@ export async function startTestDaemon(
   setup(seed);
   seed.persist();
 
+  // Signature counts are per wallet and a restart builds a new one, so they are summed across
+  // boots rather than reset by one — otherwise "did the restart buy a second signature?" would be
+  // unanswerable, which is the whole question.
+  let earlier = 0;
   let signatures = () => 0;
-  const daemon = await start({
-    configPath: join(dir, "config.json"),
-    stateDir: dir,
-    runtimeDir: join(dir, "run"),
-    makeWallet: (_config, purse, labels) => {
-      const wallet = stubWallet(purse, labels, mirror, price, delayMs);
-      signatures = wallet.signatures;
-      return wallet;
-    },
-  });
+  let current: Daemon;
+  const boot = async (): Promise<void> => {
+    current = await start({
+      configPath: join(dir, "config.json"),
+      stateDir: dir,
+      runtimeDir: join(dir, "run"),
+      makeWallet: (_config, purse, labels) => {
+        const wallet = stubWallet(purse, labels, mirror, price, delayMs);
+        signatures = wallet.signatures;
+        return wallet;
+      },
+    });
+  };
+  await boot();
   // Assertions read the file back rather than the daemon's in-memory copy, so what they check is
   // what actually survived to disk.
   return {
-    daemon,
+    get daemon() {
+      return current;
+    },
     mirror,
+    stateDir: dir,
     reload: () => Purse.open(join(dir, "purse.json")),
-    signatures: () => signatures(),
+    signatures: () => earlier + signatures(),
+    restart: async () => {
+      earlier += signatures();
+      signatures = () => 0;
+      await current.close();
+      await boot();
+    },
     close: async () => {
-      await daemon.close();
+      await current.close();
       await mirror.close();
     },
   };

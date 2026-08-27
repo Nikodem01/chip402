@@ -206,6 +206,18 @@ test("policy.ts does no I/O and keeps no clock of its own", () => {
   // nothing to be stale, and no order of operations to get wrong. `new Date(now)` is allowed —
   // it is how local midnight is worked out from the clock this function is handed, and it reads
   // no clock of its own.
+  const impure = /Date\.now|require\(|node:fs|node:net|node:crypto|node:child_process|fetch\(/;
   const source = readFileSync(new URL("../src/policy.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /Date\.now|require\(|node:fs|node:net|fetch\(/);
+  assert.doesNotMatch(source, impure);
+
+  // And it is purity by construction rather than by inspection of one file: whatever this one
+  // imports for its values has to be pure too, or the property is only true of the lines you can
+  // see. `import type` does not count — a type cannot do I/O — which is how it can name PurseState
+  // without taking purse.ts, and the split is checked here rather than trusted.
+  const value = [...source.matchAll(/^import (?!type )[^;]*from "\.\/([a-z]+\.ts)";$/gm)].map((m) => m[1]!);
+  assert.ok(value.length > 0, "policy.ts stopped importing anything, so this test proves nothing");
+  for (const name of value) {
+    const imported = readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8");
+    assert.doesNotMatch(imported, impure, `policy.ts takes values from ${name}, which is not pure`);
+  }
 });

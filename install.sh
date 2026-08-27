@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The one sudo step. It creates the boundary — a system user, a root-owned admin binary, a
-# never-cached sudo rule, three polkit actions, and the unit — and it installs no secrets: the
+# never-cached sudo rule, four polkit actions, and the unit — and it installs no secrets: the
 # key is generated later by `sudo chip402ctl setup`. Idempotent, so re-running after an edit is
 # the normal way to work on it.
 set -euo pipefail
@@ -86,6 +86,11 @@ chmod -R go-w "$LIB"
 # --- the only thing sudo and polkit will run --------------------------------------------------
 # SECURITY: root-owned. If the admin binary were a script in my home, an agent would rewrite it
 # and wait for me to type a password at it.
+# `mkdir -p` rather than `install -d`, because this directory belongs to the distribution on every
+# machine that has one and there is no reason for this script to restate its mode. It is only ever
+# created on a system minimal enough not to ship it, where the redirect below would otherwise fail
+# with a bash error that says nothing about chip402.
+mkdir -p /usr/local/bin
 cat > /usr/local/bin/chip402ctl <<EOF
 #!/usr/bin/env bash
 exec $LIB/node $LIB/bin/chip402ctl.ts "\$@"

@@ -23,7 +23,7 @@ one config value and a restart.
   root ──chip402ctl───admin.sock──┊─> same daemon, privileged verbs
     resume · allowance/max <asset>     0600 — uid 1000 cannot connect
        ↑ sudo or polkit, password every time
-                                  ┊  key: TPM2-sealed credential → tmpfs, dr-x------
+                                  ┊  key: TPM2-sealed credential → ro tmpfs, root + ACL
 ```
 
 ## The security model, stated plainly
@@ -52,14 +52,19 @@ different button rather than as an explanation printed at the user.
    Hedera signer in one of its own whose `createPartiallySignedTransferTransaction` runs
    `policy.decide` first and throws on deny. One door, and the check is on the same side of it
    as the key. This is deliberately *not* the SDK's `onBeforePaymentCreation` hook — a hook is a
-   convention that a direct call to the scheme walks past. The hook and `spendControls` stay
-   registered as an independent second opinion, not as the mechanism.
+   convention that a direct call to the scheme walks past, and chip402 registers no hook at all.
+   What it does register is `spendControls` and a scheme table with only v2 in it: an independent
+   second opinion by a different implementation, running before our guard rather than instead of
+   it. `src/wallet.ts` translates its three refusals into the same vocabulary `policy.ts` uses, so
+   the agent gets a reason and not a paragraph about SDK configuration.
 3. **The limits cannot be moved, and the spending cannot be edited because it is not written
-   down.** `/var/lib/chip402/purse.json` is `chip402:chip402 0600` and holds four things: the two
-   limits per asset, `paused`, and a display-only `txId → host` label map. The only verbs that
-   change any of them live on the admin socket. Missing file → start paused with a zero
-   allowance; unparseable → refuse to start. What has been spent today is not in that file, or in
-   any file — see the next section.
+   down.** `/var/lib/chip402/purse.json` is `chip402:chip402 0600` and holds policy and nothing
+   else: the two limits per asset, and `paused`. Every verb that **raises** anything — both limits,
+   in both assets, and `resume` — lives on the admin socket; the one spend-plane verb that writes
+   this file is `pause`, which can only ever take capability away. Missing file → start paused with
+   a zero allowance; unparseable → refuse to start. What has been spent today is not in that file,
+   or in any file — the other three things `/var/lib/chip402` holds are host names, a settling lock
+   and the TPM2-sealed key, and none of them is a number. See the next section.
 
 **What is *not* prevented, stated sharply.** The agent chooses the URL, so it can point at a
 seller it controls and dictate the whole invoice. That is bounded rather than prevented, and
@@ -86,8 +91,10 @@ and whether a payment happened at all.** The daemon shows those; it never keeps 
 then reconciles the two.
 
 The rule is not "keep nothing locally", and it is worth being exact about that, because chip402
-*does* keep one thing: a `txId → host` map, so a row can read `printwright.liftbyai.com` instead
-of `0.0.9584959`. Two properties make that legitimate where a local spend counter was not:
+*does* keep two things, and neither is a number the chain owns.
+
+**A `txId → host` map**, so a row can read `printwright.liftbyai.com` instead of `0.0.9584959`.
+Two properties make that legitimate where a local spend counter was not:
 
 - **The chain does not know it and cannot.** There is no second copy to drift from, because there
   is no first copy anywhere else. The counter was a duplicate of something Hedera already
@@ -96,19 +103,29 @@ of `0.0.9584959`. Two properties make that legitimate where a local spend counte
   limit, no sum, no policy path touches it. Lose the whole map and the worst outcome is rows that
   name account ids.
 
-So the two rules that actually survive are: *never keep a local copy of a number the chain owns*,
-and *never let local state reach a decision*. The label map breaks neither.
+**A settling lock** — one transaction id and the instant it stops being able to reach consensus.
+Same two tests, differently: the id is what *we authorised*, which the chain cannot tell us and
+which nothing else has a copy of; and it reaches a decision only in one direction, by denying.
+It carries no amount and no claim that anything happened, so there is nothing in it to reconcile
+and nothing in it that can raise a limit or make a payment look paid. Losing it costs at most two
+minutes of denial. It is on disk rather than in memory because the daemon that has to honour it
+may not be the one that took it — see *the indexing gap*, below.
 
-### Two files, because they want opposite things when they break
+So the two rules that actually survive are: *never keep a local copy of a number the chain owns*,
+and *never let local state reach a decision except by refusing*. Neither of these breaks either.
+
+### Three files, because they want three different things when they break
 
 Those names lived inside `purse.json` at first, and that was a defect regardless of how small the
-file was — one this project's own thesis should have caught sooner:
+file was — one this project's own thesis should have caught sooner. So did the settling lock,
+except that it lived nowhere at all. Everything chip402 keeps on disk now has a file whose failure
+mode is the one that thing actually wants:
 
-| | `purse.json` — policy | `labels.jsonl` — host names |
-|---|---|---|
-| size | ~250 bytes, fixed | grows with every payment |
-| written by | root, over the admin socket | the daemon, on every payment |
-| **if it cannot be read** | **refuse to start** — "I do not know the limits" must never become "there are no limits" | **carry on with fewer names.** Losing all of them costs nothing |
+| | `purse.json` — policy | `labels.jsonl` — host names | `settling.json` — the lock |
+|---|---|---|---|
+| size | ~250 bytes, fixed | grows with every payment | ~90 bytes, or absent |
+| written by | root over the admin socket to raise anything; anyone over the spend socket to `pause` | the daemon, on every payment | the daemon, before each signature |
+| **if it cannot be read** | **refuse to start** — "I do not know the limits" must never become "there are no limits" | **carry on with fewer names.** Losing all of them costs nothing | **assume it is held** — for as long as any real lock could last, a little over two minutes |
 
 Sharing a file meant sharing a failure mode, and the shared one had to be the strict one. So a
 growing pile of decoration could push the file past the size the daemon agrees to read — and then
@@ -120,13 +137,26 @@ Apart, each file gets what it actually wants. `purse.json` is four numbers and a
 cap three hundred times what it needs, and an unreadable one still stops everything. `labels.jsonl`
 is append-only — one short line at the end of a file per payment, rather than an atomic rewrite of
 the limits — and **nothing about it can stop the daemon**: truncated, corrupt, half-written, too
-big to read whole, or a directory where the file should be are all survivable, and each costs
-names and only names. `test/labels.test.ts` asserts every one of those, with the contrasting
+big to read whole, a directory where the file should be, and a write it cannot make at all are
+survivable, and each costs names and only names. The last of those is the one that had to be
+fixed rather than asserted: both writers sit where a throw is expensive — the seed write runs
+before the daemon binds a socket, and the append runs *after* a signature — so every write in
+`labels.ts` swallows its own failure. `test/labels.test.ts` asserts every one of those, with the contrasting
 `purse.json` case sitting next to them so the difference is visible in one place.
 
-It also removes the ceiling. Names are no longer capped at five hundred to fit inside somebody
-else's size limit; the file holds a hundred thousand — twenty payments a day for thirteen years —
-and past that it is read from the end and compacted, losing the oldest rather than refusing.
+`settling.json` is the third answer and the only one where damage has to read as *more* caution,
+not less: an unreadable lock is honoured rather than ignored, because "assume nothing is in flight"
+is the reading that authorises a second payment. A recorded deadline is never honoured for longer
+than a real one could have run, so a garbled number costs a bounded stretch of denial and cannot
+wedge the purse.
+It is also the reason the lock is not simply a key inside `purse.json`: that file already has two
+writers — root raising a limit, and anyone pressing PAUSE — and the lock would be a third, written
+on the payment path, which is exactly when the other two are most likely to arrive. Two atomic
+rewrites of one whole file a millisecond apart is a lost update.
+
+The split also removes the label ceiling. Names are no longer capped to fit inside somebody else's
+size limit; the file is capped at 100,000 — twenty payments a day for thirteen years — and past
+that it is read from the end and compacted, losing the oldest rather than refusing.
 
 This is not tidiness. The previous build kept its own `spentToday` counters and its own receipt
 list, and that ledger was **already wrong** — with no attacker involved:
@@ -154,14 +184,32 @@ Today's spend is that filter summed since local midnight. The receipt list is th
 every row is a transaction that provably happened and every HashScan link provably resolves.
 
 **The indexing gap is closed by waiting, not by counting.** The mirror node is a couple of
-seconds behind consensus, so a payment is not finished until the chain shows it. After signing,
-the daemon reads its own transaction id out of the bytes it signed and holds the lane shut until
-that id appears on the mirror — or until `validStart + 120 s` proves it never will, 120 seconds
-being Hedera's `TransactionValidDuration`. A payment attempted in that window is denied with *a
-payment is still settling*. **Nothing is ever given back, because nothing is ever taken, and
-nothing is ever counted twice, because we never count**: a payment that never settles simply
-never appears in the sum. There is no reserve, no commit, no refund and no in-flight tracker,
-because there is no local copy for any of them to reconcile against.
+seconds behind consensus, so a payment is not finished until the chain shows it. The daemon shuts
+the lane on its way to the key — before anything is signed — and reopens it only when the id it
+then reads out of the bytes it signed appears on the mirror, or when the clock proves it never
+will. That instant is **not** `validStart + 120 s`, and the difference is load-bearing: 120 seconds
+is Hedera's `TransactionValidDuration`, the last moment the *chain* would accept the transaction,
+while the lane needs the last moment the *mirror node* could start showing one that was accepted at
+the very end of that window. So the lock is held for the validity window plus the longest the
+mirror is allowed to be behind consensus (`src/chain.ts`'s `INDEXING_MARGIN_MS`, twenty seconds —
+the same patience a payment already spends waiting). Too long costs a payment refused for twenty
+extra seconds; too short is a payment made twice. A payment attempted in that
+window is denied with *a payment is still settling*. **Nothing is ever given back, because nothing
+is ever taken, and nothing is ever counted twice, because we never count**: a payment that never
+settles simply never appears in the sum. There is no reserve, no commit, no refund and no in-flight
+amount tracker, because there is no local copy for any of them to reconcile against.
+
+**And the lane survives a restart**, which it did not until it was demonstrated not to. The lock
+used to live only in memory, so a daemon that went down between the signature and the mirror node
+catching up came back with the lane open, read a ledger that did not yet contain the payment in
+flight, and authorised a second one against it — one extra payment of up to `maxPayment`, for
+anyone who could restart the unit inside the indexing window. `systemctl restart chip402` is
+enough, on a cached polkit authorization (see below), and `Restart=on-failure` does it unattended.
+So the two fields that make the lane a lane — the transaction id and its deadline — are written to
+`settling.json` **before the key is reached**, which is also what makes a disk that cannot be
+written a refusal to pay rather than a payment that has already been signed failing afterwards.
+`test/daemon.test.ts` runs the whole attack: pay, deny, restart, and the third payment must still
+be refused with the chain still showing exactly one transaction.
 
 **What this costs, stated plainly rather than papered over:**
 
@@ -171,9 +219,15 @@ because there is no local copy for any of them to reconcile against.
 - **Unreachable mirror ⇒ cannot compute spend ⇒ deny.** Same fail-closed posture the stale-balance
   check already had.
 - **One extra pair of mirror queries per payment**, plus pagination when a day runs long. Past a
-  bounded number of pages the daemon cannot say what was spent and refuses to pay — which an
-  attacker dusting the account with tiny incoming transfers could provoke. That is a denial of
-  service on pocket money, not a loss of funds, and it is the trade fail-closed buys.
+  bounded number of pages (12 × 100) the daemon cannot say what was spent and refuses to pay. That
+  bound is about the pathological case, and it used to be cheap for somebody else to reach: every
+  transaction the account so much as *appears in* counted against it, including money arriving, so
+  1,200 dust transfers *in* — free on testnet, about $0.12/day on mainnet — stopped payment until
+  local midnight. The fix is not more pages. When the wide query overflows, the daemon asks the
+  narrower one the sum was only ever going to keep — the transactions that took money **out** —
+  and dust weighs nothing there, because every debit of this account needs a signature only this
+  daemon can produce. If that overflows too, the refusal stands: fail-closed is postponed, never
+  weakened.
 - **A few seconds of latency at the tail of each payment**, waiting for the chain to catch up.
 
 ## Five limits
@@ -222,7 +276,37 @@ The x402 v2 spec's §10 covers replay only, is EVM-specific, and calls budget ma
 | **Asset or chain substitution.** | Pinned to the `networks.ts` row; `spendControls.allowedAssets` re-checks independently. |
 | **Prompt injection through the paid body**, including *forging the trust boundary* — the fence used to be a fixed literal wrapped around the body in one block, so a seller could write the closing line and append instructions that read as ours. | The seller's bytes go in a **content block of their own**, with none of our framing inside it to close, and the markers on either side carry a **nonce drawn fresh per call** that nothing which has never seen it can write. `test/mcp.test.ts` drives a seller that tries. The containment that matters is still elsewhere: a manipulated agent cannot exceed the allowance. |
 | **Replay of our signed transfer.** | Nothing to build — Hedera rejects a duplicate transaction id at consensus, and the validity window is short. This is *why* charge-at-signature is right. |
-| **Malicious facilitator** (chosen by the seller). | It cannot alter a signed transfer without failing signature checks, and refusing to settle costs us nothing. |
+| **Malicious facilitator** (chosen by the seller). | It cannot alter a signed transfer without failing signature checks, and refusing to settle costs us nothing — see *The facilitator is the seller's, not ours*, below, where one of them stopped settling mid-review and cost exactly that. |
+
+### The facilitator is the seller's, not ours
+
+The facilitator is the party that adds the fee-payer signature and submits the transfer to Hedera.
+**The seller picks it, chip402 never sees the choice, and nothing about the design rests on which
+one it is.** That is not an oversight to tidy up later; it is why the daemon reads the mirror node
+instead of the `PAYMENT-RESPONSE` header the facilitator's answer arrives in. A facilitator can lie
+about settling, or simply stop, and the purse's figures do not move either way — because they are
+not the purse's figures.
+
+That got tested for real rather than argued. There is **no facilitator operated by Hedera**; two
+advertise `hedera:testnet`:
+
+| | operator | fee payer | |
+|---|---|---|---|
+| `https://api.testnet.blocky402.com` | [Blocky402](https://blocky402.com), by BlockyDevs — independent, open source, and the one [Hedera's own x402 announcement](https://hedera.com/blog/hedera-and-the-x402-payment-standard/) points at | `0.0.7162784` | what `demo/seller.ts` uses |
+| `https://x402.org/facilitator` | the x402 protocol's own reference facilitator | `0.0.9185802` | what it used to use |
+
+The second one **stopped settling** while this was being written: it still advertises
+`hedera:testnet`, still verifies a payment, and then returns an unsuccessful settlement with no
+reason — its account submitted nothing to Hedera for the better part of a day. chip402's behaviour
+under that is the whole argument in one run: the daemon signed once, the receipt said
+`onChain: false` because the mirror node never showed the transaction, the day's spending did not
+move, and the lane reopened on the clock. Nothing had to be reconciled, because nothing had been
+written down. `test/live.test.ts` now tells that apart from a defect — a transaction still absent
+past its validity window was never submitted — and fails naming the facilitator rather than a
+missing word in a body.
+
+`demo/seller.ts --facilitator https://…` (or `CHIP402_FACILITATOR`) points it anywhere. It is the
+seller's flag, and the seller is not part of chip402.
 
 ### Why there is no seller allowlist
 
@@ -235,8 +319,9 @@ The amount is the only term that matters, so every limit here is amount-based.
 
 Two cheap things survive from that space: **no plaintext payments** (an `http:` seller on a
 public host can be impersonated by anyone on the network path, so it is refused; loopback is
-allowed, which is how the demo seller works), and **the panel marks a host never paid before as
-`new`** — visibility, not a gate.
+allowed, which is how the demo seller works), and **every payment row names its counterparty** —
+the host we actually reached, or the account id the chain has if we never labelled it, so a name
+you do not recognise is visible at a glance. Visibility, not a gate.
 
 ## Key custody
 
@@ -246,8 +331,13 @@ finds a key, and pastes it into a transcript. Only a different uid actually stop
 - The daemon runs as a dedicated system user `chip402`, as a system unit.
 - The key is a TPM2-sealed systemd credential (`LoadCredentialEncrypted=`). On disk it is
   ciphertext sealed to this machine; at runtime systemd decrypts it into
-  `/run/credentials/chip402.service/` — a read-only tmpfs, `dr-x------`, owned by the service
-  user. **Plaintext never touches disk.**
+  `/run/credentials/chip402.service/` — **a read-only tmpfs, so plaintext never touches disk.**
+  Measured on the running unit rather than assumed: `findmnt` reports
+  `tmpfs ro,nosuid,nodev,noexec,nosymfollow,size=1024k,mode=700`, and `getfacl` reports it
+  **owned by root** with POSIX bits `dr-x------` plus an ACL entry `user:chip402:r-x`. (`ls -ld`
+  renders that as `dr-xr-x---+`: the group field of a file with an ACL shows the mask. That is
+  exactly why `readSecret` checks `mode & 0o007` and not `mode & 0o077` — see `src/safe.ts`.)
+  uid 1000 cannot open the directory.
 - The key never enters my home directory. `sudo chip402ctl setup` generates it, pipes it straight
   into `systemd-creds encrypt`, and never puts it in argv, an environment variable, or a file I own.
 
@@ -310,9 +400,15 @@ have to remember the id. What it does with it:
 - **A hollow account is completed** on the way through, same as a fresh one.
 - **It tells you what is in there**, so you know what the agent is about to be handed.
 
-One thing to be clear about: sealing is to *this* TPM. There is no backup and no recovery — if
-the machine goes, so does the key. That is the right trade for pocket money and the wrong one
-for anything else, which is the same reason the purse is small.
+One thing to be clear about: sealing is to *this* TPM. `setup` pipes the key into
+`systemd-creds encrypt --name=chip402-key --with-key=host+tpm2`, and `host+tpm2` is what makes the
+ciphertext useless elsewhere: it is bound both to the machine's own secret and to the TPM, so
+neither a copied file nor a copied disk opens it on another machine. That is a property of
+`systemd-creds` rather than of anything in this tree, so it is cited and not claimed as measured —
+what is checked here is which key type is asked for (`bin/chip402ctl.ts`) and that this machine has
+a TPM to ask (`systemd-analyze has-tpm2` → `yes`). There is no backup and no recovery: if the
+machine goes, so does the key. That is the right trade for pocket money and the wrong one for
+anything else, which is the same reason the purse is small.
 
 Fund testnet HBAR at [portal.hedera.com/faucet](https://portal.hedera.com/faucet) — paste the
 `0x…` address. After completion the account has unlimited auto-association, so testnet USDC
@@ -387,12 +483,20 @@ ss -ltnp | grep -c chip402                                       # 0 — no TCP 
 
 **One of those is not a denial, and the README would be lying if it claimed otherwise.**
 `systemctl stop chip402` is guarded by polkit's `org.freedesktop.systemd1.manage-units`, which
-ships as `auth_admin_keep` — so it needs admin authentication, but a *cached* authorization from
-any earlier privileged action in the same session satisfies it silently. Verified on this
-machine: it stopped the daemon with no prompt. That is a denial of service the session can
+ships as `auth_admin_keep` for an active session — so it needs admin authentication, but a
+*cached* authorization from any earlier privileged action in the same session satisfies it
+silently. Read out of polkit's own database rather than by stopping a daemon that holds money:
+
+```
+$ pkaction --action-id org.freedesktop.systemd1.manage-units --verbose
+  implicit any:      auth_admin
+  implicit inactive: auth_admin
+  implicit active:   auth_admin_keep
+``` That is a denial of service the session can
 perform on itself, and it is fail-closed — with no daemon there is nothing to pay through, and
-the limits on disk are untouched. (There is nothing else on disk to touch: a restarted daemon
-re-reads what has been spent from the chain, so it cannot come back up with a stale figure.) It is also the reason chip402's own three polkit
+the limits on disk are untouched. (There is nothing else on disk worth touching: a restarted daemon
+re-reads what has been spent from the chain, so it cannot come back up with a stale figure — and
+the one thing it does read back, the settling lock, can only make it refuse.) It is also the reason chip402's own four polkit
 actions are `auth_admin` and never `auth_admin_keep`: the one thing that must not be silently
 reusable is the authority to raise a cap.
 
@@ -473,7 +577,7 @@ The risks that are real here, and what each one gets:
 
 | Risk | What it is | What chip402 does |
 |---|---|---|
-| **Truncated verification** | [Address poisoning](https://support.metamask.io/stay-safe/protect-yourself/wallet-and-hardware/address-poisoning-scams/) works *because* interfaces abbreviate to the first and last few characters, so a substitution hides in the middle. Blockaid flagged 65.4M such transactions in 13 months. | The address is shown **whole and wrapped**, never elided. |
+| **Truncated verification** | [Address poisoning](https://support.metamask.io/stay-safe/protect-yourself/wallet-and-hardware/address-poisoning-scams/) works *because* interfaces abbreviate to the first and last few characters, so a substitution hides in the middle. [Blockaid flagged 65.4M such transactions between January 2025 and February 2026](https://www.blockaid.io/blog/address-poisoning-the-growing-threat-draining-millions-from-crypto-users), of which about 316,000 succeeded. | The address is shown **whole and wrapped**, never elided. |
 | **Nothing human-checkable** | Nobody compares 42 hex characters. | The account id carries its **HIP-15 checksum** — `0.0.10193689-wkdxo`. Five letters derived from the id *and the ledger*: change one digit and all five change (`0.0.10193688-stgpx`). That is a comparison a person will actually make. |
 | **Clipboard hijacking** | Clipper malware swaps crypto addresses between copy and paste; [Microsoft flagged a Tor-based, worm-propagating one in June 2026](https://www.microsoft.com/en-us/security/blog/2026/06/17/crypto-clipper-uses-tor-worm-like-propagation-for-persistence-control/). | The QR path never touches the clipboard. Copy stays for convenience; the QR is the primary. |
 | **Wrong network** | Testnet and mainnet addresses look identical. | See below — the QR deliberately carries the recoverable identifier. |
@@ -535,12 +639,19 @@ a positively-parsed *different* key denies, after three readings; **and anything
 allows**, and is shown as unverified. `test/policy.test.ts` asserts the null case allows, under
 the name `ANTI-BRICK`.
 
-The QR itself is rendered by `qrencode` on argv into the session's own `0700` runtime directory,
-and `zbarimg` on the rendered file returns the identifier — which is how it was checked rather
-than assumed. It is drawn in the theme's own two colours rather than black on white: whichever of
-the foreground and the popup surface is lighter becomes the paper, so the code keeps the
-dark-on-light polarity scanners expect while sitting on a card that matches the rest of the
-panel. On the shipped theme that is 13.7:1 contrast, against the 3:1 scanners need.
+The QR itself is rendered by `qrencode` on argv into the session's own `0700` runtime directory
+(`/run/user/1000`, `drwx------`), and `zbarimg` on the rendered file returns the identifier —
+which is how it is checked rather than assumed. It is drawn in the theme's own two colours rather
+than black on white: whichever of the foreground and the popup surface is lighter becomes the
+paper, so the code keeps the dark-on-light polarity scanners expect while sitting on a card that
+matches the rest of the panel.
+
+`test/panel.test.ts` runs that rule — lifted out of `ui/Chip.qml` rather than restated — over six
+real themes in both directions, renders each with the exact `qrencode` argv the panel builds, and
+reads every one back with `zbarimg`. Contrast against the 3:1 scanners need, measured: 6.66:1 on
+the lightest theme installed here (`rose-pine`) up to 21:1 (`vantablack`), 9.65:1 on the one this
+machine is running (`osaka-jade`). A single number belongs to a single theme, which is why the
+claim is now the range and the floor.
 
 Both identifiers carry a visible copy button, because a top-up from a laptop browser never
 touches the QR — it is a paste into a faucet or an exchange.
@@ -564,7 +675,7 @@ can be drawn.
 
 Underneath sits **full history on HashScan ↗**, and that is deliberately a link rather than more
 rows. Everything the panel could show further back it would have to show worse: the host names are
-chip402's own labels, capped at five hundred and written after signing, because the chain knows
+chip402's own labels, capped at 100,000 and written after signing, because the chain knows
 the counterparty as `0.0.9584959` and not as `printwright.liftbyai.com`. So the panel keeps the
 named, filtered, recent view, and "everything, ever" is answered by a public explorer — which is
 also the honest place for it, being a source that is not us. There is no local log to offer
@@ -580,8 +691,8 @@ chain knows the counterparty is `0.0.9584959` and not that it was `printwright.l
 That label is decoration in the sense that matters — no number and no decision can be reached
 from it — but it is not disposable. "$1.60 to printwright.liftbyai.com" is a line you can read;
 "$1.60 to 0.0.9584959" is a line you have to go and look up, and seeing where the agent's money
-went without a deep dive is most of what the panel is for. So the map is kept generously (500
-rows, comfortably more than a day can show) and is **carried across an upgrade**: `Purse.open`
+went without a deep dive is most of what the panel is for. So the map is kept generously (100,000
+rows, far more than a day can show) and is **carried across an upgrade**: `Purse.open`
 reads host names out of the previous build's receipt list once, takes the two strings and nothing
 else — not the amounts, not the counters, not the seller's settled claim, all of which the chain
 answers now — and the first write afterwards drops the old shape for good. Where there genuinely
@@ -616,28 +727,31 @@ fixed column so hosts align however long the amount is.
 
 ## The code
 
-Eleven core files, each with one job, each meant to be read aloud: 1,377 lines of code, 2,194 with
+Twelve core files, each with one job, each meant to be read aloud: 1,465 lines of code, 2,619 with
 the comments, which are part of the deliverable rather than decoration. `grep -rn "SECURITY:"
-src/ ui/` is the outline of the security half.
+src/ ui/` is the outline of the security half. The numbers below are `wc -l`, and
+`test/readme.test.ts` recomputes them rather than trusting this table — two rows had quietly
+drifted before it did.
 
 | File | Job | Code / total |
 |---|---|---|
 | `src/networks.ts` | Two frozen rows: mirror node, both token ids, and the panel's preset ladders (a ladder, not a ceiling). **The mainnet switch.** | 72 / 109 |
 | `src/money.ts` | `bigint` base units, decimals-aware. No function takes two assets, so no function can need a price. | 36 / 61 |
-| `src/safe.ts` | `readSecret` (`O_NOFOLLOW` + `fstat`), `writeAtomic` (temp, flush, rename), `readJson` (size-capped, refuses), `appendLine`/`readTail` (append-only, never refuses). | 101 / 162 |
-| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also where local midnight is defined, because that is the one thing about "today" that is ours. | 70 / 160 |
+| `src/ids.ts` | What a Hedera id looks like, in one place instead of five. Pure, so even `policy.ts` can import it. | 6 / 25 |
+| `src/safe.ts` | `readSecret` (`O_NOFOLLOW` + `fstat`), `writeAtomic` (temp, flush, rename), `readJson` (size-capped, refuses), `appendLine`/`readTail`/`removeFile` (degrade, never refuse). | 107 / 199 |
+| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also where local midnight is defined, because that is the one thing about "today" that is ours. | 70 / 158 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK. Manual redirects, byte cap, deadline, `accepts[]` cap. | 83 / 132 |
-| `src/chain.ts` | **What the chain says, and the only place it is asked.** The x402-payment filter, today's spend, the three-state key check, and "has this transaction happened yet". | 198 / 303 |
-| `src/purse.ts` | Limits, `paused` and the settling lane — and on disk, **only** the limits and `paused`. No spending state, no host names, nothing that grows. | 191 / 310 |
-| `src/labels.ts` | The `txId → host` names, append-only in a file of their own. Structurally incapable of stopping the daemon. | 65 / 132 |
-| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement wait. | 268 / 402 |
-| `src/protocol.ts` | The NDJSON contract: two frozen verb sets, plus the client the CLI and MCP server use. | 75 / 112 |
-| `src/daemon.ts` | Two listeners in one process. The plane is the listener. Payments serialized through one chain. | 214 / 298 |
+| `src/chain.ts` | **What the chain says, and the only place it is asked.** Five facts: balances, the x402-payment filter, today's spend, "has this transaction happened yet", and the three-state key check. | 223 / 416 |
+| `src/purse.ts` | Limits, `paused` and the settling lock — on disk, **only** the limits and `paused` in `purse.json`, and the lock in a file of its own. No spending state, no host names, nothing that grows. | 219 / 435 |
+| `src/labels.ts` | The `txId → host` names, append-only in a file of their own. Structurally incapable of stopping the daemon — reads and writes alike. | 67 / 150 |
+| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, the lock taken on the way to the key, and the settlement wait. | 285 / 489 |
+| `src/protocol.ts` | The NDJSON contract: two frozen verb sets, where the sockets live, plus the client the CLI and MCP server use. | 80 / 132 |
+| `src/daemon.ts` | Two listeners in one process. The plane is the listener. Payments serialized through one chain. | 217 / 313 |
 
 Clients: `bin/chip402.ts` (spend plane only), `bin/chip402ctl.ts` (admin plane + `setup`),
 `bin/mcp.ts` (two tools, spend plane only). Panel: `ui/Chip.qml` (bar item and popup),
 `ui/Purse.qml` (the socket), `ui/ChipIcon.qml` + `ui/assets/chip.svg` (the mark, drawn in white
-and recoloured to whatever theme is on), `ui/chip402.policy` (three polkit actions).
+and recoloured to whatever theme is on), `ui/chip402.policy` (four polkit actions).
 
 ## Tests
 
@@ -646,18 +760,20 @@ missing rather than passing quietly.
 
 | File | Proves |
 |---|---|
-| `money.test.ts` | Float rejection, both decimal boundaries, overflow, and that no exported function sees two assets. |
-| `chain.test.ts` | The payment filter, against a **verbatim capture of the public testnet mirror node**: $1.62 and ℏ0.00 to the unit, failures and owner-initiated transactions dropped, incoming transfers not counted as spending — and the ℏ0.02 regression, which moves to the wallet that actually made it when the account id changes. Plus the three states of the key check, including `ANTI-BRICK`. |
+| `money.test.ts` | Float rejection, both decimal boundaries, overflow, that no exported function sees two assets, and that `ui/Purse.qml`'s own `money()` — lifted out of the shipping file and run — agrees with `format()` on every interesting value. |
+| `safe.test.ts` | The two contracts, as the opposites they are. `readSecret`: a symlink refused by `O_NOFOLLOW`, a world-readable key refused, a `0440` systemd credential **accepted** — the group bit is skipped on purpose and that is asserted in both directions. `readTail`: a file past the cap read from the end with the half-line dropped. |
+| `chain.test.ts` | The payment filter, against a **verbatim capture of the public testnet mirror node**: $1.62 and ℏ0.00 to the unit, failures and owner-initiated transactions dropped, incoming transfers not counted as spending — and the ℏ0.02 regression, which moves to the wallet that actually made it when the account id changes. Plus the three states of the key check, including `ANTI-BRICK`; the same shapes run through `setup --import`'s stricter check beside it; and 1,500 dust transfers in, which must not make spending uncomputable. |
 | `policy.test.ts` | The decision table, run twice — once per asset — plus the cross-asset cases. The security proof. Includes: a chain that has never answered denies rather than reading as zero, a settling payment denies, `verified === null` **allows**. |
-| `purse.test.ts` | That `purse.json` holds policy and *nothing* else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, that upgrading from the old build carries the host names out and *only* those, and that a truncated temp file never becomes the purse. |
+| `purse.test.ts` | That `purse.json` holds policy and *nothing* else, that no arithmetic happens in it at all, that nothing chain-shaped survives a restart, that upgrading from the old build carries the host names out and *only* those, and that a truncated temp file never becomes the purse. Plus the settling lock: what it may carry, that damage to it reads as *held* rather than as free, that a garbled deadline cannot outlast a real one, and that it is taken and released under `node --permission`. |
 | `labels.test.ts` | That nothing about the label store can stop the daemon — truncated, corrupt, oversized, or a directory where the file should be — with the contrasting `purse.json` refusal asserted beside it. Plus append-only behaviour, last-line-wins, and the one-time migration out of the old file. |
 | `seller.test.ts` | The hostile-seller table, against real HTTP servers, the real SDK wrapper and a mirror node on loopback — including a seller that takes a signature and never settles, which costs nothing. |
-| `planes.test.ts` | The authority proof: disjoint verb sets, admin verbs refused on the spend socket, the plane is never read from a field. |
-| `signer.test.ts` | The enforcement proof: every denial leaves the stub signer uncalled, no lane closed and nothing recorded. Plus a second signature in one payment throwing, and both ways the settling lane reopens. |
-| `daemon.test.ts` | Two concurrent payments against a cap that allows one → exactly one pays, bounded by the chain rather than by a counter. The indexing gap denying and then clearing. No TCP port. No key in any reply. A misshapen `accountId` refusing to start. |
-| `mcp.test.ts` | The product, end to end and out of process: a real MCP client → `bin/mcp.ts` → daemon → hardened fetch → a real x402 seller. Only the signature is a stub. The seller's body is a fence-forgery attempt, and it stays in its own block. |
+| `planes.test.ts` | The authority proof: disjoint verb sets, admin verbs refused on the spend socket, the plane is never read from a field, the socket modes and the `0750` runtime directory under the unit's own umask, and every polkit action the panel can ask for. |
+| `signer.test.ts` | The enforcement proof: every denial leaves the stub signer uncalled, no lane closed and nothing recorded. Plus a second signature in one payment throwing, both ways the settling lane reopens, a receipt that says what the chain says even when the poll loop reopened the lane first, and a signer that refuses not leaving the lane shut behind it. |
+| `daemon.test.ts` | Two concurrent payments against a cap that allows one → exactly one pays, bounded by the chain rather than by a counter. The indexing gap denying and then clearing. **The restart attack**: pay, deny, restart the daemon inside the indexing window, and the next payment must still be refused. No TCP port. No key in any reply. A misshapen `accountId` refusing to start. |
+| `mcp.test.ts` | The product, end to end and out of process: a real MCP client → `bin/mcp.ts` → daemon → hardened fetch → a real x402 seller. Only the signature is a stub. The seller's body is a fence-forgery attempt, and it stays in its own block. Plus a seller whose answer is over the cap in a script where a character is three bytes: the cap is bytes, the notice counts bytes, and the cut lands on a character boundary. |
+| `readme.test.ts` | The claims in this file that a script can check: the line counts in the table above, the totals in the sentence above it, the number of core files, and the label cap. Two table rows had drifted before this existed. |
 | `panel.test.ts` | The real `ui/Purse.qml`, under Quickshell, against a daemon that goes away and comes back: it must reconnect on its own. Skipped, loudly, where Quickshell is not installed. |
-| `live.test.ts` | A real testnet payment, then the same mirror query the daemon makes, asked independently — the panel and the chain must agree for both assets. Off unless `CHIP402_LIVE=1`. |
+| `live.test.ts` | A real testnet payment, then the same mirror query the daemon makes, asked independently — the panel and the chain must agree for both assets. HBAR by default, because a token transfer to an account that cannot hold the token fails at consensus and proves nothing; the test says so before paying rather than after. It tells an outage apart from a defect: a transaction still absent from the mirror node past its validity window was never submitted, so it asserts the fail-closed half (nothing counted, lane reopened, receipt honest) and fails naming the **facilitator** and the id. Plus the mirror node's own `type=debit` filter, checked against real history, because `src/chain.ts`'s fallback rests on it. Off unless `CHIP402_LIVE=1`. |
 
 ## Not built, on purpose
 
@@ -666,3 +782,9 @@ kind** — no spend counters, no receipt file, no reserve/commit/release, no per
 flag, no in-flight amount tracker; every one of those is a mechanism for reconciling a copy that
 should not exist · a per-host circuit breaker · log rotation · approval dialogs · key-rotation
 machinery · per-agent identity on the socket · **a seller allowlist**.
+
+The settling lock is the one thing on that list's edge, so it is worth being exact: it is not a
+reserve and not an in-flight *amount* tracker. It holds an id and a deadline, it can only ever
+deny, and nothing reconciles it against anything — the sum is still the mirror node's answer and
+nothing else. A lock that had to be balanced against a number would be the thing this list refuses;
+one that expires on its own is not. `test/purse.test.ts` asserts its shape as well as its effect.

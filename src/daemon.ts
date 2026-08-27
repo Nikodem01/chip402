@@ -8,9 +8,10 @@ import type { Server, Socket } from "node:net";
 import { join } from "node:path";
 import type { AssetKey, NetworkRow } from "./networks.ts";
 import { networkFor } from "./networks.ts";
+import { ENTITY_ID } from "./ids.ts";
 import { parse } from "./money.ts";
 import type { Plane } from "./protocol.ts";
-import { MAX_LINE_BYTES, fail, ok, parseLine, serialize, verbsFor } from "./protocol.ts";
+import { MAX_LINE_BYTES, RUNTIME_DIR, fail, ok, parseLine, serialize, verbsFor } from "./protocol.ts";
 import { Purse, snapshot } from "./purse.ts";
 import { Labels } from "./labels.ts";
 import { readJson } from "./safe.ts";
@@ -41,12 +42,6 @@ const CHAIN_RETRY_MS = 5_000;
 // descriptors.
 const MAX_CLIENTS = 64;
 
-// Hedera account ids look like 0.0.1234 and nothing else does. This one is interpolated into a
-// mirror-node URL path, so it is shape-checked at the door: /etc/chip402/config.json is
-// root-owned, but "root wrote it" is not the same claim as "it is an account id", and a path
-// segment is the wrong place to find out.
-const ENTITY_ID = /^\d+\.\d+\.\d+$/;
-
 // An unreadable, unknown-network or misshapen config is a refusal to start. "I could not tell
 // which chain this purse is on" must never resolve to a guess, because the guess could be the
 // real one.
@@ -56,6 +51,10 @@ export function loadConfig(path: string): DaemonConfig {
   const network = networkFor(name);
   if (!network) throw new Error(`unknown network ${name} in ${path}`);
   const accountId = typeof raw?.["accountId"] === "string" ? raw["accountId"] : null;
+  // The same shape policy.ts checks a seller's payTo against, out of ids.ts so there is one answer
+  // to "what does an account id look like". Here it guards a mirror-node URL path segment:
+  // /etc/chip402/config.json is root-owned, but "root wrote it" is not the same claim as "it is an
+  // account id", and a path segment is the wrong place to find that out.
   if (accountId !== null && !ENTITY_ID.test(accountId)) {
     throw new Error(`accountId ${JSON.stringify(accountId)} in ${path} is not a Hedera account id`);
   }
@@ -74,10 +73,11 @@ function assetKey(value: unknown): AssetKey {
 export async function start(options: DaemonOptions): Promise<Daemon> {
   const config = loadConfig(options.configPath);
   const purse = Purse.open(join(options.stateDir, "purse.json"));
-  // Two files, because they want two different things when they cannot be read: purse.json is the
-  // limits and a bad one stops the daemon; labels.jsonl is host names and a bad one costs names.
-  // On the first start after an upgrade the store adopts whatever purse.json used to carry, and
-  // purse.json stops carrying it on its next write.
+  // Three files in this directory and three answers to "what if it cannot be read": purse.json is
+  // the limits and a bad one stops the daemon (above); labels.jsonl is host names and a bad one
+  // costs names; settling.json is the lock and a bad one is assumed to be held. The table is in
+  // purse.ts. On the first start after an upgrade the label store adopts whatever purse.json used
+  // to carry, and purse.json stops carrying it on its next write.
   const labels = Labels.open(join(options.stateDir, "labels.jsonl"), () => purse.legacyLabels);
   const clients = new Set<Socket>();
 
@@ -231,7 +231,16 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
 
   // 0750 on the directory: the group can walk in to reach the sockets, but cannot create or
   // unlink anything, so nobody can delete the socket to force a fallback path.
+  //
+  // The chmod is not redundant. `mkdirSync`'s mode is subject to the umask, and the unit sets
+  // `UMask=0077`, so the mkdir alone would produce 0700 — the group could not reach spend.sock at
+  // all, and the panel would sit on "not permitted" for ever. In production it never gets that
+  // far, because `RuntimeDirectory=chip402` with `RuntimeDirectoryMode=0750` has already created
+  // the directory before node starts and the mkdir is a no-op; the chmod is what makes the
+  // sentence above true off that path too, and a no-op on it. The socket modes five lines below
+  // reason about the umask in exactly the same way and always did.
   mkdirSync(options.runtimeDir, { recursive: true, mode: 0o750 });
+  chmodSync(options.runtimeDir, 0o750);
 
   function bind(name: string, mode: number, plane: Plane): Promise<Server> {
     const path = join(options.runtimeDir, name);
@@ -292,7 +301,7 @@ if (import.meta.main) {
   const daemon = await start({
     configPath: process.env["CHIP402_CONFIG"] ?? "/etc/chip402/config.json",
     stateDir: process.env["STATE_DIRECTORY"] ?? "/var/lib/chip402",
-    runtimeDir: process.env["RUNTIME_DIRECTORY"] ?? "/run/chip402",
+    runtimeDir: process.env["RUNTIME_DIRECTORY"] ?? RUNTIME_DIR,
   });
   console.error(`chip402: listening on ${daemon.spendPath} and ${daemon.adminPath}`);
   for (const signal of ["SIGINT", "SIGTERM"] as const) {

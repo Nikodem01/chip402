@@ -6,15 +6,13 @@
 import { ASSET_KEYS, networkFor } from "../src/networks.ts";
 import type { AssetKey } from "../src/networks.ts";
 import { format } from "../src/money.ts";
-import { open } from "../src/protocol.ts";
+import { open, spendSocket } from "../src/protocol.ts";
 
 // A daemon that is not running, or a socket this uid cannot reach, is an ordinary answer.
 process.on("unhandledRejection", (error: unknown) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exit(1);
 });
-
-const RUNTIME = process.env["CHIP402_RUNTIME_DIR"] ?? "/run/chip402";
 
 type Status = Record<string, any>;
 
@@ -69,7 +67,7 @@ function show(status: Status): void {
 }
 
 const [verb, argument] = process.argv.slice(2);
-const session = await open(`${RUNTIME}/spend.sock`);
+const session = await open(spendSocket());
 
 try {
   if (verb === "status" || verb === undefined) {

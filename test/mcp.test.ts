@@ -116,10 +116,10 @@ function rpc(child: { stdin: NodeJS.WritableStream; stdout: NodeJS.ReadableStrea
   };
 }
 
-test("an agent pays a URL it has never seen, through one MCP tool call", async (t) => {
-  const shop = await seller();
-  t.after(() => shop.close());
-
+// A daemon with the real payment path and a stub where the Hedera key would be, plus bin/mcp.ts
+// in its own process speaking JSON-RPC over stdio. Everything between the agent and the key is
+// the shipping code; only the signature is stubbed.
+async function agentHost(t: { after: (fn: () => unknown) => void }) {
   const dir = scratch();
   // A mirror node of its own, so the figures the agent reads back are derived from a chain the
   // test can inspect rather than from a counter the daemon kept.
@@ -170,6 +170,13 @@ test("an agent pays a URL it has never seen, through one MCP tool call", async (
     clientInfo: { name: "chip402-test", version: "0" },
   });
   client.notify("notifications/initialized");
+  return { client, daemon, mirror, inner };
+}
+
+test("an agent pays a URL it has never seen, through one MCP tool call", async (t) => {
+  const shop = await seller();
+  t.after(() => shop.close());
+  const { client, daemon, mirror, inner } = await agentHost(t);
 
   // Two tools, and neither one can express an admin verb.
   const tools = await client.call("tools/list");
@@ -225,4 +232,79 @@ test("an agent pays a URL it has never seen, through one MCP tool call", async (
   assert.equal(denied["result"].isError, true);
   assert.match((denied["result"].content as { text: string }[])[0]!.text, /per-payment cap/);
   assert.equal(inner.calls(), 1, "a denied call still produced a signature");
+});
+
+// A seller with more to say than the agent's cap allows, in a script where one character is not
+// one byte. Every character here is three bytes in UTF-8, which is what made "bytes" the wrong
+// word for a count of UTF-16 code units.
+async function bulkSeller(characters: number): Promise<{ base: string; body: string; close: () => Promise<void> }> {
+  const body = "こんにちは、世界。".repeat(Math.ceil(characters / 9)).slice(0, characters);
+  const server = createServer((req, res) => {
+    if (!req.headers["payment-signature"]) {
+      res
+        .writeHead(402, {
+          "PAYMENT-REQUIRED": b64({
+            x402Version: 2,
+            resource: { url: "http://127.0.0.1/bulk" },
+            accepts: [
+              {
+                scheme: "exact",
+                network: testnet.caip2,
+                asset: testnet.assets.usdc.id,
+                amount: "20000",
+                payTo: SELLER,
+                maxTimeoutSeconds: 60,
+                extra: { feePayer: FACILITATOR },
+              },
+            ],
+          }),
+        })
+        .end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" }).end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    base: `http://127.0.0.1:${port}`,
+    body,
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+test("the cap on what comes back is bytes, and the number the agent is handed is bytes too", async (t) => {
+  // `MAX_RETURNED_BYTES` was applied with `slice`, which counts UTF-16 code units — so a body in
+  // any non-Latin script came back well over the stated cap, and "N of M bytes withheld" was a
+  // count of something else. The wire is capped at a megabyte by fetch.ts either way, so nothing
+  // was at risk; a number handed to a model should still be the number it is called.
+  const shop = await bulkSeller(120_000);
+  t.after(() => shop.close());
+  const wire = Buffer.byteLength(shop.body, "utf8");
+  assert.ok(wire > 256 * 1024, "the fixture does not reach the cap in bytes");
+  assert.ok(shop.body.length < 256 * 1024, "the fixture would also be truncated by a count of characters");
+
+  const { client } = await agentHost(t);
+  const paid = await client.call("tools/call", { name: "pay", arguments: { url: `${shop.base}/bulk` } });
+  const blocks = paid["result"].content as { type: string; text: string }[];
+  assert.equal(paid["result"].isError, undefined);
+
+  const returned = Buffer.byteLength(blocks[1]!.text, "utf8");
+  assert.ok(returned <= 256 * 1024, `the cap let ${returned} bytes through`);
+  // Cut on a character boundary, not through one: no replacement character, and the text that did
+  // come back is a prefix of what the seller sent.
+  assert.ok(!blocks[1]!.text.includes("�"), "the block ends in half a character");
+  assert.ok(shop.body.startsWith(blocks[1]!.text), "what came back is not the start of what was paid for");
+  // At most three bytes are given up to land on that boundary.
+  assert.ok(returned > 256 * 1024 - 4, `${256 * 1024 - returned} bytes were given up to a boundary`);
+
+  // And the notice counts the same unit it names, both halves of it.
+  const notice = /TRUNCATED: (\d+) of (\d+) bytes withheld/.exec(blocks[2]!.text);
+  assert.ok(notice, `no truncation notice: ${blocks[2]!.text}`);
+  assert.equal(Number(notice[2]), wire, "the total is not the byte count");
+  assert.equal(Number(notice[1]), wire - returned, "the withheld figure is not the byte count");
 });

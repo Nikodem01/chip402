@@ -3,6 +3,26 @@
 // is which socket accepted the connection — see daemon.ts.
 
 import { connect } from "node:net";
+import { join } from "node:path";
+
+// Where the two sockets live, written down once. It was written down five times — daemon.ts,
+// both CLIs, the MCP server and ui/Purse.qml — four of them as `CHIP402_RUNTIME_DIR ?? "/run/…"`,
+// which is consistent by copying rather than by construction. The QML copy cannot import this and
+// is still its own literal; `test/planes.test.ts` checks it against this one rather than trusting
+// that nobody moved the directory.
+//
+// The daemon reads systemd's RUNTIME_DIRECTORY instead, because systemd is what creates the
+// directory and it is not this constant's job to second-guess where it put it — but it falls back
+// here, so there is still only one path spelled out.
+export const RUNTIME_DIR = "/run/chip402";
+
+// The override exists for the tests and for running a daemon out of a checkout. It is read from
+// the environment of whatever is *connecting*, never from anything the daemon is told, so it can
+// only ever point a client somewhere else — it cannot move the daemon's own sockets.
+export const runtimeDir = (): string => process.env["CHIP402_RUNTIME_DIR"] ?? RUNTIME_DIR;
+
+export const spendSocket = (): string => join(runtimeDir(), "spend.sock");
+export const adminSocket = (): string => join(runtimeDir(), "admin.sock");
 
 // Anything running as me reaches these: my shell, my agents, the panel. Read the purse, buy
 // something inside the caps, and hit the big red button.

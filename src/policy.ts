@@ -10,6 +10,7 @@
 
 import type { Asset, NetworkRow } from "./networks.ts";
 import { assetFor } from "./networks.ts";
+import { ENTITY_ID } from "./ids.ts";
 import type { PurseState } from "./purse.ts";
 
 // What the seller asked for, already pulled out of the 402 by the caller. `finalUrl` is the URL
@@ -53,9 +54,6 @@ export function dayEnd(now: number): number {
   at.setHours(24, 0, 0, 0);
   return at.getTime();
 }
-
-// Hedera account and token ids look like 0.0.1234, and nothing else does.
-const ENTITY_ID = /^\d+\.\d+\.\d+$/;
 
 // The one exception to "https only": the demo seller runs on the loopback interface, where
 // there is no network path for anyone to inject a 402 on.

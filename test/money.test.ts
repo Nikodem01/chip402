@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MAX_UNITS, digits, format, parse, parseUnits } from "../src/money.ts";
-import { NETWORKS } from "../src/networks.ts";
+import { ASSET_KEYS, NETWORKS } from "../src/networks.ts";
 
 const testnet = NETWORKS["hedera:testnet"]!;
 const usdc = testnet.assets.usdc;
@@ -71,4 +71,50 @@ test("no exported function in money.ts takes two assets at once", () => {
     const assets = (signature[1]?.match(/:\s*Asset\b/g) ?? []).length;
     assert.ok(assets <= 1, `two assets in one signature: ${signature[0]}`);
   }
+});
+
+// --- the same rule, in the other language -------------------------------------------------------
+
+test("the panel formats money exactly as money.ts does", () => {
+  // `digits()`/`format()` here and `money()` in ui/Purse.qml implement one trimming rule twice,
+  // because QML cannot import TypeScript. The duplication is unavoidable; the drift is not. The
+  // QML function is ordinary ECMAScript, so it is lifted out of the shipping file and run against
+  // the shipping formatter over the values where the two could plausibly disagree.
+  const qml = readFileSync(new URL("../ui/Purse.qml", import.meta.url), "utf8");
+  const source = /\n  function money\(units, asset\) \{\n([\s\S]*?)\n  \}\n/.exec(qml);
+  assert.ok(source, "ui/Purse.qml no longer has a money() to compare against");
+  // eslint-disable-next-line no-new-func -- the point of this test is to run the panel's own code
+  const panelMoney = new Function("units", "asset", source[1]!) as (units: unknown, asset: unknown) => string;
+
+  // The asset as it crosses the socket: the panel is handed the decimals and the symbol and never
+  // hardcodes either, so this is the same object `snapshot` sends.
+  const wire = (asset: (typeof testnet.assets)["usdc"]) => ({
+    decimals: asset.decimals,
+    minDisplayDecimals: asset.minDisplayDecimals,
+    prefix: asset.prefix,
+  });
+
+  const interesting = [
+    0n, 1n, 9n, 10n, 99n, 100n, 999n, 1_000n, 9_999n, 10_000n, 100_000n,
+    350_000n, 1_000_000n, 1_600_000n, 2_000_000n, 12_500_000n, 17_150_000n,
+    99_999_999n, 100_000_000n, 2_500_000_000n, 51_347_384n, 999_999_999_999n,
+  ];
+  for (const key of ASSET_KEYS) {
+    const asset = testnet.assets[key];
+    for (const units of interesting) {
+      assert.equal(
+        panelMoney(units.toString(), wire(asset)),
+        format(units, asset),
+        `${key} disagrees at ${units} base units`,
+      );
+    }
+    // And the two shapes the socket can legitimately hand the panel where there is no number yet.
+    assert.equal(panelMoney(undefined, wire(asset)), format(0n, asset));
+    assert.equal(panelMoney(null, wire(asset)), format(0n, asset));
+  }
+  // The four the review checked by hand, spelled out so a reader can see they are the ones meant.
+  assert.equal(format(0n, testnet.assets.usdc), "$0.00");
+  assert.equal(format(350_000n, testnet.assets.usdc), "$0.35");
+  assert.equal(format(0n, testnet.assets.hbar), "ℏ0");
+  assert.equal(format(1_250_000_000n, testnet.assets.hbar), "ℏ12.5");
 });

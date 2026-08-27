@@ -10,7 +10,7 @@ import type { Network, PaymentRequirements } from "@x402/fetch";
 import type { AssetKey } from "./networks.ts";
 import { assetFor } from "./networks.ts";
 import type { Ledger } from "./chain.ts";
-import { VALID_DURATION_MS, readLedger, transactionSeen, validStartOf } from "./chain.ts";
+import { readLedger, transactionSeen, validStartOf } from "./chain.ts";
 import { digits, parseUnits } from "./money.ts";
 import { dayStart, decide } from "./policy.ts";
 import type { PolicyConfig } from "./policy.ts";
@@ -133,10 +133,45 @@ export function guard(
       );
       if (!decision.ok) throw new Error(DENIED + decision.reason);
 
+      // SECURITY: the lane closes on the way to the key, not on the way back — and it is written
+      // to disk here, before anything is signed. Both halves matter and they are the same fix.
+      //
+      // Durable, because the daemon that has to honour this lock may not be this one. `settling`
+      // used to live only in memory, so a restart between the signature and the mirror node
+      // catching up came back with the lane open and authorised a second payment against a ledger
+      // that did not yet contain the first — demonstrated end to end, and reachable by anyone who
+      // could `systemctl restart chip402` inside the indexing window, or by `Restart=on-failure`
+      // after a crash.
+      //
+      // Before, because a write that cannot be made has to be a refusal rather than a surprise.
+      // Taken here it is a denial with nothing signed; taken after the signature it would be a
+      // payment that has already been authorised failing on a file operation, which is the exact
+      // shape of bug the label store was rewritten to make impossible. The id is not known yet, so
+      // this first lock carries none — `now` is a deliberate over-estimate of the deadline, since
+      // the SDK generates validStart three to eight seconds in the *past*, and the refinement
+      // below replaces it with the truth.
+      try {
+        purse.beginSettling(null, now);
+      } catch {
+        throw new Error(DENIED + "the settling lock could not be written");
+      }
+
       // Set before the key is reached, not after. Whatever the signer then does — returns,
       // throws, hangs — this payment has had its one signature.
       signed = true;
-      const payload = await inner.createPartiallySignedTransferTransaction(requirements);
+      let payload: string;
+      try {
+        payload = await inner.createPartiallySignedTransferTransaction(requirements);
+      } catch (error) {
+        // The signer builds and signs locally and returns the bytes; there is no network in it.
+        // A throw therefore means no payload was produced, so nothing can have left this process
+        // — the caller submits what it is handed, and it was handed an exception. Releasing the
+        // lane here is what keeps a signer that refuses a malformed request from costing two
+        // minutes of denial per attempt. Anything that could return bytes *and* throw would have
+        // to release them itself, and there is no such path.
+        purse.finishSettling();
+        throw error;
+      }
 
       // The transaction id out of the bytes we just signed. It is in the signed body, so the
       // facilitator cannot change it and the seller never gets a say in what it is. This is the
@@ -146,12 +181,21 @@ export function guard(
       try {
         txId = inspectHederaTransaction(payload).transactionId ?? null;
       } catch {
-        // Bytes we cannot read back are bytes we cannot ask the chain about. The lane still
-        // closes below — with no id, only the clock can reopen it, which is the fail-closed
-        // reading of "we do not know what we just signed".
+        // Bytes we cannot read back are bytes we cannot ask the chain about. The lane is already
+        // shut — with no id, only the clock can reopen it, which is the fail-closed reading of
+        // "we do not know what we just signed".
       }
       const validStart = txId === null ? null : validStartOf(txId);
-      purse.beginSettling(txId, validStart ?? now);
+      try {
+        // Name it, so the chain can end the wait rather than only the clock. This second write
+        // moves the deadline to the one measured from `validStart`, which is *earlier* than
+        // the one above, so a failure here leaves a lock that is honoured for a few seconds longer
+        // than it needed to be — a denial, never an extra payment, which is why this one is
+        // allowed to fail and the first one is not.
+        purse.beginSettling(txId, validStart ?? now);
+      } catch {
+        // Deliberately nothing. See above.
+      }
 
       // The host is recorded by the caller, not here — see payer(). The guard is about the key
       // and the decision; a display label is neither, and does not belong on the same side of
@@ -167,21 +211,40 @@ export function guard(
 // it does. Two exits and no third: the chain has it, or the chain can never have it. Giving up
 // on patience is not an exit — it leaves the lane closed and lets policy.ts deny until one of
 // the two real answers arrives.
+//
+// The boolean is the receipt's `onChain`, and it is a claim about the chain rather than about who
+// asked it. That distinction is load-bearing: `pollChain` runs every 60 s and is *not* serialized
+// against a payment in flight — `inLane` wraps `pay`, not the poll — so a refresh landing between
+// the signature and this call can clear the lane first. This used to return `false` there and put
+// `onChain: false` on a receipt for a payment that had settled a moment earlier. The ledger was
+// right either way, but the receipt was not, and a receipt that lies in the pessimistic direction
+// is still a receipt that lies. So when the lane is open and this call did not open it, the
+// question goes to the mirror node instead of to the lock.
 export async function settle(
   config: PolicyConfig,
   purse: Purse,
   txId: string | null,
   patienceMs: number = SETTLE_WAIT_MS,
 ): Promise<boolean> {
-  const settling = purse.state.settling;
-  if (settling === null) return false;
   const giveUpAt = Date.now() + patienceMs;
   for (;;) {
+    const settling = purse.state.settling;
+    if (settling === null) {
+      // Somebody else ended the wait: `refresh()` from the chain-poll loop, or the clock inside
+      // it. Ask the chain what actually happened. An id we never read back, or a mirror node that
+      // will not answer, is reported as "not seen" — the honest reading of the one thing this
+      // field claims.
+      if (txId === null) return false;
+      return transactionSeen(config.network, txId).catch(() => false);
+    }
     const now = Date.now();
     if (now >= settling.deadline) {
-      // validStart + TransactionValidDuration has passed: Hedera will not accept it now, so it
-      // is not "not yet", it is "never". Nothing is given back because nothing was taken — a
-      // payment that never settled simply never appears in the chain's sum.
+      // validStart + TransactionValidDuration has passed, *and* the margin the mirror node is
+      // allowed to be behind that. Hedera will not accept the transaction now and the mirror has
+      // had long enough to start showing it if it ever will, so it is not "not yet", it is "never".
+      // Those are two different instants and the lock waits for the later one — see
+      // INDEXING_MARGIN_MS. Nothing is given back because nothing was taken: a payment that never
+      // settled simply never appears in the chain's sum.
       purse.finishSettling();
       return false;
     }
@@ -216,13 +279,16 @@ export async function refresh(
       purse.finishSettling();
     }
   }
-  const now = Date.now();
-  const since = dayStart(now);
-  // A transaction signed just before midnight settles just after it, so the window we search for
-  // an in-flight id reaches back past the window we sum. Only rows at or after local midnight
-  // are counted as today's spending; the extra reach is for looking, not for adding.
-  const from = purse.state.settling === null ? since : Math.min(since, now - VALID_DURATION_MS);
-  return readLedger(config.network, config.accountId, publicKeyHex, evmAddress, since, from);
+  // Local midnight, and nothing earlier. This used to widen the window to `now - 120 s` whenever
+  // something was settling, on the theory that a transaction signed just before midnight has to be
+  // looked for in yesterday too — but nothing ever looked. `readLedger` hands its rows to
+  // `paymentsIn`, which drops every row before `since`, and the in-flight question is asked by
+  // `transactionSeen` above: a direct lookup of one id, which has no window at all. So the reach
+  // back fetched rows only to throw them away, and every one of them counted against the page
+  // bound that chain.ts's fallback exists to keep us under. A payment signed at 23:59:30 that
+  // reaches consensus at 00:00:02 is in today's window on its own merits, because the chain dates
+  // it by consensus and not by signature.
+  return readLedger(config.network, config.accountId, publicKeyHex, evmAddress, dayStart(Date.now()));
 }
 
 export type Wallet = {
@@ -268,8 +334,10 @@ export function payer(
     let charged: Receipt | null = null;
     const signer = guard(inner, purse, config, seen, (receipt) => {
       charged = receipt;
-      // One short append, the moment the transaction id and the host are both known. It cannot
-      // fail a payment: the store's whole contract is that losing it costs names and nothing else.
+      // One short append, the moment the transaction id and the host are both known. This runs
+      // after the signature, so it must not be able to fail a payment that has already been
+      // authorised — every write in labels.ts is best-effort for exactly that reason, and the
+      // store's whole contract is that losing it costs names and nothing else.
       labels.record(receipt.txId, receipt.host);
     });
 
@@ -315,6 +383,8 @@ export function payer(
     // The seller's PAYMENT-RESPONSE header is not read at all, here or anywhere. It used to
     // supply the transaction id on a receipt; the id in the bytes we signed is the same id and
     // is not the seller's to write, so a whole class of seller-controlled input is simply gone.
+    //
+    // `onChain` is the mirror node's answer and not this process's memory — see settle().
     if (charged !== null) {
       const receipt = charged as Receipt;
       receipt.onChain = await settle(config, purse, receipt.txId, patienceMs);
@@ -335,7 +405,23 @@ export function payer(
   };
 }
 
-export function openWallet(config: PolicyConfig, purse: Purse, labels: Labels): Wallet {
+// SECURITY: the anti-brick counter's two numbers. A mismatch has to be read three times, a minute
+// apart, before it stops payment — so a mirror node having a bad minute, or an account mid-update,
+// costs nothing. Anything we could not parse never gets here at all: readKeyMatch returns null for
+// it, and null resets the count exactly like a match does.
+//
+// The gap is a parameter of `openWallet` for the same reason `patienceMs` is one of `payer`: a test
+// that had to wait two real minutes to reach the third reading would not be written. Nothing reads
+// it from a config file, so there is no setting an attacker could widen.
+const STRIKE_GAP_MS = 60_000;
+const STRIKES_TO_DENY = 3;
+
+export function openWallet(
+  config: PolicyConfig,
+  purse: Purse,
+  labels: Labels,
+  strikeGapMs: number = STRIKE_GAP_MS,
+): Wallet {
   // The key is read once, from the tmpfs systemd decrypted the TPM2-sealed credential into. It
   // lives in this closure and is never stored on the Wallet object, so nothing that holds a
   // wallet holds a key.
@@ -367,27 +453,21 @@ export function openWallet(config: PolicyConfig, purse: Purse, labels: Labels): 
     // An id we cannot checksum is still an id; the panel just shows it bare.
   }
 
-  // SECURITY: the anti-brick counter. A mismatch has to be read three times, a minute apart,
-  // before it stops payment — so a mirror node having a bad minute, or an account mid-update,
-  // costs nothing. Anything we could not parse never gets here at all: readKeyMatch returns
-  // null for it, and null resets the count exactly like a match does.
-  const STRIKE_GAP_MS = 60_000;
-  const STRIKES_TO_DENY = 3;
   let strikes = 0;
   let lastStrike = 0;
 
   const observe = (ledger: Ledger): void => {
+    // The counter counts *readings*, so it must not advance on one the purse refuses as overtaken
+    // — see Purse.observe. Work out what this reading would do to the count, offer it, and keep the
+    // answer only if it was taken; otherwise three "different key" readings could be one reading
+    // arriving three times out of order.
+    const disagrees = ledger.verified === false;
+    const counts = disagrees && (strikes === 0 || ledger.at - lastStrike >= strikeGapMs);
+    const nextStrikes = disagrees ? (counts ? strikes + 1 : strikes) : 0;
+    if (!purse.observe(ledger, nextStrikes >= STRIKES_TO_DENY)) return;
     verified = ledger.verified;
-    if (ledger.verified === false) {
-      if (strikes === 0 || ledger.at - lastStrike >= STRIKE_GAP_MS) {
-        strikes++;
-        lastStrike = ledger.at;
-      }
-    } else {
-      strikes = 0;
-      lastStrike = 0;
-    }
-    purse.observe(ledger, strikes >= STRIKES_TO_DENY);
+    strikes = nextStrikes;
+    lastStrike = disagrees ? (counts ? ledger.at : lastStrike) : 0;
   };
 
   const refreshChain = async (): Promise<void> => {

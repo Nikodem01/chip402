@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 // The privileged CLI. It is installed root-owned to /usr/local/bin/chip402ctl and is the only
 // thing sudo and polkit will run, so an agent cannot rewrite it and wait for me to type a
-// password. Everything here either reaches the admin socket or is `setup`, which is the one
-// place in the whole project that submits a transaction to Hedera.
+// password. Three kinds of thing live here and nothing else: the admin verbs, which reach the
+// admin socket; `setup`, the one place in the whole project that submits a transaction to Hedera;
+// and `start`, which execs `systemctl start chip402` and moves nothing — it is routed through this
+// binary only so that the panel's START button raises a polkit dialog that names chip402 instead
+// of the generic "run a program as another user". See the comment on that branch.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -16,7 +19,13 @@ import {
 } from "@x402/hedera";
 import { networkFor } from "../src/networks.ts";
 import type { NetworkRow } from "../src/networks.ts";
-import { open } from "../src/protocol.ts";
+// SECURITY-adjacent, and mostly a kindness: importing a key that does not control the account
+// you named produces a purse that looks fine and cannot pay for anything, with no explanation.
+// Say so here instead. It lives beside the daemon's own key check, and the comment there sets
+// out why the two answer an unrecognised key shape differently on purpose.
+import { controlsAccount } from "../src/chain.ts";
+import type { ChainAccount } from "../src/chain.ts";
+import { adminSocket, open } from "../src/protocol.ts";
 
 // A daemon that is not running, or a socket this uid cannot reach, is an ordinary answer.
 process.on("unhandledRejection", (error: unknown) => {
@@ -24,7 +33,6 @@ process.on("unhandledRejection", (error: unknown) => {
   process.exit(1);
 });
 
-const RUNTIME = process.env["CHIP402_RUNTIME_DIR"] ?? "/run/chip402";
 const CONFIG = process.env["CHIP402_CONFIG"] ?? "/etc/chip402/config.json";
 const STATE = "/var/lib/chip402";
 // Hedera's fee-collection account. Completion needs the new account to pay for one transaction
@@ -42,7 +50,7 @@ if (process.geteuid?.() !== 0) {
 const [verb, ...rest] = process.argv.slice(2);
 
 async function admin(frame: Record<string, unknown>): Promise<void> {
-  const session = await open(`${RUNTIME}/admin.sock`);
+  const session = await open(adminSocket());
   try {
     const reply = await session.ask(frame);
     if (reply["ok"] !== true) {
@@ -167,17 +175,6 @@ async function mirrorAccountsByKey(network: NetworkRow, publicKeyHex: string): P
   return ((await response.json()) as { accounts?: Record<string, any>[] }).accounts ?? [];
 }
 
-// SECURITY-adjacent, and mostly a kindness: importing a key that does not control the account
-// you named produces a purse that looks fine and cannot pay for anything, with no explanation.
-// Say so here instead.
-function keyControls(account: Record<string, any>, publicKeyHex: string, evmAddress: string | null): boolean {
-  const onChain = String(account["key"]?.["key"] ?? "").toLowerCase();
-  if (onChain && onChain === publicKeyHex.toLowerCase()) return true;
-  // A hollow account has no key on record yet; its alias is the proof instead.
-  const alias = String(account["evm_address"] ?? "").toLowerCase().replace(/^0x/, "");
-  return evmAddress !== null && alias === evmAddress.toLowerCase();
-}
-
 // Find the account this key already controls. Given an id, verify it; given none, discover it —
 // so "I think I still have that testnet account somewhere" is one command and no homework.
 async function resolveImported(network: NetworkRow, key: PrivateKey, wanted: string | null): Promise<string> {
@@ -195,7 +192,7 @@ async function resolveImported(network: NetworkRow, key: PrivateKey, wanted: str
   if (wanted) {
     const account = found.get(wanted) ?? (await mirror(network, wanted));
     if (!account) throw new Error(`${wanted} does not exist on ${network.label}`);
-    if (!keyControls(account, publicKeyHex, evmAddress)) {
+    if (!controlsAccount(account as ChainAccount, publicKeyHex, evmAddress)) {
       throw new Error(`that key does not control ${wanted} — chip402 would never be able to pay from it`);
     }
     return wanted;

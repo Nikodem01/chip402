@@ -1,16 +1,35 @@
-// Two file operations that have to be paranoid: reading the key, and writing the purse. Both
-// are short, because the paranoia is in the flags rather than in the logic.
+// The file operations that have to be paranoid, and they come in two kinds. The strict ones —
+// `readSecret` for the key, `writeAtomic` and `readJson` for the purse and the settling lock —
+// refuse rather than guess, because "I could not read the limits" must never become "there are no
+// limits". The forgiving ones — `appendLine` and `readTail` for the host names, and `removeFile`
+// for releasing the lock — have the opposite contract: they degrade and never refuse, because
+// what they carry is decoration or a lane that was reopening anyway. All of them are short,
+// because the paranoia is in the flags rather than in the logic.
 
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, rmSync, writeSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 // A Hedera private key is well under this. The cap is here so that pointing this function at a
 // large file is a refusal rather than a memory spike.
 const MAX_SECRET_BYTES = 4096;
 
-// systemd decrypts the TPM2-sealed credential into this directory — a read-only tmpfs,
-// dr-x------, owned by the service user. Plaintext never touches disk, and the path is not
-// configurable: there is no setting an attacker could point at a key they supplied.
+// systemd decrypts the TPM2-sealed credential into this directory. Plaintext never touches disk —
+// it is a read-only tmpfs — and the path is not configurable: there is no setting an attacker
+// could point at a key they supplied.
+//
+// Exactly what it looks like, because two comments in this file used to describe it differently
+// and only one of them was right. Measured on the running unit:
+//
+//   $ findmnt -no FSTYPE,OPTIONS /run/credentials/chip402.service
+//   tmpfs  ro,nosuid,nodev,noexec,relatime,nosymfollow,size=1024k,mode=700
+//   $ getfacl -p /run/credentials/chip402.service
+//   # owner: root      user::r-x      user:chip402:r-x
+//   # group: root      group::---     mask::r-x      other::---
+//
+// So: owned by **root**, POSIX bits `dr-x------`, and the service user reaches it through an ACL
+// entry rather than through ownership. `ls -ld` renders that as `dr-xr-x---+`, because the group
+// field of a file with an ACL shows the mask and not the group bits — which is the whole reason
+// the mode check below skips the group bit. uid 1000 cannot open the directory at all.
 export function credentialPath(name: string): string {
   const dir = process.env["CREDENTIALS_DIRECTORY"];
   if (!dir) {
@@ -27,11 +46,13 @@ export function readSecret(path: string): string {
     const info = fstatSync(fd);
     if (!info.isFile()) throw new Error(`${path} is not a regular file`);
     // SECURITY: world-readable is the thing that must never be true. The group bit deliberately
-    // is not checked, because systemd lays a credential out as 0440 root:root plus an ACL
-    // granting the service user read — and an ACL shows up in the group class of the mode, so a
-    // `mode & 0o077` test reads that as "readable by others" and refuses to start. The real
-    // boundary is the directory systemd decrypts into: 0550 root:root on a tmpfs, with the same
-    // ACL. Nothing outside this uid can reach either.
+    // is not checked, because systemd lays a credential out root-owned plus an ACL granting the
+    // service user read — and an ACL puts its mask in the group class of the mode, so a
+    // `mode & 0o077` test reads that as "readable by others" and refuses to start against a
+    // perfectly correct credential. The real boundary is the directory systemd decrypts into,
+    // described above: a read-only tmpfs, `dr-x------` root-owned with the same kind of ACL, which
+    // nothing outside this uid can open. `test/safe.test.ts` pins both directions — a world bit
+    // refuses, a group bit does not.
     if ((info.mode & 0o007) !== 0) throw new Error(`${path} is world-readable`);
     const uid = process.getuid?.() ?? -1;
     if (info.uid !== 0 && info.uid !== uid) throw new Error(`${path} is owned by neither root nor this service`);
@@ -58,9 +79,11 @@ function flush(fd: number): void {
   }
 }
 
-// The purse is the record of what has already been spent. A half-written one after a crash would
-// either lose spending — free money for the agent — or invent it, so it is never written in
-// place: whole file to a temp name, flush, then a rename the kernel performs atomically.
+// The purse is the record of the limits — what may be spent, not what has been. A half-written
+// one after a crash would either lose a limit somebody set or invent one nobody did, and
+// purse.ts refuses to start on a file it cannot parse, so a torn write is a machine that will not
+// come back up. It is therefore never written in place: whole file to a temp name, flush, then a
+// rename the kernel performs atomically.
 export function writeAtomic(path: string, data: string, mode = 0o600): void {
   const temp = `${path}.tmp`;
   const fd = openSync(temp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, mode);
@@ -78,6 +101,20 @@ export function writeAtomic(path: string, data: string, mode = 0o600): void {
     flush(dir);
   } finally {
     closeSync(dir);
+  }
+}
+
+// Take a file away, and never mind if it is not there or will not go. The only caller is the
+// settling lock's release, and the ordering there is deliberate: the lane is already open in
+// memory by the time this runs, so a removal that fails costs the *next* daemon a lane held until
+// the clock opens it — a denial for at most a lock duration, never a payment. Refusing
+// here would turn that into a thrown error on the path that has just finished a payment, which is
+// the failure this project spent a whole file avoiding.
+export function removeFile(path: string): void {
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    // Deliberately nothing. See above.
   }
 }
 

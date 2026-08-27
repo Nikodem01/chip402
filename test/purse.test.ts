@@ -3,13 +3,21 @@
 // any, and the labels that do survive cannot reach a number.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Purse, snapshot } from "../src/purse.ts";
 import { dayEnd } from "../src/policy.ts";
-import { NOW, labelStore, ledger, scratch, testnet } from "./support.ts";
+import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "../src/chain.ts";
+
+// How long a lock may last: the chain's own validity window plus the margin the mirror node is
+// allowed to be behind it. Taken from the constants rather than written out, so the two cannot
+// drift apart the way a hand-copied 120_000 would.
+const LOCK_DURATION = VALID_DURATION_MS + INDEXING_MARGIN_MS;
+import { NOW, OUR_EVM_ADDRESS, OUR_PUBLIC_KEY, OUR_ACCOUNT, fakeMirror, labelStore, ledger, scratch, sleep, testnet } from "./support.ts";
+import { refresh } from "../src/wallet.ts";
+import { dayStart } from "../src/policy.ts";
 
 function open(dir: string): Purse {
   return Purse.open(join(dir, "purse.json"));
@@ -81,13 +89,125 @@ test("nothing restored from disk carries a fact about the chain", () => {
   const purse = open(dir);
   purse.setLimit("usdc", "allowance", 2_000_000n);
   purse.observe(ledger({ spent: { usdc: 999_000n, hbar: 0n } }), true);
-  purse.beginSettling("0.0.9185802@1.0", Date.now());
+  purse.beginSettling("0.0.9185802@1800000000.0", Date.now());
 
   const reloaded = open(dir);
   assert.equal(reloaded.state.usdc.allowance, 2_000_000n, "the limit is policy and survives");
   assert.equal(reloaded.state.ledger, null, "a restarted daemon must ask the chain again");
   assert.equal(reloaded.state.mismatch, false);
-  assert.equal(reloaded.state.settling, null);
+
+  // The lock does survive — that is B12 — and it is the one exception, so it is worth saying
+  // exactly what it is allowed to carry. A transaction id and a deadline: what we authorised and
+  // when it stops being able to happen. Not what it moved, not whether it did, not a balance and
+  // not a running total. Every number the chain owns is still asked for again.
+  const settling = reloaded.state.settling as Record<string, unknown> | null;
+  assert.notEqual(settling, null, "a restart handed back the allowance");
+
+  // Read off the *file*, not off `state.settling`. That distinction is the whole assertion:
+  // `readLock` builds a fresh `{ txId, deadline }` whatever it finds, so checking the object's key
+  // set proves only that readLock is readLock. Adding a `units` field to what `beginSettling`
+  // writes left the entire suite green — an amount reaching disk and surviving a restart, with the
+  // one test that exists to forbid it passing. The word list below is a second net, not the net.
+  const onDisk = readFileSync(join(dir, "settling.json"), "utf8");
+  const written = JSON.parse(onDisk) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(written).sort(), ["deadline", "txId"], "the lock file grew a field");
+  assert.equal(typeof written["txId"], "string");
+  assert.equal(typeof written["deadline"], "number");
+  assert.doesNotMatch(onDisk, /amount|spent|balance|usdc|hbar|paid|settled/i, "the lock is a ledger");
+  assert.ok(onDisk.length < 120, "the lock is bigger than a lock needs to be");
+});
+
+test("SECURITY: a reading that was overtaken cannot displace the one that overtook it", async (t) => {
+  // The invariant the settling lock protects, reached from the other side — after the lock has
+  // legitimately opened. `refresh` has three callers and nothing orders them: the chain-poll loop,
+  // which is deliberately outside the payment lane, and both ends of a payment. So the last to
+  // *complete* used to win rather than the last to start, and a read issued before a payment
+  // settled could displace one issued after it — arriving with a timestamp seconds old and a
+  // `spent` that predates the payment. Every check in `decide` passes on that, and the day's
+  // allowance is charged once for two payments.
+  //
+  // Both halves are needed and both are exercised here: `Ledger.at` is stamped when the requests go
+  // out rather than when they land, and `observe` refuses a reading older than the one it holds.
+  const mirror = await fakeMirror();
+  t.after(() => mirror.close());
+  const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
+  const purse = open(scratch());
+
+  // One reading issued now, with the balances leg held back so it cannot land for a while.
+  mirror.accountsDelayMs = 500;
+  const overtaken = refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
+  await sleep(80);
+
+  // A payment settles, and a second reading is issued and served while the first is still in the
+  // air. This is the one that tells the truth.
+  mirror.accountsDelayMs = 0;
+  mirror.record("0.0.9185802@1800000042.0", "usdc", 10_000n, dayStart(Date.now()) + 1_000);
+  const current = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
+  assert.equal(current.spent.usdc, 10_000n, "the fixture did not produce a reading that saw the payment");
+  assert.equal(purse.observe(current, false), true);
+
+  // And now the first one lands, later, knowing less.
+  const stale = await overtaken;
+  assert.equal(stale.spent.usdc, 0n, "the fixture did not produce an overtaken reading");
+  assert.ok(stale.at < current.at, "`at` is stamped on arrival, so a slow read looks fresher than it is");
+  assert.equal(purse.observe(stale, false), false, "a reading issued earlier displaced a newer one");
+  assert.equal(purse.state.ledger?.spent.usdc, 10_000n, "the purse forgot a payment that had settled");
+});
+
+test("the lock the restart honours is the lock, and nothing longer", () => {
+  // The restored deadline is the one thing a corrupt file could use to wedge the purse for ever,
+  // so it is clamped rather than trusted: a genuine deadline is `validStart + 120s` and validStart
+  // is always in the past by the time it is written, so anything past `now + 120s` is damage.
+  const dir = scratch();
+  const lock = join(dir, "settling.json");
+  const far = Date.now() + 400 * 24 * 3600 * 1000;
+  writeFileSync(lock, JSON.stringify({ txId: "0.0.9185802@1800000000.0", deadline: far }));
+  const held = open(dir).state.settling!;
+  assert.ok(held.deadline <= Date.now() + LOCK_DURATION, "a garbled deadline wedged the purse");
+  assert.ok(held.deadline > Date.now());
+
+  // And a deadline that has already passed is not a lock at all: the transaction can no longer
+  // reach consensus, which is the same exit the running daemon takes on the clock.
+  writeFileSync(lock, JSON.stringify({ txId: "0.0.9185802@1800000000.0", deadline: Date.now() - 1 }));
+  assert.equal(open(dir).state.settling, null, "an expired lock outlived the transaction it named");
+});
+
+test("a lock we cannot read is a lock we honour", () => {
+  // Fail-closed, and bounded: the file is unreadable, so we do not know whether anything is in
+  // flight — and "assume nothing is" is the reading that authorises a second payment. Holding
+  // costs at most TransactionValidDuration of denial, after which the clock opens the lane with
+  // no file involved at all.
+  for (const damage of ["{ not json", '"a string"', "", "[1,2,3]", '{"txId":"0.0.1@1.0"}', '{"deadline":"soon"}']) {
+    const dir = scratch();
+    writeFileSync(join(dir, "settling.json"), damage);
+    const held = open(dir).state.settling;
+    assert.notEqual(held, null, `damage was read as "nothing in flight": ${JSON.stringify(damage)}`);
+    assert.ok(held!.deadline > Date.now() && held!.deadline <= Date.now() + LOCK_DURATION);
+    // With no id, only the clock can end it — there is nothing to ask the chain about.
+    assert.equal(held!.txId, null);
+  }
+});
+
+test("releasing the lock takes the file with it", () => {
+  const dir = scratch();
+  const purse = open(dir);
+  purse.beginSettling("0.0.9185802@1800000000.0", Date.now());
+  assert.ok(existsSync(join(dir, "settling.json")));
+  purse.finishSettling();
+  assert.equal(existsSync(join(dir, "settling.json")), false, "a released lock still shuts the next daemon's lane");
+  assert.equal(open(dir).state.settling, null);
+});
+
+test("the lock cannot be taken at all if it cannot be written down", () => {
+  // A lock only this process remembers is not a lock. `beginSettling` therefore writes first and
+  // sets the field second, and it is allowed to throw — wallet.ts takes it before it reaches the
+  // key precisely so that this is a refusal to pay rather than a payment that has already been
+  // signed failing on a file operation.
+  const dir = scratch();
+  const purse = open(dir);
+  mkdirSync(join(dir, "settling.json.tmp"));      // writeAtomic cannot create its temp file
+  assert.throws(() => purse.beginSettling("0.0.9185802@1800000000.0", Date.now()));
+  assert.equal(purse.state.settling, null, "the lane closed on a lock that was never written");
 });
 
 test("upgrading from the old build keeps the host names and nothing else", () => {
@@ -144,8 +264,12 @@ test("the lane closes on a signature and only the chain or the clock opens it", 
   purse.beginSettling("0.0.9185802@1800000000.0", validStart);
   const settling = purse.state.settling as { txId: string | null; deadline: number } | null;
   assert.equal(settling?.txId, "0.0.9185802@1800000000.0");
-  // 120 seconds, because that is Hedera's TransactionValidDuration and not a number we chose.
-  assert.equal(settling?.deadline, validStart + 120_000);
+  // 120 seconds because that is Hedera's TransactionValidDuration and not a number we chose, plus
+  // the indexing margin — the gap between "the chain can no longer accept it" and "the mirror node
+  // can no longer start showing it". Releasing at 120 s exactly would open the lane for the second
+  // or three a transaction submitted at the very end of its window takes to appear.
+  assert.equal(settling?.deadline, validStart + 120_000 + INDEXING_MARGIN_MS);
+  assert.ok(INDEXING_MARGIN_MS > 0, "a zero margin is the bug this line exists for");
   purse.finishSettling();
   assert.equal(purse.state.settling, null);
 });
@@ -226,6 +350,32 @@ test("a purse.json too large to be limits is refused rather than read", () => {
   const dir = scratch();
   writeFileSync(join(dir, "purse.json"), JSON.stringify({ paused: true, pad: "x".repeat(300 * 1024) }));
   assert.throws(() => open(dir), /too large/);
+});
+
+test("the settling lock is taken and released under node --permission too", () => {
+  // The same class of bug as the fsync one below, and the reason this is a subprocess rather than
+  // a mock: the lock adds a write and an unlink to the payment path, and the daemon runs under a
+  // permission model that disables whole syscall families. A lock that could not be written would
+  // refuse every payment; a lock that could not be removed would deny for two minutes after each
+  // one. Both would only ever show on the installed service.
+  const dir = scratch();
+  const script = join(dir, "lock.ts");
+  const repo = new URL("../", import.meta.url).pathname;
+  writeFileSync(
+    script,
+    `import { Purse } from "${repo}src/purse.ts";\n` +
+      `const purse = Purse.open(${JSON.stringify(join(dir, "purse.json"))});\n` +
+      `purse.beginSettling("0.0.9185802@1800000000.0", Date.now());\n` +
+      `if (Purse.open(${JSON.stringify(join(dir, "purse.json"))}).state.settling === null) throw new Error("the lock was not written");\n` +
+      `purse.finishSettling();\n` +
+      `if (Purse.open(${JSON.stringify(join(dir, "purse.json"))}).state.settling !== null) throw new Error("the lock was not released");\n`,
+  );
+  execFileSync(
+    process.execPath,
+    ["--permission", `--allow-fs-read=${repo}`, `--allow-fs-read=${dir}`, `--allow-fs-write=${dir}`, script],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  assert.equal(existsSync(join(dir, "settling.json")), false);
 });
 
 test("the purse still writes under node --permission, which forbids fsync", () => {

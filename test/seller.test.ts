@@ -8,6 +8,7 @@
 // the way it is enforced: by asking the chain.
 
 import { createServer } from "node:http";
+import { mkdirSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -30,6 +31,7 @@ import {
   testSigner,
   testnet,
 } from "./support.ts";
+import { Labels } from "../src/labels.ts";
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => void;
 
@@ -344,6 +346,43 @@ test("a seller that claims success it never earned still only gets one signature
   assert.equal(requests, 2);
   assert.equal(signatures(), 1);
   assert.equal((await spent()).usdc, 10_000n);
+});
+
+test("a label store that cannot be written costs a name, never the payment", async (t) => {
+  // The host name is decoration: `hostFor` is read by the status snapshot and by nothing else, so
+  // losing it costs a row that says 0.0.5005 instead of a hostname. It must therefore be
+  // impossible for it to cost a payment — and the append happens *after* the signature, so a
+  // throw here would fail a payment that had already been authorised, and leave the settling lane
+  // shut behind it for the whole validity window.
+  const shop = await seller((req, res) => {
+    if (!req.headers["payment-signature"]) {
+      res.writeHead(402, { "PAYMENT-REQUIRED": offer() }).end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain" }).end("the goods");
+  });
+  t.after(() => shop.close());
+
+  const mirror = await fakeMirror();
+  t.after(() => mirror.close());
+  const purse = readyPurse();
+  const dir = scratch();
+  const path = join(dir, "labels.jsonl");
+  mkdirSync(path);                                   // every append against this throws EISDIR
+  const labels = Labels.open(path);
+  const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
+  const inner = testSigner(mirror);
+  const refreshChain = async (): Promise<void> => {
+    purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS), false);
+  };
+  const pay = payer(inner, walletConfig, purse, labels, refreshChain, LIMITS, 0);
+
+  const result = await pay(`${shop.base}/secret`);
+  assert.equal(result.body, "the goods", "a name that could not be written failed the payment");
+  assert.equal(result.paid, true);
+  assert.equal(labels.hostFor(String(result.receipt?.txId)), new URL(shop.base).host, "the name is still usable in memory");
+  // And the lane is not left shut behind a payment that was never delivered.
+  assert.equal(purse.state.settling, null);
 });
 
 test("a paused purse denies even a perfectly well-behaved seller", async (t) => {

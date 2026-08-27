@@ -181,3 +181,76 @@ test("an accountId that is not an account id is a refusal to start", async () =>
   writeFileSync(join(dir, "config.json"), JSON.stringify({ network: "hedera:testnet", accountId: "0.0.10193689" }));
   assert.equal(loadConfig(join(dir, "config.json")).accountId, "0.0.10193689");
 });
+
+test("SECURITY: a restart inside the indexing window does not hand the allowance back", async (t) => {
+  // B12, end to end. The reviewed build kept the settling lane in memory only, so this sequence
+  // bought a second payment out of an allowance that covers one:
+  //
+  //   1. pay — signed, and the mirror node has not indexed it yet
+  //   2. pay — denied, "a payment is still settling"
+  //   3. restart the daemon
+  //   4. pay — PAID, because the new process read a ledger that did not contain (1) and had no
+  //      lock to tell it that something was in flight
+  //
+  // Bound: one extra payment of up to maxPayment, for anyone who can restart the unit — a cached
+  // polkit `manage-units` authorization is enough, and `Restart=on-failure` does it unattended.
+  // Step 4 must now be a denial, and the chain must still show exactly one transaction.
+  const test402 = await startTestDaemon(ready(10_000n), 10_000n);
+  t.after(() => test402.close());
+  test402.mirror.indexing = true;
+
+  const before = await connect(test402.daemon.spendPath);
+  assert.equal((await before.send({ cmd: "pay", url: "https://a.example/x" }))["ok"], true);
+  const second = await before.send({ cmd: "pay", url: "https://a.example/y" });
+  assert.equal(second["ok"], false);
+  assert.match(String(second["reason"]), /still settling/);
+  before.close();
+
+  await test402.restart();
+
+  const after = await connect(test402.daemon.spendPath);
+  const third = await after.send({ cmd: "pay", url: "https://a.example/z" });
+  assert.equal(third["ok"], false, "a restart inside the indexing window authorised a second payment");
+  assert.match(String(third["reason"]), /still settling/);
+  // The panel is told too, on the very first frame after the restart.
+  assert.equal((await after.send({ cmd: "purse" }))["settling"], true);
+  // One signature across both daemons, and one transaction in the mirror node's whole world.
+  assert.equal(test402.signatures(), 1);
+  assert.equal(test402.mirror.rows.length + test402.mirror.held.length, 1);
+
+  // And the lock is still a lock: once the chain shows the payment, the next one goes through on
+  // its own — the restart delayed nothing that was going to happen anyway.
+  test402.mirror.indexing = false;
+  test402.mirror.catchUp();
+  const fourth = await after.send({ cmd: "pay", url: "https://a.example/w" });
+  assert.equal(fourth["ok"], false, String(fourth["reason"]));
+  assert.match(String(fourth["reason"]), /daily allowance/, "the lane never reopened after the chain caught up");
+  after.close();
+});
+
+test("a restart after the transaction can no longer settle reopens the lane on the clock", async (t) => {
+  // The other half of the same fix, and the half a lock could easily have broken: a payment that
+  // never reached consensus must not shut the purse for ever. The deadline is
+  // `validStart + TransactionValidDuration` and it is honoured across a restart in both
+  // directions — held while it is in the future, and gone the moment it is not, with nothing
+  // asked of the mirror node to conclude it.
+  const test402 = await startTestDaemon(ready(2_000_000n), 10_000n);
+  t.after(() => test402.close());
+  test402.mirror.indexing = true;
+
+  const before = await connect(test402.daemon.spendPath);
+  assert.equal((await before.send({ cmd: "pay", url: "https://a.example/x" }))["ok"], true);
+  before.close();
+
+  // Wind the lock past its deadline by rewriting the file the way two minutes of waiting would
+  // have left it. Nothing else changes: same daemon state, same mirror still holding the row.
+  const lock = join(test402.stateDir, "settling.json");
+  const held = JSON.parse(readFileSync(lock, "utf8")) as Record<string, unknown>;
+  writeFileSync(lock, JSON.stringify({ ...held, deadline: Date.now() - 1 }));
+
+  await test402.restart();
+  const after = await connect(test402.daemon.spendPath);
+  const next = await after.send({ cmd: "pay", url: "https://a.example/y" });
+  assert.equal(next["ok"], true, `a payment that can never settle shut the purse: ${String(next["reason"])}`);
+  after.close();
+});
