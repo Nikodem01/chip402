@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "hedera-docs": {
+      "type": "http",
+      "url": "https://docs.hedera.com/mcp"
+    },
+    "x402-docs": {
+      "type": "http",
+      "url": "https://docs.x402.org/mcp"
+    },
+    "qt-docs": {
+      "type": "http",
+      "url": "https://qt-docs-mcp.qt.io/mcp"
+    }
+  }
+}
