@@ -21,37 +21,30 @@ import type { Sighting } from "./fetch.ts";
 import { hardenedFetch } from "./fetch.ts";
 import { MIRROR_TX_ID, SDK_TX_ID } from "./ids.ts";
 
-// One page is a hundred transactions and a day of pocket money is a handful, so this bound is
-// about the pathological case rather than the ordinary one. Past the bound we cannot say what was
-// spent, and a purse that cannot count must not pay — the caller turns the throw into a denial.
-// That is a denial of service on pocket money and not a loss of funds, which is the trade the
-// fail-closed posture buys.
-//
-// What used to reach the bound was cheap for somebody else to arrange: every transaction that so
-// much as *touches* the account counts against it, so 1,200 dust transfers *into* the account —
-// free on testnet, about $0.12/day on mainnet — stopped payment until local midnight. Money
-// arriving cannot cost us anything, and the filter already discarded every one of those rows
-// after paying to fetch them. `readTransactions` now asks the narrower question when the wide one
-// overflows; see there.
+// A hundred rows is the mirror node's own page cap — asked for two hundred, it returns a hundred —
+// so it is measured here rather than assumed. The bound on *pages* is generous because this walk
+// is no longer on the payment path: it runs once when the daemon starts, to learn what a previous
+// one already spent today, and after that the purse counts its own payments and asks the chain
+// about them one transaction id at a time. Twenty thousand outgoing transactions in a single local
+// day is far past anything this is for, and reaching it costs a daemon that will not finish
+// starting rather than a number that is wrong.
 const PAGE_SIZE = 100;
-const MAX_PAGES = 12;
+const MAX_PAGES = 200;
 
 // Hedera's own TransactionValidDuration. A signed transaction that has not reached consensus by
 // validStart + this can never reach it. That is a fact about the *chain*.
 export const VALID_DURATION_MS = 120_000;
 
-// And this is the gap between that fact and the one the settling lane actually needs, which is
-// "the mirror node can no longer start showing it". The two are not the same instant, and reading
-// them as if they were is a way to hand back the allowance: a facilitator that submits at
+// And this is the gap between that fact and the one an authorisation actually needs, which is "the
+// mirror node can no longer start showing it". The two are not the same instant, and reading them
+// as if they were is a way to hand back the allowance: a facilitator that submits at
 // validStart + 119 s reaches consensus inside the window, so the payment is real and will be
-// charged — but the mirror node is a second or three behind consensus, and a lane that opened at
-// validStart + 120 s exactly would spend those seconds reading a ledger that does not contain it.
+// charged — but the mirror node is a second or three behind consensus, and letting go at
+// validStart + 120 s exactly would stop counting it for those seconds.
 //
-// So the lock is held for the deadline plus this. It is the same patience `SETTLE_WAIT_MS` already
-// spends on the ordinary case, and it costs nothing but denial: too long is a payment refused for
-// twenty extra seconds, too short is a payment made twice. If the mirror node is further behind
-// than this, the purse is already inside the trust assumption the README states as the honest
-// ceiling of the design — it cannot spend what the mirror will not show it.
+// So an authorisation lasts for the deadline plus this. It costs nothing but denial: too long is
+// twenty extra seconds of an amount counted that may never have moved, too short is a payment made
+// twice.
 export const INDEXING_MARGIN_MS = 20_000;
 
 // One payment, as the ledger has it. Every field is read off the chain except `host`, which the
@@ -69,8 +62,16 @@ export type Payment = {
 // was computed for. policy.ts refuses to pay against one that has gone stale or that was
 // computed before local midnight rolled over.
 export type Ledger = {
+  // Which account this was read for, carried so that nothing derived from it can be applied to a
+  // different one. `setup --import` changes the account under a running install, and the previous
+  // build charged a fresh account's allowance for an older wallet's spending because the number it
+  // kept did not say who it was about. This field is how policy.ts refuses that by construction.
+  readonly accountId: string;
   readonly since: number;
   readonly at: number;
+  // Did the walk reach the end of the day, or stop at the page bound? Only a complete reading may
+  // seed the day's spending; a partial one may only ever raise it. See Purse.observe.
+  readonly complete: boolean;
   readonly balances: Readonly<Record<AssetKey, bigint>>;
   readonly spent: Readonly<Record<AssetKey, bigint>>;
   readonly payments: readonly Payment[];
@@ -275,8 +276,14 @@ async function mirrorJson(url: string): Promise<unknown> {
   return response.json();
 }
 
+// `transactions=false` is not a nicety. The accounts endpoint bundles a page of recent
+// transactions into its answer unless told not to, and this function reads two things from it: the
+// balances and the key. Measured against the public testnet node, the same request is 23,072 bytes
+// with the list and 740 without — thirty-one times the bytes, every time, for rows that are parsed
+// and thrown away.
 export async function readAccount(network: NetworkRow, accountId: string): Promise<ChainAccount> {
-  return (await mirrorJson(`${network.mirror}/api/v1/accounts/${accountId}`)) as ChainAccount;
+  const url = `${network.mirror}/api/v1/accounts/${accountId}?transactions=false`;
+  return (await mirrorJson(url)) as ChainAccount;
 }
 
 // Has this transaction reached the chain at all? Answered for any outcome, not only success: a
@@ -290,87 +297,67 @@ export async function transactionSeen(network: NetworkRow, txId: string): Promis
   return (body.transactions ?? []).length > 0;
 }
 
-// The walk ran out of pages before it ran out of rows. Its own class, because `readTransactions`
-// has to tell this apart from a mirror node that is simply down: one is worth asking a narrower
-// question about, the other is not.
-class TooManyRows extends Error {}
-
-// One walk back to `from`, newest first. Paged by asking for everything older than the last row we
-// saw, rather than by following the `links.next` the server hands us: the bound stays ours, and
-// there is no server-supplied URL to fetch.
+// Everything that took money *out* of this account back to `from`, newest first, and whether the
+// walk reached the end. Paged by asking for what is older than the last row we saw rather than by
+// following the `links.next` the server hands us: the bound stays ours, and there is no
+// server-supplied URL to fetch.
 //
-// `filter` is appended to the query verbatim and is never derived from anything outside this file.
+// SECURITY: `type=debit`, not every transaction the account appears in, and the difference is the
+// whole reason a busy day is survivable. It is a superset of what `paymentsIn` counts, by
+// construction: a row that function keeps has a negative entry for us in some asset, and a
+// negative entry is what makes a row a debit. Checked rather than argued — against this account's
+// real history on the public testnet mirror node on 2026-08-27, `type=debit` keeps all fifty rows
+// `paymentsIn` would count, including twenty-four token-only debits where the facilitator paid the
+// HBAR fee and our account has no HBAR entry at all, and drops every credit. Nothing it counts can
+// exist without a signature only this daemon can produce, so the row count is bounded by our own
+// spending and by nothing an outsider can arrange. Asking the wide question instead let anyone
+// dust the account into the page bound for about $0.12 a day.
 async function walk(
   network: NetworkRow,
   accountId: string,
   from: number,
-  filter: string,
-  what: string,
-): Promise<ChainTransaction[]> {
+  maxPages: number,
+): Promise<{ rows: ChainTransaction[]; complete: boolean }> {
   const floor = (from / 1000).toFixed(9);
   const rows: ChainTransaction[] = [];
   let before: string | null = null;
-  for (let page = 0; page < MAX_PAGES; page++) {
+  for (let page = 0; page < maxPages; page++) {
     const query =
       `account.id=${encodeURIComponent(accountId)}&timestamp=gte:${floor}` +
       (before === null ? "" : `&timestamp=lt:${before}`) +
-      filter +
-      `&order=desc&limit=${PAGE_SIZE}`;
+      `&type=debit&order=desc&limit=${PAGE_SIZE}`;
     const body = (await mirrorJson(`${network.mirror}/api/v1/transactions?${query}`)) as {
       transactions?: ChainTransaction[];
     };
     const page_rows = body.transactions ?? [];
     rows.push(...page_rows);
-    if (page_rows.length < PAGE_SIZE) return rows;
+    if (page_rows.length < PAGE_SIZE) return { rows, complete: true };
     const last = page_rows[page_rows.length - 1]?.consensus_timestamp;
-    if (typeof last !== "string" || last === before) return rows;
+    if (typeof last !== "string" || last === before) return { rows, complete: true };
     before = last;
   }
-  // "At least", not "more than": the last page may have been the last rows there are, and a full
-  // page is indistinguishable from a full page with more behind it. And the window is named by
-  // the instant it starts at rather than called "today", because `from` reaches back past local
-  // midnight whenever a transaction signed just before it is still in flight — see readLedger.
-  throw new TooManyRows(
-    `at least ${MAX_PAGES * PAGE_SIZE} ${what} since ${new Date(from).toISOString()} — cannot say what was spent`,
-  );
+  // A full last page is indistinguishable from a full last page with more behind it, so this says
+  // "we stopped", not "there is more". What the caller does with it depends on why it asked: the
+  // read at start-up needs the whole day and treats a stop as a failure; the read that keeps the
+  // panel current does not care, because its sum may only ever raise the day's figure.
+  return { rows, complete: false };
 }
 
-// Every transaction touching this account back to `from`, newest first — and, when there are too
-// many of those to read, every transaction that took money *out* of it.
+// One read of everything the chain has to say about us: the balances and the key check from the
+// account endpoint, the day's outgoing payments from the walk. `since` is local midnight.
 //
-// SECURITY: the second walk is a fallback and never the first answer, which is the whole of why
-// it is safe. The wide query is what the three filter rules were verified against and what runs
-// every ordinary day; the narrow one runs only where the alternative is refusing to pay at all,
-// so the worst a wrong belief about `type=debit` could cost is a payment in a state that today
-// denies every payment. It cannot be provoked, either: `type=debit` drops exactly the rows an
-// attacker can create — money arriving — and every row it keeps needs our signature to exist, so
-// nobody but us can put a payment of ours on the far side of the filter. If it too overflows, the
-// throw stands and the purse still refuses to pay.
-//
-// Verified against the public testnet mirror node on 2026-08-27 with this account's real history:
-// `type=debit` keeps every one of its four x402 payments — all of them token-only debits with no
-// HBAR entry for us at all — and drops both incoming HBAR credits and the incoming 20 USDC
-// transfer. See test/chain.test.ts and `npm run test:live`.
-async function readTransactions(network: NetworkRow, accountId: string, from: number): Promise<ChainTransaction[]> {
-  try {
-    return await walk(network, accountId, from, "", "transactions");
-  } catch (error) {
-    if (!(error instanceof TooManyRows)) throw error;
-  }
-  return walk(network, accountId, from, "&type=debit", "outgoing transactions");
-}
-
-// One read of everything the chain has to say about us. `since` is local midnight, and it is both
-// the window that is read and the window that is summed — there used to be a second, wider `from`
-// for looking back past midnight, and nothing looked: every row before `since` is dropped by
-// `paymentsIn`, and the only question that reaches back is `transactionSeen`, which asks about one
-// id and has no window. Two requests in the ordinary case.
+// `maxPages` is what tells this function's two callers apart, and they want different things. The
+// read at start-up wants the whole day, because its sum is what seeds the figure the day's
+// allowance is measured against; every later read is for the panel and for a balance that has only
+// moved in our favour, so it takes the newest page and stops. Two requests in the ordinary case,
+// and on an ordinary day the second one is a single page.
 export async function readLedger(
   network: NetworkRow,
   accountId: string,
   publicKeyHex: string,
   evmAddress: string | null,
   since: number,
+  maxPages: number = MAX_PAGES,
 ): Promise<Ledger> {
   // SECURITY: stamped before the requests go out, not after they come back. `at` is the only thing
   // policy.ts measures staleness against, so it has to be a claim the rows can support. A read
@@ -381,9 +368,9 @@ export async function readLedger(
   // bound instead: the data is never *older* than this, which is the direction a deny-on-stale
   // check needs, and it is the ordering `Purse.observe` uses to refuse a reading that was overtaken.
   const at = Date.now();
-  const [account, rows] = await Promise.all([
+  const [account, walked] = await Promise.all([
     readAccount(network, accountId),
-    readTransactions(network, accountId, since),
+    walk(network, accountId, since, maxPages),
   ]);
 
   const usdcRow = (account.balance?.tokens ?? []).find((row) => row.token_id === network.assets.usdc.id);
@@ -392,13 +379,15 @@ export async function readLedger(
     hbar: BigInt(account.balance?.balance ?? 0),
   };
 
-  const payments = paymentsIn(rows, network, accountId, since);
+  const payments = paymentsIn(walked.rows, network, accountId, since);
   const spent = { usdc: 0n, hbar: 0n };
   for (const payment of payments) spent[payment.asset] += payment.amount;
 
   return {
+    accountId,
     since,
     at,
+    complete: walked.complete,
     balances,
     spent,
     payments,

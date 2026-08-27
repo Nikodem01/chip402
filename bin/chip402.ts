@@ -33,7 +33,10 @@ function show(status: Status): void {
     console.log("  the chain says a different key controls this account; payment is refused.");
     console.log("  re-import it with `sudo chip402ctl setup --import`");
   }
-  if (status["settling"] === true) console.log("  a payment is still settling");
+  const flying = Number(status["inFlight"] ?? 0);
+  if (flying > 0) {
+    console.log(`  ${flying} payment${flying === 1 ? "" : "s"} settling — already counted against today`);
+  }
 
   for (const key of ASSET_KEYS as AssetKey[]) {
     const row = status["assets"][key];

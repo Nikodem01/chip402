@@ -1,21 +1,31 @@
-// The purse: the limits, the kill switch, and the settling lock. That is the whole of what this
-// file keeps, and it is deliberately the whole of it.
+// The purse: the limits, the kill switch, the day's figure, and the payments still in the air.
 //
-// What is *not* here is the thing this file used to be about. There is no counter of what has
-// gone out today, no list of what was bought, and no number that moves when we sign. Those are
-// facts about the chain, and a hand-written copy of a fact drifts from it: the previous build
-// carried two HBAR payments made by a wallet this machine no longer holds across a
-// `setup --import` and charged today's allowance for them. Nothing was attacking it. A second
-// copy is a second answer.
+// The day's figure is a number this file keeps, and the previous build kept one too and got it
+// wrong — it carried two HBAR payments made by a wallet this machine no longer held across a
+// `setup --import` and charged a fresh account's allowance for them. Nothing was attacking it. So
+// the difference is worth being exact about, because "we keep a number again" is the sentence that
+// deserves the most suspicion in this file:
+//
+//   then                                    now
+//   in purse.json, written on every payment  in memory, gone on restart
+//   nothing said which account it was for    tagged with the account and the local day, and
+//                                            discarded rather than carried when either changes
+//   nothing ever re-derived it               seeded from the chain at start-up and at midnight,
+//                                            and raised by a chain reading, never by arithmetic
+//                                            alone
+//
+// What is on disk is not that figure. It is the list of payments signed in the last two minutes
+// that the chain has not answered for yet, and every entry in it expires — see `Authorization`.
 //
 // So there are three kinds of state here and each lives where it belongs:
 //
 //   purse.json     policy, and only policy — four numbers and a flag, set by root and changeable
 //                  only over the admin socket. Unreadable ⇒ refuse to start.
-//   memory         the chain's last answer, held by `observe` and thrown away on restart. The
-//                  next daemon asks the mirror node again, which is the point.
-//   settling.json  the lock: a transaction id and the instant it can no longer reach consensus.
-//                  No amount, so it is not a ledger — see `Settling`. Unreadable ⇒ assume held.
+//   memory         the chain's last answer and the day's running figure, thrown away on restart.
+//                  The next daemon asks the mirror node again, which is the point.
+//   inflight.json  payments we have signed and the chain has not yet shown us. Every entry dies
+//                  within a little over two minutes of being written — see `Authorization`.
+//                  Unreadable ⇒ assume the whole allowance is committed until then.
 //
 // The host names used to be in this file too. They are in labels.ts now, because a file that must
 // refuse to start when it cannot be read has no business also holding something that grows and is
@@ -26,7 +36,7 @@ import { ASSET_KEYS } from "./networks.ts";
 import type { Ledger, Payment } from "./chain.ts";
 import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "./chain.ts";
 import type { Label, Labels } from "./labels.ts";
-import { dayEnd } from "./policy.ts";
+import { committed, dayEnd } from "./policy.ts";
 import { parseUnits } from "./money.ts";
 import { readJson, removeFile, writeAtomic } from "./safe.ts";
 import { dirname, join } from "node:path";
@@ -39,85 +49,144 @@ export type Budget = {
   maxPayment: bigint;
 };
 
-// A transaction we have signed and not yet seen on the chain. It holds no amount, because an
-// amount here would be a second copy of a number the chain already has — it holds only enough
-// to ask "has this happened yet?" and to know when the answer can no longer change. A null id
-// means we could not read back the bytes we signed, so only the clock can end it.
+// One payment we have authorised and the chain has not yet shown us. It is not a receipt and not
+// a ledger entry: it is a claim about what *we did*, which is the one kind of fact this process is
+// entitled to know before the mirror node does.
 //
-// SECURITY: these two fields are the only thing chip402 writes down about a payment, and the
-// reason it is not the local ledger this project refuses to keep is that neither of them is a
-// number the chain owns. `txId` is what we authorised, not what happened; `deadline` is arithmetic
-// on it. Nothing about how much moved, or whether it did, is here — those are still questions only
-// the mirror node answers.
-export type Settling = {
-  readonly txId: string | null;
-  readonly deadline: number;
+// SECURITY: this is the only thing chip402 writes to disk about a payment, and what makes it safe
+// is that it cannot outlive its own question. `deadline` is `validStart` plus the last moment
+// Hedera would accept the transaction plus the longest the mirror node may be behind consensus —
+// so every entry here is resolved, one way or the other, within a little over two minutes of being
+// written. Nothing in this file can walk into another day or another account, because nothing in
+// it lives long enough to try. That is the exact failure the previous build had: a `spent` figure
+// kept in purse.json with no account on it and nothing that ever re-derived it, which charged a
+// freshly imported account for an older wallet's spending.
+//
+// A null `txId` means we could not read back the bytes we signed. Then only the deadline can end
+// it, and wallet.ts re-reads the day before letting go — the fail-closed reading of "we do not know
+// what we just signed".
+export type Authorization = {
+  readonly asset: AssetKey;
+  readonly amount: bigint;
+  txId: string | null;
+  deadline: number;
 };
 
-// The lock lives beside purse.json and not in it, for the same reason labels.jsonl does: the three
-// files want three different things when they cannot be read, and the shared failure mode would
-// have to be the strictest one.
+// What has gone out today, as this daemon knows it — the chain's figure for the day, plus every
+// payment of ours the chain has since confirmed and has not been asked about again.
+//
+// SECURITY: the two tags are not bookkeeping. A figure is only ever applied to the account and the
+// local day it was measured for; anything else is discarded and re-read rather than carried over.
+// policy.ts checks both again before it will spend against this, so the rule is visible in the
+// pure function that makes the decision rather than only here.
+export type Spent = {
+  readonly accountId: string;
+  readonly dayStart: number;
+  readonly totals: Readonly<Record<AssetKey, bigint>>;
+};
+
+// The in-flight list lives beside purse.json and not in it, for the same reason labels.jsonl does:
+// the three files want three different things when they cannot be read, and a shared file would
+// have to take the strictest of them.
 //
 //   purse.json     refuse to start   — "I do not know the limits" must never become "no limits"
 //   labels.jsonl   carry on          — losing every host name costs rows that show account ids
-//   settling.json  assume held       — a lock we cannot read is a lock we honour, for as long as
-//                                      one could possibly last
+//   inflight.json  assume committed  — a list we cannot read is a list we honour, for as long as
+//                                      any entry in it could possibly have lasted
 //
-// A `settling` key inside purse.json would also have been a third writer on a file that already has
-// two — root raising a limit over the admin socket, and anyone pressing PAUSE over the spend one —
-// and it would write on the payment path, which is exactly when the other two are most likely to
-// arrive. An atomic rewrite of the whole file by one of them a millisecond after the other is a
-// lost update.
-const LOCK_FILE = "settling.json";
+// It would also have been a third writer on a file that already has two — root raising a limit over
+// the admin socket, and anyone pressing PAUSE over the spend one — writing on the payment path,
+// which is exactly when the other two are most likely to arrive. An atomic rewrite of the whole
+// file by one of them a millisecond after the other is a lost update.
+const INFLIGHT_FILE = "inflight.json";
 
-// How long a lock lasts, at most: the last instant Hedera would accept the transaction, plus the
-// longest we are willing to assume the mirror node is behind consensus. Both halves are chain.ts's
-// to define and neither is ours to choose — see INDEXING_MARGIN_MS for why the second one is not
-// zero, which is the whole difference between "it can never happen" and "it can never *show*".
-const LOCK_DURATION_MS = VALID_DURATION_MS + INDEXING_MARGIN_MS;
+// The single-payment lock this file used to keep. Read once on the way past, so that upgrading a
+// daemon that had a payment in the air does not open a window; then deleted and never written.
+const LEGACY_LOCK_FILE = "settling.json";
 
-const lockPath = (pursePath: string): string => join(dirname(pursePath), LOCK_FILE);
+// How long an authorisation lasts, at most: the last instant Hedera would accept the transaction,
+// plus the longest we are willing to assume the mirror node is behind consensus. Both halves are
+// chain.ts's to define and neither is ours to choose — see INDEXING_MARGIN_MS for why the second
+// one is not zero, which is the whole difference between "it can never happen" and "it can never
+// *show*".
+export const AUTHORIZATION_MS = VALID_DURATION_MS + INDEXING_MARGIN_MS;
 
-// SECURITY: what a restart is allowed to conclude. The old build kept `settling` in memory only,
-// so a daemon that went down between a signature and the mirror node catching up came back with
-// the lane open, read a ledger that did not yet contain the in-flight payment, and authorised a
-// second one against it — one extra payment of up to `maxPayment`, for anyone who could restart
-// the unit inside the indexing window. That was demonstrated end to end; this function is the
-// half of the fix that runs at start-up.
+const inFlightPath = (pursePath: string): string => join(dirname(pursePath), INFLIGHT_FILE);
+const legacyLockPath = (pursePath: string): string => join(dirname(pursePath), LEGACY_LOCK_FILE);
+
+// SECURITY: what a restart is allowed to conclude, and it is the half of the design that had to be
+// demonstrated before it was believed. This used to live in memory only, so a daemon that went down
+// between a signature and the mirror node catching up came back knowing nothing about it, read a
+// day that did not yet contain it, and authorised a second payment against the same allowance —
+// for anyone who could restart the unit inside the indexing window, which `Restart=on-failure`
+// does unattended.
 //
-// Three readings and all of them fail closed:
+// Four readings and every one of them fails closed:
 //
-//   no file            no payment was in flight. The ordinary case.
-//   unreadable file    hold the lane for as long as any real lock could last. It expires on the
-//                      clock within LOCK_DURATION_MS, so a corrupt file costs a bounded stretch
-//                      of denial — a little over two minutes — and never an extra payment.
-//   a deadline         honour it — but never for longer than a genuine lock could have run.
-//                      `deadline` is always `validStart + LOCK_DURATION_MS` and `validStart` is in
-//                      the past by the time it is written, so a value beyond `now + that` is
-//                      damage rather than data, and clamping it is what stops a garbled number
-//                      from wedging the purse for ever.
-function readLock(pursePath: string, now: number): Settling | null {
+//   no file          nothing was in flight. The ordinary case, and the common one.
+//   unreadable       commit the whole allowance, in both assets, for as long as any real entry
+//                    could have lasted. A corrupt file costs a bounded stretch of denial — a
+//                    little over two minutes — and never an extra payment.
+//   another account  discard it. It cannot describe this purse, and applying somebody else's
+//                    figure to this one is the precise shape of the bug this design exists to
+//                    make impossible.
+//   entries          honour them, each clamped to the longest a genuine one could have run.
+//                    `deadline` is `validStart + AUTHORIZATION_MS` and `validStart` is already in
+//                    the past when it is written, so a value beyond `now + that` is damage rather
+//                    than data, and clamping is what stops a garbled number wedging the purse.
+function readInFlight(pursePath: string, accountId: string | null, budgets: Record<AssetKey, Budget>, now: number): Authorization[] {
+  const ceiling = now + AUTHORIZATION_MS;
+  const everything = (deadline: number): Authorization[] =>
+    ASSET_KEYS.map((asset) => ({ asset, amount: budgets[asset].allowance, txId: null, deadline }));
+
+  // The lock the previous build kept, honoured once so that upgrading over a payment in the air is
+  // not a window. It carried no amount, so the only safe reading of it is "all of it".
+  const legacy = legacyLockPath(pursePath);
+  let carried: Authorization[] = [];
+  try {
+    const raw = readJson(legacy) as Record<string, unknown> | undefined;
+    if (raw !== undefined) {
+      const written = typeof raw["deadline"] === "number" && Number.isFinite(raw["deadline"]) ? raw["deadline"] : ceiling;
+      const deadline = Math.min(written, ceiling);
+      if (now < deadline) carried = everything(deadline);
+    }
+  } catch {
+    carried = everything(ceiling);
+  }
+  removeFile(legacy);
+
   let raw: unknown;
   try {
-    raw = readJson(lockPath(pursePath));
+    raw = readJson(inFlightPath(pursePath));
   } catch {
-    return { txId: null, deadline: now + LOCK_DURATION_MS };
+    return everything(ceiling);
   }
-  if (raw === undefined || raw === null || typeof raw !== "object") {
-    return raw === undefined ? null : { txId: null, deadline: now + LOCK_DURATION_MS };
-  }
+  if (raw === undefined) return carried;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return everything(ceiling);
   const row = raw as Record<string, unknown>;
-  const written = row["deadline"];
-  const ceiling = now + LOCK_DURATION_MS;
-  // A record whose deadline will not read is a record we do not act on beyond holding the lane:
-  // the id goes with it, because using an id we cannot date could end the wait for a payment that
-  // is not the one in flight. Held on the clock alone, which is the fail-closed reading.
-  if (typeof written !== "number" || !Number.isFinite(written)) return { txId: null, deadline: ceiling };
-  const deadline = Math.min(written, ceiling);
-  // Past it, the transaction can never reach consensus, so there is nothing left to wait for.
-  // This is the same exit the running daemon takes on the clock, taken one boot later.
-  if (now >= deadline) return null;
-  return { txId: typeof row["txId"] === "string" ? row["txId"] : null, deadline };
+  // Written for somebody else's purse. Not ours to honour and not ours to act on.
+  if (accountId !== null && row["accountId"] !== accountId) return carried;
+  const entries = row["entries"];
+  if (!Array.isArray(entries)) return everything(ceiling);
+
+  const live: Authorization[] = [...carried];
+  for (const entry of entries as Record<string, unknown>[]) {
+    const asset = entry?.["asset"];
+    if (asset !== "usdc" && asset !== "hbar") return everything(ceiling);
+    let amount: bigint;
+    try {
+      amount = BigInt(String(entry["amount"]));
+    } catch {
+      return everything(ceiling);
+    }
+    if (amount < 0n) return everything(ceiling);
+    const written = entry["deadline"];
+    if (typeof written !== "number" || !Number.isFinite(written)) return everything(ceiling);
+    const deadline = Math.min(written, ceiling);
+    if (now >= deadline) continue;
+    live.push({ asset, amount, txId: typeof entry["txId"] === "string" ? entry["txId"] : null, deadline });
+  }
+  return live;
 }
 
 // How many payment rows the status frame carries per asset. The panel draws six and the CLI five,
@@ -133,18 +202,23 @@ export type PurseState = {
   usdc: Budget;
   hbar: Budget;
   // --- nothing below this line is in purse.json ---
-  // The chain's last answer: balances, what has been spent since local midnight, and the rows
-  // behind that number. Null until the mirror node has answered once, which policy.ts treats
-  // as a reason to refuse rather than as a zero. Memory only: a restart asks again.
+  // The chain's last answer: balances, the key check, and the day's payments for the panel to
+  // draw. Null until the mirror node has answered once, which policy.ts treats as a reason to
+  // refuse rather than as a zero. Memory only: a restart asks again.
   ledger: Ledger | null;
+  // What has gone out today. Seeded from the chain when the daemon starts and when the day rolls
+  // over, raised by every payment of ours the chain confirms, and never lowered. Memory only, for
+  // the same reason as above and for one more: a figure that cannot survive a restart cannot
+  // survive an account change either.
+  spent: Spent | null;
   // Three consecutive readings, a minute apart, that the account is controlled by a different
   // key. See wallet.ts for the counting and policy.ts for what it costs. Memory only, and the
   // warning it is counting survives a restart on its own — the very first reading after one sets
   // `verified` false again. What resets is the refusal, not the alarm.
   mismatch: boolean;
-  // The lock, and the one field here with a file of its own — settling.json, not purse.json.
-  // See `Settling` and `readLock`.
-  settling: Settling | null;
+  // Payments authorised and not yet answered for, and the one field here with a file of its own —
+  // inflight.json, not purse.json. See `Authorization` and `readInFlight`.
+  inFlight: readonly Authorization[];
 };
 
 // bigint has no JSON representation, so the limits cross the file boundary as decimal strings of
@@ -200,34 +274,43 @@ function labelsFromLegacyReceipts(raw: Record<string, unknown> | undefined): Lab
 export class Purse {
   readonly #path: string;
   readonly #state: PurseState;
+  // Which account this purse spends from, stamped onto the in-flight list so a later daemon can
+  // tell whether the list it finds describes the purse it is. Null before `setup` has run.
+  readonly #accountId: string | null;
   // Host names carried out of an older purse.json, for the label store to adopt on first start.
   // Never written back, never read by anything here — see `legacyLabels`.
   readonly #carried: Label[];
   #onChange: (() => void) | undefined;
 
-  constructor(path: string, state: PurseState, carried: Label[] = []) {
+  constructor(path: string, state: PurseState, carried: Label[] = [], accountId: string | null = null) {
     this.#path = path;
     this.#state = state;
     this.#carried = carried;
+    this.#accountId = accountId;
   }
 
   // Missing file means a machine that has been installed but never configured: start paused with
   // nothing spendable. A file we cannot parse means something is wrong with the limits, and the
   // only safe reading of "I do not know the limits" is to refuse to run at all.
-  static open(path: string): Purse {
+  // `accountId` is only ever used to refuse: an in-flight list written for another account is
+  // discarded rather than applied. Null before `setup` has run, when nothing can be paid anyway.
+  static open(path: string, accountId: string | null = null): Purse {
     const raw = readJson(path) as Record<string, unknown> | undefined;
+    const usdc = budgetFromJson(raw?.["usdc"]);
+    const hbar = budgetFromJson(raw?.["hbar"]);
     const state: PurseState = {
       paused: raw === undefined ? true : raw["paused"] !== false,
-      usdc: budgetFromJson(raw?.["usdc"]),
-      hbar: budgetFromJson(raw?.["hbar"]),
+      usdc,
+      hbar,
       ledger: null,
+      spent: null,
       mismatch: false,
       // The one thing on this side of the line that a restart does not throw away — and the only
-      // thing, which is what keeps "the chain is the ledger" true. See readLock.
-      settling: readLock(path, Date.now()),
+      // thing. See readInFlight for what a restart is allowed to conclude.
+      inFlight: readInFlight(path, accountId, { usdc, hbar }, Date.now()),
     };
     const labels = labelsFromJson(raw?.["labels"]);
-    return new Purse(path, state, labels.length > 0 ? labels : labelsFromLegacyReceipts(raw));
+    return new Purse(path, state, labels.length > 0 ? labels : labelsFromLegacyReceipts(raw), accountId);
   }
 
   get state(): PurseState {
@@ -250,8 +333,8 @@ export class Purse {
   // so without this the *last to complete* wins rather than the last to start. A slow read issued
   // before a payment settled could then displace a fast one issued after it, and `decide` would see
   // a `spent` that predates the payment wearing an `at` that is seconds old: every check passes and
-  // the day's allowance is charged once for two payments. That is the same invariant the settling
-  // lock protects, reached after the lock has legitimately opened, so it needs its own guard.
+  // the day's allowance is charged once for two payments. `#absorb` below is the other half of the
+  // answer: a reading of a day this purse already has a figure for may raise it and never lower it.
   //
   // `Ledger.at` is stamped when the requests were issued, not when they landed — see readLedger,
   // which is the half of this that makes the comparison mean anything.
@@ -260,44 +343,131 @@ export class Purse {
     if (held !== null && ledger.at < held.at) return false;
     this.#state.ledger = ledger;
     this.#state.mismatch = mismatch;
+    this.#absorb(ledger);
     this.#onChange?.();
     return true;
   }
 
-  // SECURITY: the lane closes here, and it closes *before* a signature exists — wallet.ts takes
-  // the lock on the way to the key, not on the way back. Until it reopens policy.ts denies, so a
-  // payment cannot be counted twice by being made twice in the seconds before the mirror node has
-  // caught up. There is no in-flight amount to track and nothing to give back if it never settles:
-  // a payment that never settles simply never appears in the sum.
+  // SECURITY: the day's figure is allowed to move in exactly two ways, and this is one of them.
   //
-  // Two things reopen it, and only the first is the chain: the mirror node showing the transaction,
-  // and the clock passing `validStart + LOCK_DURATION_MS` — the last instant Hedera would have
-  // accepted it, plus the longest the mirror node is allowed to be behind (wallet.ts asks nothing
-  // to conclude that). A restart used to be a third — this was memory — and is not one any more.
+  // A reading of a different account, or of a different local day, replaces it outright — and only
+  // if the walk reached the end of that day, because a partial sum is not a day's spending. A
+  // reading of the same account and day may only ever *raise* it, never lower it, because by then
+  // this purse knows about payments the mirror node has not indexed yet and forgetting one is how
+  // an allowance gets spent twice. The chain is still what seeds and what corrects; what it may
+  // not do is talk us down.
+  #absorb(ledger: Ledger): void {
+    const spent = this.#state.spent;
+    if (spent === null || spent.accountId !== ledger.accountId || spent.dayStart !== ledger.since) {
+      if (!ledger.complete) return;
+      this.#state.spent = { accountId: ledger.accountId, dayStart: ledger.since, totals: { ...ledger.spent } };
+      return;
+    }
+    const totals = { ...spent.totals };
+    for (const key of ASSET_KEYS) if (ledger.spent[key] > totals[key]) totals[key] = ledger.spent[key];
+    this.#state.spent = { ...spent, totals };
+  }
+
+  // SECURITY: a payment is committed against the allowance here, on the way to the key, and this
+  // is what makes the lock the daemon used to hold unnecessary. `decide` reads the figure and this
+  // raises it with no `await` between the two, so any number of payments running at once are
+  // counted exactly — where a lock could only ever make them wait for a reading that lags.
   //
-  // The write happens before the field is set, and it is allowed to throw. A lock only this
-  // process remembers is not a lock, because the daemon that has to honour it may be the next one;
-  // so if it cannot be made durable the caller is told, and it is told early enough to refuse the
-  // payment rather than to fail one it has already signed. Nothing is left half-taken either way:
-  // a throw here leaves the lane exactly as it was, and a crash between the write and the
-  // assignment leaves a lock the next start reads.
-  beginSettling(txId: string | null, validStart: number): void {
-    const settling: Settling = { txId, deadline: validStart + LOCK_DURATION_MS };
-    writeAtomic(lockPath(this.#path), JSON.stringify(settling) + "\n");
-    this.#state.settling = settling;
+  // The write happens before the field is set, and it is allowed to throw. An authorisation only
+  // this process remembers is no authorisation at all, because the daemon that has to honour it may
+  // be the next one; so if it cannot be made durable the caller is told, and told early enough to
+  // refuse the payment rather than to fail one it has already signed. Nothing is left half-taken
+  // either way: a throw here leaves the list exactly as it was, and a crash between the write and
+  // the assignment leaves an entry the next start reads.
+  authorize(asset: AssetKey, amount: bigint, validStart: number): Authorization {
+    const entry: Authorization = { asset, amount, txId: null, deadline: validStart + AUTHORIZATION_MS };
+    const next = [...this.#state.inFlight, entry];
+    this.#write(next);
+    this.#state.inFlight = next;
+    this.#onChange?.();
+    return entry;
+  }
+
+  // Name it, so the chain can answer for it rather than only the clock, and move the deadline to
+  // the one measured from the transaction's own validStart — which is *earlier* than the estimate
+  // `authorize` was given, since the SDK dates a transaction a few seconds in the past. A failure
+  // here therefore leaves an entry honoured for a few seconds longer than it needed to be, which
+  // is a denial and never an extra payment. That is why this write may fail and the first may not.
+  identify(entry: Authorization, txId: string | null, validStart: number): void {
+    entry.txId = txId;
+    entry.deadline = validStart + AUTHORIZATION_MS;
+    try {
+      this.#write(this.#state.inFlight);
+    } catch {
+      // Deliberately nothing. See above.
+    }
     this.#onChange?.();
   }
 
-  // The lock is released in memory first and on disk second, because the ordering that matters is
-  // the fail-closed one: a crash in between leaves a lock the next start honours for the seconds
-  // it has left, which costs a denial. The reverse ordering would leave the lane open in a process
-  // that thinks it is shut. Removal is best-effort for the same reason — a file we cannot delete
-  // is a lane that reopens on the clock, which is where it was heading anyway.
-  finishSettling(): void {
-    if (this.#state.settling === null) return;
-    this.#state.settling = null;
-    removeFile(lockPath(this.#path));
+  // The chain has it. The amount moves out of the in-flight list and into the day's figure, which
+  // is the second and last way that figure is allowed to move — and it nets to nothing, because the
+  // entry was already counted against the allowance while it was in flight.
+  //
+  // Counted exactly once, which needs saying because there are two ways for the chain to tell us
+  // and they can arrive in either order. A reading that already contains this id has raised the
+  // figure through `#absorb` and `policy.committed` has already stopped counting the entry, so
+  // adding it here again would charge the day twice for one payment — nine payments out of an
+  // allowance for ten, which is exactly how this was found. The same predicate governs both places.
+  settled(entry: Authorization): void {
+    const shown = this.#shown(entry);
+    if (!this.#forget(entry)) return;
+    const spent = this.#state.spent;
+    if (spent !== null && !shown) {
+      const totals = { ...spent.totals, [entry.asset]: spent.totals[entry.asset] + entry.amount };
+      this.#state.spent = { ...spent, totals };
+    }
     this.#onChange?.();
+  }
+
+  // Is this payment already in the figure by way of a chain reading? The mirror of the test in
+  // `policy.committed`, and deliberately the same one.
+  #shown(entry: Authorization): boolean {
+    if (entry.txId === null) return false;
+    return this.#state.ledger?.payments.some((payment) => payment.txId === entry.txId) === true;
+  }
+
+  // It can never reach consensus now, so it never happened and nothing is given back — because
+  // nothing was taken. A payment that never settles simply never enters the figure.
+  abandon(entry: Authorization): void {
+    if (this.#forget(entry)) this.#onChange?.();
+  }
+
+  #forget(entry: Authorization): boolean {
+    if (!this.#state.inFlight.includes(entry)) return false;
+    const next = this.#state.inFlight.filter((row) => row !== entry);
+    this.#state.inFlight = next;
+    // Best effort, and the ordering is the fail-closed one: the list is already short in memory, so
+    // a write that fails leaves the *next* daemon holding an entry for the seconds it has left —
+    // a denial, never a second payment.
+    try {
+      this.#write(next);
+    } catch {
+      // Deliberately nothing. See above.
+    }
+    return true;
+  }
+
+  #write(entries: readonly Authorization[]): void {
+    const path = inFlightPath(this.#path);
+    if (entries.length === 0) {
+      removeFile(path);
+      return;
+    }
+    const body = {
+      accountId: this.#accountId,
+      entries: entries.map((entry) => ({
+        asset: entry.asset,
+        amount: entry.amount.toString(),
+        txId: entry.txId,
+        deadline: entry.deadline,
+      })),
+    };
+    writeAtomic(path, JSON.stringify(body) + "\n");
   }
 
   // What an older purse.json had in it, for labels.ts to adopt once. Reading this is the whole
@@ -363,8 +533,9 @@ function paymentToJson(payment: Payment, host: string | null): Record<string, un
 // ids.
 //
 // SECURITY: there is no branch of this function that can reach the key — the wallet does not
-// appear in it at all. And every number under `spent`, `balance` and `payments` came off the
-// mirror node in this process's last read; none of them is stored anywhere.
+// appear in it at all. Every number under `balance` and `payments` came off the mirror node in this
+// process's last read, and `spent` is that read plus this process's own payments since; none of
+// them is on disk.
 export function snapshot(
   purse: Purse,
   labels: Labels,
@@ -387,9 +558,11 @@ export function snapshot(
       maxPresets: asset.maxPresets,
       allowance: budget.allowance.toString(),
       maxPayment: budget.maxPayment.toString(),
-      // Both derived, both from the chain, both null-safe: before the first mirror read there is
+      // What the day has cost so far, which is what the chain has confirmed *plus* what is still
+      // in the air — the same figure the allowance is measured against, so the bar on the panel and
+      // the decision behind it can never disagree. Null-safe: before the first mirror read there is
       // no number to show, and "0" would be a claim we have not earned.
-      spent: (ledger?.spent[key] ?? 0n).toString(),
+      spent: (state.spent === null ? 0n : state.spent.totals[key] + committed(state, key, now)).toString(),
       balance: (ledger?.balances[key] ?? 0n).toString(),
       payments: (ledger?.payments ?? [])
         .filter((payment) => payment.asset === key)
@@ -429,7 +602,9 @@ export function snapshot(
     // When the chain last answered. 0 means it never has, which is a refusal to pay and not a
     // zero balance.
     chainAt: ledger?.at ?? 0,
-    settling: state.settling !== null,
+    // How many payments are signed and not yet answered for. Ordinary rather than exceptional now:
+    // payments run alongside each other, so this is a count and not a lane.
+    inFlight: state.inFlight.filter((entry) => now < entry.deadline).length,
     assets,
   };
 }

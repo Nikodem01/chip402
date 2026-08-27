@@ -1,9 +1,9 @@
 // The file operations that have to be paranoid, and they come in two kinds. The strict ones —
-// `readSecret` for the key, `writeAtomic` and `readJson` for the purse and the settling lock —
+// `readSecret` for the key, `writeAtomic` and `readJson` for the purse and the in-flight list —
 // refuse rather than guess, because "I could not read the limits" must never become "there are no
 // limits". The forgiving ones — `appendLine` and `readTail` for the host names, and `removeFile`
-// for releasing the lock — have the opposite contract: they degrade and never refuse, because
-// what they carry is decoration or a lane that was reopening anyway. All of them are short,
+// for clearing the last one — have the opposite contract: they degrade and never refuse, because
+// what they carry is decoration, or an amount that was about to stop counting anyway. All of them are short,
 // because the paranoia is in the flags rather than in the logic.
 
 import { closeSync, constants, fstatSync, fsyncSync, openSync, readSync, renameSync, rmSync, writeSync } from "node:fs";
@@ -105,9 +105,9 @@ export function writeAtomic(path: string, data: string, mode = 0o600): void {
 }
 
 // Take a file away, and never mind if it is not there or will not go. The only caller is the
-// settling lock's release, and the ordering there is deliberate: the lane is already open in
-// memory by the time this runs, so a removal that fails costs the *next* daemon a lane held until
-// the clock opens it — a denial for at most a lock duration, never a payment. Refusing
+// in-flight list's last entry going, and the ordering there is deliberate: the entry is already
+// gone in memory by the time this runs, so a removal that fails costs the *next* daemon an amount
+// committed until its own deadline — a denial for at most two minutes, never a payment. Refusing
 // here would turn that into a thrown error on the path that has just finished a payment, which is
 // the failure this project spent a whole file avoiding.
 export function removeFile(path: string): void {

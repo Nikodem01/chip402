@@ -10,6 +10,7 @@ import type { AssetKey, NetworkRow } from "./networks.ts";
 import { networkFor } from "./networks.ts";
 import { ENTITY_ID } from "./ids.ts";
 import { parse } from "./money.ts";
+import { dayEnd } from "./policy.ts";
 import type { Plane } from "./protocol.ts";
 import { MAX_LINE_BYTES, RUNTIME_DIR, fail, ok, parseLine, serialize, verbsFor } from "./protocol.ts";
 import { Purse, snapshot } from "./purse.ts";
@@ -31,9 +32,9 @@ export type DaemonOptions = {
 
 export type Daemon = { spendPath: string; adminPath: string; close: () => Promise<void> };
 
-// Often enough that an idle panel is never stale, rarely enough that the mirror node does not
-// notice us. The retry is faster because the usual cause is a boot that beat the network up.
-const CHAIN_REFRESH_MS = 60_000;
+// The first reading at boot routinely lands before DNS is up, so it is retried this often until it
+// works. There is no interval after that: see the reading loop at the bottom of `start` for why an
+// idle chip402 asks the mirror node nothing at all.
 const CHAIN_RETRY_MS = 5_000;
 
 // A panel, a shell, an agent or two. Anything past this is a client that has stopped closing its
@@ -41,6 +42,11 @@ const CHAIN_RETRY_MS = 5_000;
 // rather than to grow the set — the daemon holding the key is not the place to run out of
 // descriptors.
 const MAX_CLIENTS = 64;
+
+// Payments in the air at once. Generous — a metered API paying per request sustains this many
+// divided by the seller's own latency, which is far more than a seller will serve — and it exists
+// to bound fan-out and the in-flight file, not to bound spending. The allowance does that.
+const MAX_IN_FLIGHT = 64;
 
 // An unreadable, unknown-network or misshapen config is a refusal to start. "I could not tell
 // which chain this purse is on" must never resolve to a guess, because the guess could be the
@@ -72,10 +78,13 @@ function assetKey(value: unknown): AssetKey {
 
 export async function start(options: DaemonOptions): Promise<Daemon> {
   const config = loadConfig(options.configPath);
-  const purse = Purse.open(join(options.stateDir, "purse.json"));
+  // The account goes in so the purse can tell whether the in-flight list it finds on disk was
+  // written for the purse it is. `setup --import` changes that account under a running install.
+  const purse = Purse.open(join(options.stateDir, "purse.json"), config.accountId);
   // Three files in this directory and three answers to "what if it cannot be read": purse.json is
   // the limits and a bad one stops the daemon (above); labels.jsonl is host names and a bad one
-  // costs names; settling.json is the lock and a bad one is assumed to be held. The table is in
+  // costs names; inflight.json is what we have signed and not been answered for, and a bad one is
+  // assumed to commit everything until it could not possibly still be true. The table is in
   // purse.ts. On the first start after an upgrade the label store adopts whatever purse.json used
   // to carry, and purse.json stops carrying it on its next write.
   const labels = Labels.open(join(options.stateDir, "labels.jsonl"), () => purse.legacyLabels);
@@ -111,27 +120,28 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     for (const socket of clients) socket.write(frame);
   });
 
-  // SECURITY: payments run one at a time through this chain. Every payment begins by reading the
-  // chain and ends by waiting for its own transaction to appear there, and both of those happen
-  // inside this lane — so two concurrent `pay` calls against an allowance that only covers one
-  // cannot both read a ledger taken before either of them signed. The race is structurally
-  // impossible rather than merely unlikely.
-  let lane: Promise<unknown> = Promise.resolve();
-  function inLane<T>(work: () => Promise<T>): Promise<T> {
-    const next = lane.then(work, work);
-    lane = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
-  }
+  // SECURITY: payments run alongside one another, and what makes that safe is where the day's
+  // figure lives rather than anything here. `policy.decide` reads it and `Purse.authorize` raises
+  // it with no `await` in between, so two payments cannot both pass against the same figure — the
+  // race is closed at the only place it could open. This daemon used to run payments one at a time
+  // instead, because the figure came from a mirror-node reading that lagged them; that bought
+  // safety with a hard ceiling of roughly one payment every few seconds, which is not a purse that
+  // can pay per request for a metered API.
+  //
+  // What is bounded here is fan-out, not safety: this many payments may be in the air at once, and
+  // past it a caller is told so rather than queued. It keeps inflight.json small and keeps a
+  // runaway agent from opening an unbounded number of sockets to sellers.
+  let inFlight = 0;
 
   async function run(plane: Plane, command: ReturnType<typeof parseLine>): Promise<string> {
     const { id, cmd, args } = command;
     switch (cmd) {
       case "purse":
         // The same frame the panel is pushed, but carrying the request id so a client that
-        // asked for it can tell it apart from an unsolicited update.
+        // asked for it can tell it apart from an unsolicited update. Somebody asking is the other
+        // signal that a reading is worth taking; the answer goes out with what we have and the
+        // reading, if one is taken, arrives as a push a moment later.
+        look();
         return serialize({ id, ...snapshot(purse, labels, config.network, identity(), Date.now()) });
 
       case "pause":
@@ -144,8 +154,10 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
         const init: RequestInit = {};
         if (typeof args["method"] === "string") init.method = args["method"];
         if (typeof args["body"] === "string") init.body = args["body"];
+        if (inFlight >= MAX_IN_FLIGHT) return fail(id, `too many payments in flight — retry in a moment`);
+        inFlight++;
         try {
-          const result = await inLane(() => open().pay(url, init));
+          const result = await open().pay(url, init);
           return ok(id, {
             status: result.status,
             contentType: result.contentType,
@@ -157,6 +169,8 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
           // A policy denial gets its own reason back verbatim; anything else is reported as
           // what it is, because a payment that failed for a network reason is not a denial.
           return fail(id, denialReason(error) ?? (error instanceof Error ? error.message : String(error)));
+        } finally {
+          inFlight--;
         }
       }
 
@@ -192,8 +206,10 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     socket.setEncoding("utf8");
     socket.on("close", () => clients.delete(socket));
     socket.on("error", () => socket.destroy());
-    // The panel gets the current state the instant it connects, so its first paint is real.
+    // The panel gets the current state the instant it connects, so its first paint is real — and
+    // somebody connecting is the signal that a reading is now worth taking.
     socket.write(statusFrame());
+    look();
 
     let buffer = "";
     socket.on("data", (chunk: string) => {
@@ -262,30 +278,71 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
   const spend = await bind("spend.sock", 0o660, "spend");
   const admin = await bind("admin.sock", 0o600, "admin");
 
-  // Nothing in this process knows what is held or what has been spent until the chain says so,
-  // and the first read at boot routinely lands before DNS is up. Retry until it works, then keep
-  // reading, so the panel never sits showing a zero it read once during a network outage. A
-  // payment reads it too; this is what keeps an idle purse honest — and what reopens the lane
-  // when a payment was signed and then never turned up.
+  // When this daemon reads the chain, and — more to the point — when it does not.
+  //
+  // It used to ask every sixty seconds, for ever, plus twice per payment. Measured against the
+  // public mirror node that is about 98 MB a day to sit idle and around 320 MB on a busy one, all
+  // of it spent re-deriving a figure this process could already state: it signed every transaction
+  // that moves the day's spending, and only its own key can make the balance smaller. So the
+  // reading is event-driven, and the events are the ones this process cannot cause itself.
+  //
+  //   at start-up   what a *previous* daemon spent today, which is the one thing this one cannot
+  //                 know. Retried until it lands; nothing may be paid before it does.
+  //   at midnight   the day it is measured for has changed, so the figure is taken again for the
+  //                 new one. One scheduled reading per day.
+  //   when looked   a panel connecting or a `purse` command asks for a page, so what a human sees
+  //     at          is current. Dropped by the wallet if the last reading was seconds ago.
+  //   after paying  one page, so the payment shows up as a row the chain returned. Not awaited,
+  //                 and not needed for any decision.
+  //
+  // Idle, that is nothing at all.
   let chainTimer: ReturnType<typeof setTimeout> | undefined;
-  async function pollChain(): Promise<void> {
-    let delay = CHAIN_REFRESH_MS;
+  let dayTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function seed(): Promise<void> {
     try {
       await open().refresh();
     } catch (error) {
-      delay = CHAIN_RETRY_MS;
       console.error("chip402: chain read failed, retrying:", error instanceof Error ? error.message : error);
+      chainTimer = setTimeout(() => void seed(), CHAIN_RETRY_MS);
+      chainTimer.unref();
+      return;
     }
-    chainTimer = setTimeout(() => void pollChain(), delay);
-    chainTimer.unref();
+    // Whatever the last daemon signed and did not stay alive to hear the answer for. Asked once
+    // each here and then chased in the background until the chain answers or the deadline passes.
+    await open().resume().catch(() => undefined);
   }
-  if (config.accountId) void pollChain();
+
+  function atMidnight(): void {
+    // A second past it, so the reading is unambiguously taken in the new day rather than on the
+    // boundary of it. `dayEnd` is local midnight, which is policy.ts's to define.
+    dayTimer = setTimeout(() => {
+      if (config.accountId) void open().refresh().catch(() => undefined);
+      atMidnight();
+    }, Math.max(1_000, dayEnd(Date.now()) + 1_000 - Date.now()));
+    dayTimer.unref();
+  }
+
+  // For the display only, and safe to call as often as anything likes: the wallet drops it if the
+  // last reading is recent, and no decision waits on it.
+  function look(): void {
+    if (!config.accountId) return;
+    void open()
+      .refresh(1)
+      .catch(() => undefined);
+  }
+
+  if (config.accountId) {
+    void seed();
+    atMidnight();
+  }
 
   return {
     spendPath: join(options.runtimeDir, "spend.sock"),
     adminPath: join(options.runtimeDir, "admin.sock"),
     close: async () => {
       if (chainTimer) clearTimeout(chainTimer);
+      if (dayTimer) clearTimeout(dayTimer);
       for (const socket of clients) socket.destroy();
       await Promise.all([
         new Promise<void>((resolve) => spend.close(() => resolve())),

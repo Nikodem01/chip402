@@ -3,12 +3,15 @@
 // here is one of the limits in the README, and deleting any line widens the blast radius by
 // exactly the failure named next to it.
 //
-// The two numbers this file bounds spending against — what is held and what has been spent —
-// are not stored anywhere. They arrive on `purse.ledger`, read off the mirror node by chain.ts
-// moments before this runs, and they go stale: a ledger this file will not trust is a denial,
-// which is why an unreachable mirror node stops payment rather than freeing it.
+// The two quantities this file bounds spending against are what is held and what has gone out
+// today, and neither is asked for here. The day's figure arrives on `purse.spent`: seeded from the
+// chain when the daemon started, raised by every payment of ours the chain has confirmed since, and
+// raised again by every payment authorised and not yet answered for. The balance arrives on
+// `purse.ledger` and is deliberately allowed to be old, because only this purse's own key can make
+// it smaller — so last reading minus what we have committed since is a lower bound that stays true
+// however long ago the reading was taken.
 
-import type { Asset, NetworkRow } from "./networks.ts";
+import type { Asset, AssetKey, NetworkRow } from "./networks.ts";
 import { assetFor } from "./networks.ts";
 import { ENTITY_ID } from "./ids.ts";
 import type { PurseState } from "./purse.ts";
@@ -33,11 +36,26 @@ export type PolicyConfig = {
 
 export type Decision = { ok: true; asset: Asset } | { ok: false; reason: string };
 
-// A reading of the chain older than this is not evidence. The daemon re-reads before every
-// payment, so hitting this means the mirror node is unreachable — and paying against a stale
-// balance, or a stale idea of what has already gone out today, is how a purse goes overdrawn
-// without anyone lying.
-export const LEDGER_MAX_AGE_MS = 90_000;
+// SECURITY: what has been authorised and not yet answered for, in one asset. This is what makes a
+// lock unnecessary: `decide` reads it and the caller raises it with no `await` in between, so any
+// number of payments in flight at once are counted exactly rather than made to queue behind a
+// reading of the chain that lags them.
+//
+// Two things take an entry out of the sum and both are the chain's word rather than ours. The
+// deadline passing means the transaction can never reach consensus, so it never happened. Its id
+// appearing among the payments the chain returned means the chain is already counting it — and
+// `purse.spent` will have been raised to match, so leaving it in would charge the allowance twice
+// for one payment.
+export function committed(purse: PurseState, key: AssetKey, now: number): bigint {
+  const shown = purse.ledger?.payments;
+  let total = 0n;
+  for (const entry of purse.inFlight) {
+    if (entry.asset !== key || now >= entry.deadline) continue;
+    if (entry.txId !== null && shown?.some((payment) => payment.txId === entry.txId)) continue;
+    total += entry.amount;
+  }
+  return total;
+}
 
 // Where the day starts and ends, in this machine's own timezone. This is policy — it is the one
 // thing about "today" that is ours rather than the chain's — and it is computed from the clock
@@ -82,11 +100,6 @@ export function decide(invoice: Invoice, purse: PurseState, config: PolicyConfig
   if (purse.mismatch) {
     return deny("the chain says a different key controls this account — re-import it with `sudo chip402ctl setup --import`");
   }
-
-  // SECURITY: a transaction we signed has not appeared on the chain yet, so what has been spent
-  // today is not yet knowable. Waiting is the whole mechanism — there is no in-flight counter to
-  // add up, because a payment that never settles never appears in the sum at all.
-  if (purse.settling !== null && now < purse.settling.deadline) return deny("a payment is still settling");
 
   // SECURITY: refuse anything but v2. The SDK falls back to a v1 body when the v2 header is
   // absent, and v1 requirements are a different shape with different fields — accepting one
@@ -139,20 +152,40 @@ export function decide(invoice: Invoice, purse: PurseState, config: PolicyConfig
   // separate enable flag to get out of step with this number.
   if (budget.allowance === 0n) return deny(`${asset.symbol} is switched off`);
 
-  // Limits 2 and 3 both rest on the chain's answer, so the answer has to be one we can stand on.
-  // Never read, too old, or measured from a midnight that has since passed: all three are a
-  // refusal, and none of them is a zero.
+  // Limits 2 and 3 both rest on a reading of the chain, so there has to be one, and it has to be a
+  // reading of *this* purse's day.
+  const spent = purse.spent;
   const ledger = purse.ledger;
-  if (ledger === null) return deny("the chain has not answered yet");
-  if (now - ledger.at > LEDGER_MAX_AGE_MS) return deny("what the chain says is too old to trust");
-  if (ledger.since !== dayStart(now)) return deny("the day has rolled over since the chain was read");
+  if (spent === null || ledger === null) return deny("the chain has not answered yet");
 
-  if (ledger.spent[asset.key] + invoice.amount > budget.allowance) {
+  // SECURITY: the check that makes the previous build's worst bug unrepresentable. That build kept
+  // a `spent` figure with nothing on it to say whose it was, so `setup --import` carried an older
+  // wallet's spending into a fresh account and charged its allowance for money it had never spent.
+  // A figure here is stamped with the account it was measured for, and a figure measured for
+  // somebody else is refused rather than reinterpreted.
+  if (spent.accountId !== config.accountId) {
+    return deny("the chain was read for a different account — restart chip402");
+  }
+  // And with the local day it was measured for. There is no counter to zero at midnight; the day
+  // simply stops matching, and the next reading is taken for the new one.
+  if (spent.dayStart !== dayStart(now)) return deny("the day has rolled over since the chain was read");
+
+  const outstanding = committed(purse, asset.key, now);
+  if (spent.totals[asset.key] + outstanding + invoice.amount > budget.allowance) {
     return deny(`over the ${asset.symbol} daily allowance`);
   }
 
   // Limit 3 — the on-chain balance. Nobody can raise this one; it is a fact, not a setting.
-  if (invoice.amount > ledger.balances[asset.key]) return deny(`not enough ${asset.symbol} in the purse`);
+  //
+  // The reading may be minutes or hours old and that is deliberate, because only this purse's key
+  // can make the balance smaller. So the balance as it was, less everything that has left since
+  // that reading — the payments the chain confirmed to us after it, plus the ones still in the air
+  // — is a lower bound that cannot be too high however stale the reading is. Money arriving only
+  // ever makes it pessimistic, which is the direction a spending check may be wrong in.
+  const since = spent.totals[asset.key] - ledger.spent[asset.key];
+  if (invoice.amount > ledger.balances[asset.key] - since - outstanding) {
+    return deny(`not enough ${asset.symbol} in the purse`);
+  }
 
   return { ok: true, asset };
 }

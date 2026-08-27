@@ -1,6 +1,7 @@
 // The enforcement proof. policy.ts deciding "no" is only worth something if no signature can
 // be produced anyway, so this file drives the guarded signer with a stub underneath and asserts
-// the stub is never reached on any deny path — and that the lane closes on the allow path.
+// the stub is never reached on any deny path — and that the allow path commits what it authorised
+// before it reaches the key.
 
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -9,8 +10,9 @@ import test from "node:test";
 import type { PaymentRequirements } from "@x402/fetch";
 import { PrivateKey, inspectHederaTransaction } from "@x402/hedera";
 import type { Sighting } from "../src/fetch.ts";
+import type { Authorization } from "../src/purse.ts";
 import { Purse } from "../src/purse.ts";
-import { denialReason, guard, openWallet, refresh, settle } from "../src/wallet.ts";
+import { denialReason, guard, openWallet, refresh, resolve } from "../src/wallet.ts";
 import { dayStart } from "../src/policy.ts";
 import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "../src/chain.ts";
 import {
@@ -79,7 +81,7 @@ test("the transaction id on the receipt is ours, read out of the bytes we signed
   // Not the seller's claim: the same id the SDK put in the body we signed, which the facilitator
   // cannot change and the seller never had a say in.
   assert.equal(charged[0], inspectHederaTransaction(payload).transactionId);
-  assert.equal(purse.state.settling?.txId, charged[0], "the lane did not close on the signature");
+  assert.equal(purse.state.inFlight[0]?.txId, charged[0], "the payment was not committed on the signature");
   assert.equal(labels.hostFor(String(charged[0])), "api.example.com");
 });
 
@@ -100,20 +102,37 @@ test("SECURITY: a second signature inside one payment throws", async () => {
   assert.equal(calls(), 1, "the key was reached twice in one payment");
 });
 
-test("a second payment is refused while the first is still unaccounted for", async () => {
-  // Not a counter: the lane. The chain has not shown the first transaction yet, so what has been
-  // spent today is not yet knowable, so nothing else may go out.
+test("a second payment goes through while the first is unaccounted for, and both are counted", async () => {
+  // This used to be a refusal. The chain had not shown the first transaction yet, so what had been
+  // spent was not yet knowable, so nothing else could go out — one payment at a time, at the mirror
+  // node's pace. Now the amount is committed before the key is reached, so the day already includes
+  // the payment in the air and the next one is simply measured against it.
   const purse = readyPurse();
   await harness(purse).signer.createPartiallySignedTransferTransaction(requirements());
   const second = harness(purse);
+  await second.signer.createPartiallySignedTransferTransaction(requirements());
+  assert.equal(second.calls(), 1);
+  assert.equal(purse.state.inFlight.length, 2);
+  assert.equal(purse.state.inFlight.reduce((sum, entry) => sum + entry.amount, 0n), 20_000n);
+});
+
+test("SECURITY: payments in flight together cannot exceed the allowance between them", async () => {
+  // The proof that the lane is gone and nothing was given up with it. The allowance covers two
+  // payments; three are asked for with nothing answered for in between, and the third is refused by
+  // figure the first two already raised rather than by anything waiting on the chain.
+  const purse = readyPurse();
+  purse.setLimit("usdc", "allowance", 20_000n);
+  await harness(purse).signer.createPartiallySignedTransferTransaction(requirements());
+  await harness(purse).signer.createPartiallySignedTransferTransaction(requirements());
+  const third = harness(purse);
   await assert.rejects(
-    () => second.signer.createPartiallySignedTransferTransaction(requirements()),
+    () => third.signer.createPartiallySignedTransferTransaction(requirements()),
     (error: unknown) => {
-      assert.match(String(denialReason(error)), /still settling/);
+      assert.match(String(denialReason(error)), /daily allowance/);
       return true;
     },
   );
-  assert.equal(second.calls(), 0);
+  assert.equal(third.calls(), 0, "the key was reached past the allowance");
 });
 
 // Every denial policy.ts can reach, driven through the door rather than through the function.
@@ -151,9 +170,9 @@ const DENIALS: {
     reason: /not enough/,
   },
   {
-    name: "a stale reading of the chain",
-    chain: { at: Date.now() - 200_000 },
-    reason: /too old to trust/,
+    name: "a reading taken for a different account",
+    chain: { accountId: "0.0.999999" },
+    reason: /read for a different account/,
   },
   { name: "us as fee payer", req: { extra: { feePayer: OUR_ACCOUNT } }, reason: /named us as fee payer/ },
   { name: "no fee payer", req: { extra: {} }, reason: /missing or malformed feePayer/ },
@@ -178,13 +197,13 @@ for (const denial of DENIALS) {
     // The three things that must all be true on every deny path.
     assert.equal(calls(), 0, "the key was reached");
     assert.equal(charged.length, 0, "a payment was recorded");
-    assert.equal(purse.state.settling, null, "the lane closed for a payment that never happened");
+    assert.equal(purse.state.inFlight.length, 0, "an amount was committed for a payment that never happened");
   });
 }
 
-// --- the two ways the lane reopens, and no third ----------------------------------------------
+// --- the two ways an authorisation is answered for, and no third -------------------------------
 
-test("the lane reopens the moment the chain shows the transaction", async (t) => {
+test("an authorisation is answered the moment the chain shows the transaction", async (t) => {
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
@@ -192,22 +211,27 @@ test("the lane reopens the moment the chain shows the transaction", async (t) =>
   const inner = testSigner(mirror);
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
   let txId: string | null = null;
-  const signer = guard(inner, purse, walletConfig, sighting, (receipt) => {
+  let entry: Authorization | null = null;
+  const signer = guard(inner, purse, walletConfig, sighting, (receipt, authorized) => {
     txId = receipt.txId;
+    entry = authorized;
   });
 
   await signer.createPartiallySignedTransferTransaction(requirements());
-  assert.notEqual(purse.state.settling, null);
-  assert.equal(await settle(walletConfig, purse, txId, 5_000), true);
-  assert.equal(purse.state.settling, null);
+  assert.equal(purse.state.inFlight.length, 1);
+  assert.equal(await resolve(walletConfig, purse, entry!, 5_000), true);
+  assert.equal(purse.state.inFlight.length, 0);
+  // The amount did not move when it was answered for: it was already counted the moment it was
+  // authorised, which is the whole reason nothing had to wait for this.
+  assert.equal(purse.state.spent?.totals.usdc, 10_000n);
 
-  // And the next reading of the chain contains it, which is the point of having waited.
+  // And the next reading of the chain contains it, which is what makes the figure checkable.
   const after = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
   assert.equal(after.spent.usdc, 10_000n);
   assert.equal(after.payments[0]?.txId, txId);
 });
 
-test("the lane reopens when the transaction can no longer reach the chain, and nothing is counted", async (t) => {
+test("an authorisation lapses when the transaction can no longer reach the chain, and nothing is counted", async (t) => {
   // The other exit: validStart + TransactionValidDuration has passed with the mirror node never
   // having seen it. Nothing is given back because nothing was taken — a payment that never
   // settled simply never appears in the sum.
@@ -219,83 +243,83 @@ test("the lane reopens when the transaction can no longer reach the chain, and n
   const inner = testSigner(mirror);
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
   let txId: string | null = null;
-  const signer = guard(inner, purse, walletConfig, sighting, (receipt) => {
+  let entry: Authorization | null = null;
+  const signer = guard(inner, purse, walletConfig, sighting, (receipt, authorized) => {
     txId = receipt.txId;
+    entry = authorized;
   });
 
   await signer.createPartiallySignedTransferTransaction(requirements());
-  const deadline = purse.state.settling!.deadline;
-  // Giving up on patience is not an exit: the lane stays shut and policy.ts keeps denying.
-  assert.equal(await settle(walletConfig, purse, txId, 0), false);
-  assert.notEqual(purse.state.settling, null);
+  const committed = entry as unknown as Authorization;
+  // Giving up on patience is not an answer: the amount stays committed and policy.ts keeps counting
+  // it. The asking continues in the background with the time the entry has left.
+  assert.equal(await resolve(walletConfig, purse, committed, 0), false);
+  assert.equal(purse.state.inFlight.length, 1);
 
-  // Wind the clock past the whole lock duration by pretending validStart already was — the
-  // deadline is the only thing that ends this, so moving it is the same experiment as waiting.
-  purse.beginSettling(txId, Date.now() - (VALID_DURATION_MS + INDEXING_MARGIN_MS + 1_000));
-  assert.ok(purse.state.settling!.deadline < Date.now());
-  assert.equal(await settle(walletConfig, purse, txId, 0), false);
-  assert.equal(purse.state.settling, null, "the lane never reopened");
-  assert.ok(deadline > 0);
+  // Wind past the whole authorisation duration by pretending validStart already was — the deadline
+  // is the only thing that ends this, so moving it is the same experiment as waiting.
+  purse.identify(committed, txId, Date.now() - (VALID_DURATION_MS + INDEXING_MARGIN_MS + 1_000));
+  assert.ok(committed.deadline < Date.now());
+  assert.equal(await resolve(walletConfig, purse, committed, 0), false);
+  assert.equal(purse.state.inFlight.length, 0, "an amount stayed committed past its own deadline");
+  assert.equal(purse.state.spent?.totals.usdc, 0n, "a payment that never settled was counted");
 
   const after = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
   assert.equal(after.spent.usdc, 0n, "a payment that never settled was counted");
 });
 
-test("the receipt says what the chain says, even when the poll loop got there first", async (t) => {
-  // `pollChain` runs every 60 s and is not serialized against a payment in flight — `inLane` wraps
-  // `pay`, not the poll. So a refresh landing between the signature and `settle()` clears the lane
-  // first, and `settle()` used to read "the lane is open" as "not on the chain" and stamp
-  // `onChain: false` on a receipt for a payment that had settled a moment earlier. The ledger was
-  // right either way; the receipt was not. It is a claim about the chain, so it is asked of the
-  // chain.
+test("the receipt says what the chain says, and asks the chain to find out", async (t) => {
+  // `onChain` is a claim about the chain, so it is asked of the chain and never inferred from this
+  // process's own bookkeeping. It used to be read off the lane — "the lane is open, so it cannot be
+  // on the chain" — which put `onChain: false` on a receipt for a payment that had settled a moment
+  // earlier, whenever anything else cleared the lane first. The ledger was right either way; the
+  // receipt was not.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
   const purse = readyPurse();
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
-  let txId: string | null = null;
-  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (receipt) => {
-    txId = receipt.txId;
+  let entry: Authorization | null = null;
+  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (_receipt, authorized) => {
+    entry = authorized;
   });
   await signer.createPartiallySignedTransferTransaction(requirements());
 
-  // Exactly what a refresh that saw the transaction does, a millisecond before settle() runs.
-  purse.finishSettling();
-  assert.equal(purse.state.settling, null);
+  // Exactly what somebody else answering for it first does to the list.
+  const committed = entry as unknown as Authorization;
+  purse.settled(committed);
+  assert.equal(purse.state.inFlight.length, 0);
 
-  assert.equal(await settle(walletConfig, purse, txId, 0), true, "a settled payment was reported as unsettled");
+  assert.equal(await resolve(walletConfig, purse, committed, 0), true, "a settled payment was reported as unsettled");
 });
 
-test("a lane somebody else opened does not turn a payment that never happened into one that did", async (t) => {
-  // The other side of the same question. The lane is open and the mirror node has never heard of
-  // the transaction — because the clock ended the wait, not the chain — so the honest answer is
-  // still "not seen", and it is the mirror node saying so rather than the lock.
+test("an entry somebody else answered for does not turn a payment that never happened into one that did", async (t) => {
+  // The other side of the same question. The entry is gone from the list and the mirror node has
+  // never heard of the transaction, so the honest answer is still "not seen" — and it is the mirror
+  // node saying so rather than the absence of a record here.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   mirror.indexing = true;
   const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
   const purse = readyPurse();
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
-  let txId: string | null = null;
-  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (receipt) => {
-    txId = receipt.txId;
+  let entry: Authorization | null = null;
+  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (_receipt, authorized) => {
+    entry = authorized;
   });
   await signer.createPartiallySignedTransferTransaction(requirements());
-  purse.finishSettling();
-
-  assert.equal(await settle(walletConfig, purse, txId, 0), false);
-  // And an unreachable mirror node is not evidence either way, which reads as "not seen".
-  await mirror.close();
-  assert.equal(await settle(walletConfig, purse, txId, 0), false);
+  const committed = entry as unknown as Authorization;
+  purse.abandon(committed);
+  assert.equal(await resolve(walletConfig, purse, committed, 0), false, "a payment the chain never saw was reported as settled");
 });
 
-test("the window the chain is read over is local midnight, settling or not", async (t) => {
+test("the window the chain is read over is local midnight, in flight or not", async (t) => {
   // `refresh()` used to widen the window to `now - 120 s` whenever a payment was in flight, on the
   // theory that a transaction signed just before midnight had to be looked for in yesterday too.
   // Nothing looked: `paymentsIn` drops every row before local midnight, and the in-flight question
   // is a direct lookup of one id. So the reach-back only fetched rows to throw them away — and
-  // every one of them counted against the page bound the fallback in chain.ts exists to keep us
-  // under. This pins the floor at midnight in both states, so it cannot come back by accident.
+  // every one of them counted against the page bound chain.ts still has for the one walk it does.
+  // This pins the floor at midnight in both states, so it cannot come back by accident.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
@@ -306,7 +330,7 @@ test("the window the chain is read over is local midnight, settling or not", asy
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
   const signer = guard(testSigner(mirror), purse, walletConfig, sighting, () => {});
   await signer.createPartiallySignedTransferTransaction(requirements());
-  assert.notEqual(purse.state.settling, null, "the lane did not close, so this proves nothing");
+  assert.equal(purse.state.inFlight.length, 1, "nothing was committed, so this proves nothing");
   await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
 
   const windows = mirror.requests.filter((path) => path.startsWith("/api/v1/transactions?"));
@@ -337,16 +361,15 @@ test("a signer that refuses does not shut the lane behind it", async () => {
     () => {},
   );
   await assert.rejects(() => signer.createPartiallySignedTransferTransaction(requirements()), /the key said no/);
-  assert.equal(purse.state.settling, null, "a payment that was never signed held the lane shut");
+  assert.equal(purse.state.inFlight.length, 0, "a payment that was never signed stayed committed");
 });
 
-test("the lane stays shut through the mirror node's lag, not just the chain's window", async (t) => {
+test("an authorisation outlasts the mirror node's lag, not just the chain's window", async (t) => {
   // "It can never reach consensus" and "it can never start showing up" are different instants, and
-  // the lane needs the second one. A facilitator that submits at validStart + 119 s gets consensus
-  // inside the window — the payment is real and will be charged — but the mirror node is a second
-  // or three behind it. A lane that opened at validStart + 120 s exactly would spend those seconds
-  // reading a ledger that does not contain a payment that has already happened, which is the same
-  // extra payment B12 was about with a slow facilitator in place of a restart.
+  // an authorisation has to last until the second one. A facilitator that submits at
+  // validStart + 119 s gets consensus inside the window — the payment is real and will be charged —
+  // but the mirror node is a second or three behind it. Letting go at validStart + 120 s exactly
+  // would stop counting a payment that has already happened, for the seconds it takes to appear.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   mirror.indexing = true;                       // consensus reached; the mirror has not caught up
@@ -354,31 +377,35 @@ test("the lane stays shut through the mirror node's lag, not just the chain's wi
   const purse = readyPurse();
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
   let txId: string | null = null;
-  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (receipt) => {
+  let entry: Authorization | null = null;
+  const signer = guard(testSigner(mirror), purse, walletConfig, sighting, (receipt, authorized) => {
     txId = receipt.txId;
+    entry = authorized;
   });
   await signer.createPartiallySignedTransferTransaction(requirements());
 
   // Three seconds past the chain's own deadline, which is inside the margin and nowhere near past
   // it. Moving validStart is the same experiment as waiting, and it does not need a clock.
-  purse.beginSettling(txId, Date.now() - (VALID_DURATION_MS + 3_000));
-  assert.equal(await settle(walletConfig, purse, txId, 0), false);
-  assert.notEqual(purse.state.settling, null, "the lane opened inside the mirror node's lag");
+  const committed = entry as unknown as Authorization;
+  purse.identify(committed, txId, Date.now() - (VALID_DURATION_MS + 3_000));
+  assert.equal(await resolve(walletConfig, purse, committed, 0), false);
+  assert.equal(purse.state.inFlight.length, 1, "the amount lapsed inside the mirror node's lag");
   const early = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
-  assert.notEqual(purse.state.settling, null, "a refresh opened the lane inside the lag");
   assert.equal(early.spent.usdc, 0n, "the ledger showed a payment the mirror was still holding");
 
-  // And then the mirror catches up, which is the whole reason for waiting: the payment is counted
-  // and the lane opens on the chain rather than on the clock.
+  // And then the mirror catches up, which is the whole reason the margin is not zero: the payment
+  // is answered for by the chain rather than lapsing on the clock, and it is counted.
   mirror.catchUp();
+  assert.equal(await resolve(walletConfig, purse, committed, 0), true);
+  assert.equal(purse.state.inFlight.length, 0, "the chain showed it and it stayed in the air");
+  assert.equal(purse.state.spent?.totals.usdc, 10_000n, "the payment was not counted");
   const late = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
-  assert.equal(purse.state.settling, null, "the lane never reopened once the chain showed it");
   assert.equal(late.spent.usdc, 10_000n, "the payment was not counted");
 });
 
-test("bytes we cannot read back close the lane on the clock alone", async () => {
-  // If inspectHederaTransaction cannot tell us what we just signed, we cannot ask the chain
-  // about it either. Fail closed: the lane still shuts, and only the deadline opens it.
+test("bytes we cannot read back stay committed on the deadline alone", async () => {
+  // If inspectHederaTransaction cannot tell us what we just signed, we cannot ask the chain about
+  // it either. Fail closed: the amount is committed anyway, and only the deadline can end it.
   const purse = readyPurse();
   const sighting: Sighting = { finalUrl: "https://api.example.com/secret", x402Version: 2 };
   const signer = guard(
@@ -389,8 +416,9 @@ test("bytes we cannot read back close the lane on the clock alone", async () => 
     () => {},
   );
   await signer.createPartiallySignedTransferTransaction(requirements());
-  assert.notEqual(purse.state.settling, null);
-  assert.equal(purse.state.settling?.txId, null);
+  assert.equal(purse.state.inFlight.length, 1);
+  assert.equal(purse.state.inFlight[0]?.txId, null);
+  assert.equal(purse.state.inFlight[0]?.amount, 10_000n);
 });
 
 // --- the structural guarantees -----------------------------------------------------------------

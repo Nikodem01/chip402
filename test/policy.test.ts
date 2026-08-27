@@ -5,9 +5,9 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { LEDGER_MAX_AGE_MS, dayStart, decide } from "../src/policy.ts";
+import { dayStart, decide } from "../src/policy.ts";
 import type { AssetKey } from "../src/networks.ts";
-import { NOW, OUR_ACCOUNT, config, invoice, ledger, purseState, testnet } from "./support.ts";
+import { NOW, OUR_ACCOUNT, config, inFlight, invoice, ledger, purseState, testnet } from "./support.ts";
 
 // Both assets get the identical table, so a check that only ever fired for USDC would show up
 // here as an HBAR failure rather than as silence.
@@ -102,10 +102,24 @@ for (const asset of ASSETS) {
     assert.match(result.ok ? "" : result.reason, /not enough/);
   });
 
-  test(`${asset.key}: a reading of the chain that has gone stale is not evidence`, () => {
-    const purse = purseState({ ledger: ledger({ at: NOW - LEDGER_MAX_AGE_MS - 1 }) });
-    const result = decide(inv(), purse, config, NOW);
-    assert.match(result.ok ? "" : result.reason, /too old to trust/);
+  test(`${asset.key}: an old reading of the chain still pays, because it can only be wrong the safe way`, () => {
+    // There is deliberately no staleness check any more, and the reason is a fact about the chain
+    // rather than a tolerance somebody picked. Only this purse's own key can make its balance
+    // smaller, and this process signed everything that could — so a reading from hours ago, less
+    // what has left since, is a lower bound that stays true however old it is. Money arriving only
+    // makes it pessimistic. Denying on age instead bought nothing and cost a purse that stopped
+    // working whenever somebody else's REST API did.
+    const purse = purseState({ ledger: ledger({ at: NOW - 6 * 3600_000 }) });
+    assert.equal(decide(inv(), purse, config, NOW).ok, true);
+  });
+
+  test(`${asset.key}: what has left since the reading is taken off the balance it showed`, () => {
+    // The balance the chain reported, minus every payment of ours confirmed after that reading and
+    // every one still in the air. Here the reading showed just enough for one payment and one is
+    // already committed, so there is nothing left for a second.
+    const reading = ledger({ balances: { usdc: 0n, hbar: 0n, [asset.key]: asset.small } });
+    const purse = purseState({ ledger: reading, inFlight: [inFlight(asset.key, asset.small)] });
+    assert.match(decide(inv(), purse, config, NOW).ok ? "" : "not enough", /not enough/);
   });
 
   test(`${asset.key}: a chain that has never answered is a refusal, not a zero`, () => {
@@ -113,16 +127,37 @@ for (const asset of ASSETS) {
     assert.match(result.ok ? "" : result.reason, /chain has not answered/);
   });
 
-  test(`${asset.key}: nothing is paid while a signed transaction is still unaccounted for`, () => {
-    const purse = purseState({ settling: { txId: "0.0.9185802@1.0", deadline: NOW + 1 } });
-    const result = decide(inv(), purse, config, NOW);
-    assert.match(result.ok ? "" : result.reason, /still settling/);
+  test(`${asset.key}: a payment the chain has not shown yet still counts against the day`, () => {
+    // The indexing gap, closed by counting rather than by waiting. This purse used to refuse every
+    // payment while one was in the air, because the figure it measured against came from a mirror
+    // node that lagged the signature. Now the amount is committed on the way to the key, so other
+    // payments carry on — they are simply measured against a day that already includes this one.
+    const room = purseState()[asset.key].allowance - asset.small;
+    const purse = purseState({ inFlight: [inFlight(asset.key, room)] });
+    assert.equal(decide(inv({ amount: asset.small }), purse, config, NOW).ok, true, "one unit under the line was refused");
+    const overfull = purseState({ inFlight: [inFlight(asset.key, room + 1n)] });
+    assert.match(decide(inv(), overfull, config, NOW).ok ? "" : "over the daily allowance", /daily allowance/);
   });
 
-  test(`${asset.key}: once the transaction can no longer settle, the lane is open again`, () => {
-    // validStart + 120s has passed, so Hedera will never accept it. Nothing is given back
-    // because nothing was taken: it simply never appears in the chain's sum.
-    const purse = purseState({ settling: { txId: "0.0.9185802@1.0", deadline: NOW } });
+  test(`${asset.key}: once a payment can no longer reach consensus it stops counting`, () => {
+    // validStart + TransactionValidDuration + the indexing margin has passed, so Hedera will never
+    // accept it and the mirror node will never start showing it. Nothing is given back because
+    // nothing was taken: it simply never appears in the day at all.
+    const purse = purseState({ inFlight: [inFlight(asset.key, purseState()[asset.key].allowance, { deadline: NOW })] });
+    assert.equal(decide(inv(), purse, config, NOW).ok, true);
+  });
+
+  test(`${asset.key}: a payment the chain has since shown is not counted twice`, () => {
+    // The entry is still in the list — nothing has swept it yet — but the reading in hand already
+    // contains its id, so `purse.spent` has been raised to match. Counting it in both places would
+    // charge the day twice for one payment.
+    const txId = "0.0.9185802@1800000000.0";
+    const reading = ledger({
+      spent: { usdc: 0n, hbar: 0n, [asset.key]: asset.small },
+      payments: [{ txId, at: NOW, asset: asset.key, amount: asset.small, payTo: "0.0.5005" }],
+    });
+    const room = purseState()[asset.key].allowance - asset.small - asset.small;
+    const purse = purseState({ ledger: reading, inFlight: [inFlight(asset.key, asset.small, { txId }), inFlight(asset.key, room)] });
     assert.equal(decide(inv(), purse, config, NOW).ok, true);
   });
 
@@ -159,6 +194,16 @@ for (const asset of ASSETS) {
 }
 
 // --- the key check, which now costs something ------------------------------------------------
+
+test("SECURITY: a figure measured for another account is refused, not reinterpreted", () => {
+  // The previous build's worst bug, made unrepresentable. It kept a `spent` figure with nothing on
+  // it to say whose it was, so `setup --import` carried an older wallet's spending into a fresh
+  // account and charged its allowance for money that account had never spent. Nothing was attacking
+  // it. Here the figure is stamped, and a stamp that does not match is a refusal.
+  const elsewhere = purseState({ ledger: ledger({ accountId: "0.0.999999" }) });
+  const result = decide(invoice(), elsewhere, config, NOW);
+  assert.match(result.ok ? "" : result.reason, /read for a different account/);
+});
 
 test("a confirmed key mismatch denies, and says how to fix it", () => {
   const result = decide(invoice(), purseState({ mismatch: true }), config, NOW);

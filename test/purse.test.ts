@@ -7,21 +7,18 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Purse, snapshot } from "../src/purse.ts";
+import { AUTHORIZATION_MS, Purse, snapshot } from "../src/purse.ts";
 import { dayEnd } from "../src/policy.ts";
 import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "../src/chain.ts";
-
-// How long a lock may last: the chain's own validity window plus the margin the mirror node is
-// allowed to be behind it. Taken from the constants rather than written out, so the two cannot
-// drift apart the way a hand-copied 120_000 would.
-const LOCK_DURATION = VALID_DURATION_MS + INDEXING_MARGIN_MS;
 import { NOW, OUR_EVM_ADDRESS, OUR_PUBLIC_KEY, OUR_ACCOUNT, fakeMirror, labelStore, ledger, scratch, sleep, testnet } from "./support.ts";
 import { refresh } from "../src/wallet.ts";
 import { dayStart } from "../src/policy.ts";
 
 function open(dir: string): Purse {
-  return Purse.open(join(dir, "purse.json"));
+  return Purse.open(join(dir, "purse.json"), OUR_ACCOUNT);
 }
+
+const INFLIGHT = "inflight.json";
 
 const identity = { accountId: "0.0.10193689", accountWithChecksum: "0.0.10193689-wkdxo", evmAddress: null, verified: null };
 const labels = labelStore();
@@ -74,140 +71,138 @@ test("there is no local spending state anywhere in src/", () => {
   const files = readdirSync(new URL("../src/", import.meta.url)).filter((name) => name.endsWith(".ts"));
   for (const name of files) {
     const source = readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8");
-    assert.doesNotMatch(source, /spentToday|\bannotate\b|\bconfirm\(/, `${name} keeps a spending ledger`);
+    assert.doesNotMatch(source, /spentToday|\bannotate\b/, `${name} keeps a spending ledger`);
   }
-  // And in the purse itself, no number moves at all: every field it holds is assigned outright
-  // by root over the admin socket, or read whole from the chain.
+  // The day's figure is kept in memory now, deliberately — but nothing about it may reach disk.
+  // `persist` writes purse.json and `#write` writes the in-flight list; those two are the only
+  // writers in the file, and what they write is checked field by field below.
   const purse = readFileSync(new URL("../src/purse.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(purse, /[+\-]=/, "the purse does arithmetic on something it keeps");
+  assert.equal((purse.match(/writeAtomic\(/g) ?? []).length, 2, "purse.ts grew a third thing it writes");
   // Exactly one read of the legacy shape, and it is the label migration.
   assert.equal((purse.match(/"receipts"/g) ?? []).length, 1, "purse.ts touches the old receipts list more than once");
 });
 
-test("nothing restored from disk carries a fact about the chain", () => {
+test("nothing restored from disk is a figure, and what is restored expires", () => {
   const dir = scratch();
   const purse = open(dir);
   purse.setLimit("usdc", "allowance", 2_000_000n);
   purse.observe(ledger({ spent: { usdc: 999_000n, hbar: 0n } }), true);
-  purse.beginSettling("0.0.9185802@1800000000.0", Date.now());
+  const entry = purse.authorize("usdc", 10_000n, Date.now());
+  purse.identify(entry, "0.0.9185802@1800000000.0", Date.now());
 
   const reloaded = open(dir);
   assert.equal(reloaded.state.usdc.allowance, 2_000_000n, "the limit is policy and survives");
   assert.equal(reloaded.state.ledger, null, "a restarted daemon must ask the chain again");
+  assert.equal(reloaded.state.spent, null, "a restarted daemon must ask the chain what it spent");
   assert.equal(reloaded.state.mismatch, false);
 
-  // The lock does survive — that is B12 — and it is the one exception, so it is worth saying
-  // exactly what it is allowed to carry. A transaction id and a deadline: what we authorised and
-  // when it stops being able to happen. Not what it moved, not whether it did, not a balance and
-  // not a running total. Every number the chain owns is still asked for again.
-  const settling = reloaded.state.settling as Record<string, unknown> | null;
-  assert.notEqual(settling, null, "a restart handed back the allowance");
+  // The in-flight list does survive — that is the whole point of it — so it is worth saying exactly
+  // what it is allowed to carry, and for how long. What we authorised, in which asset, its id, and
+  // the instant it stops being able to happen. Not what it moved, not whether it did, not a
+  // balance, not a running total, and nothing at all that outlives its own deadline.
+  assert.equal(reloaded.state.inFlight.length, 1, "a restart handed back the allowance");
+  assert.equal(reloaded.state.inFlight[0]!.amount, 10_000n);
 
-  // Read off the *file*, not off `state.settling`. That distinction is the whole assertion:
-  // `readLock` builds a fresh `{ txId, deadline }` whatever it finds, so checking the object's key
-  // set proves only that readLock is readLock. Adding a `units` field to what `beginSettling`
-  // writes left the entire suite green — an amount reaching disk and surviving a restart, with the
-  // one test that exists to forbid it passing. The word list below is a second net, not the net.
-  const onDisk = readFileSync(join(dir, "settling.json"), "utf8");
-  const written = JSON.parse(onDisk) as Record<string, unknown>;
-  assert.deepEqual(Object.keys(written).sort(), ["deadline", "txId"], "the lock file grew a field");
-  assert.equal(typeof written["txId"], "string");
-  assert.equal(typeof written["deadline"], "number");
-  assert.doesNotMatch(onDisk, /amount|spent|balance|usdc|hbar|paid|settled/i, "the lock is a ledger");
-  assert.ok(onDisk.length < 120, "the lock is bigger than a lock needs to be");
+  // Read off the *file*, not off the object. That distinction is the whole assertion: `readInFlight`
+  // builds a fresh entry whatever it finds, so checking the object's keys proves only that
+  // readInFlight is readInFlight. A field added to what `#write` writes would otherwise reach disk
+  // and survive a restart with the one test that exists to forbid it passing.
+  const written = JSON.parse(readFileSync(join(dir, INFLIGHT), "utf8")) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(written).sort(), ["accountId", "entries"], "the in-flight file grew a field");
+  const rows = written["entries"] as Record<string, unknown>[];
+  assert.deepEqual(Object.keys(rows[0]!).sort(), ["amount", "asset", "deadline", "txId"], "an entry grew a field");
+  assert.doesNotMatch(readFileSync(join(dir, INFLIGHT), "utf8"), /balance|total|since|spent/);
 });
 
-test("SECURITY: a reading that was overtaken cannot displace the one that overtook it", async (t) => {
-  // The invariant the settling lock protects, reached from the other side — after the lock has
-  // legitimately opened. `refresh` has three callers and nothing orders them: the chain-poll loop,
-  // which is deliberately outside the payment lane, and both ends of a payment. So the last to
-  // *complete* used to win rather than the last to start, and a read issued before a payment
-  // settled could displace one issued after it — arriving with a timestamp seconds old and a
-  // `spent` that predates the payment. Every check in `decide` passes on that, and the day's
-  // allowance is charged once for two payments.
-  //
-  // Both halves are needed and both are exercised here: `Ledger.at` is stamped when the requests go
-  // out rather than when they land, and `observe` refuses a reading older than the one it holds.
-  const mirror = await fakeMirror();
-  t.after(() => mirror.close());
-  const walletConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
-  const purse = open(scratch());
-
-  // One reading issued now, with the balances leg held back so it cannot land for a while.
-  mirror.accountsDelayMs = 500;
-  const overtaken = refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
-  await sleep(80);
-
-  // A payment settles, and a second reading is issued and served while the first is still in the
-  // air. This is the one that tells the truth.
-  mirror.accountsDelayMs = 0;
-  mirror.record("0.0.9185802@1800000042.0", "usdc", 10_000n, dayStart(Date.now()) + 1_000);
-  const current = await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS);
-  assert.equal(current.spent.usdc, 10_000n, "the fixture did not produce a reading that saw the payment");
-  assert.equal(purse.observe(current, false), true);
-
-  // And now the first one lands, later, knowing less.
-  const stale = await overtaken;
-  assert.equal(stale.spent.usdc, 0n, "the fixture did not produce an overtaken reading");
-  assert.ok(stale.at < current.at, "`at` is stamped on arrival, so a slow read looks fresher than it is");
-  assert.equal(purse.observe(stale, false), false, "a reading issued earlier displaced a newer one");
-  assert.equal(purse.state.ledger?.spent.usdc, 10_000n, "the purse forgot a payment that had settled");
-});
-
-test("the lock the restart honours is the lock, and nothing longer", () => {
-  // The restored deadline is the one thing a corrupt file could use to wedge the purse for ever,
-  // so it is clamped rather than trusted: a genuine deadline is `validStart + 120s` and validStart
-  // is always in the past by the time it is written, so anything past `now + 120s` is damage.
+test("SECURITY: an in-flight list written for another account is not this purse's to honour", () => {
+  // The shape of the previous build's worst bug, refused at the file. It kept a `spent` figure with
+  // nothing on it to say whose it was, so `setup --import` walked an older wallet's spending into a
+  // fresh account. Here the account is on the file, and a file that names a different one is
+  // discarded rather than applied — a figure that cannot be attributed is not a figure.
   const dir = scratch();
-  const lock = join(dir, "settling.json");
+  const purse = open(dir);
+  purse.authorize("usdc", 10_000n, Date.now());
+  assert.equal(Purse.open(join(dir, "purse.json"), "0.0.999999").state.inFlight.length, 0);
+  assert.equal(Purse.open(join(dir, "purse.json"), OUR_ACCOUNT).state.inFlight.length, 1);
+});
+
+test("what a restart honours is honoured for no longer than it could really have lasted", () => {
+  // The restored deadline is the one thing a corrupt file could use to wedge the purse for ever, so
+  // it is clamped rather than trusted: a genuine deadline is `validStart + AUTHORIZATION_MS` and
+  // validStart is always in the past by the time it is written, so anything beyond `now + that` is
+  // damage.
+  const dir = scratch();
+  const file = join(dir, INFLIGHT);
   const far = Date.now() + 400 * 24 * 3600 * 1000;
-  writeFileSync(lock, JSON.stringify({ txId: "0.0.9185802@1800000000.0", deadline: far }));
-  const held = open(dir).state.settling!;
-  assert.ok(held.deadline <= Date.now() + LOCK_DURATION, "a garbled deadline wedged the purse");
+  const row = (deadline: number) =>
+    JSON.stringify({ accountId: OUR_ACCOUNT, entries: [{ asset: "usdc", amount: "10000", txId: "0.0.9185802@1800000000.0", deadline }] });
+
+  writeFileSync(file, row(far));
+  const held = open(dir).state.inFlight[0]!;
+  assert.ok(held.deadline <= Date.now() + AUTHORIZATION_MS, "a garbled deadline wedged the purse");
   assert.ok(held.deadline > Date.now());
 
-  // And a deadline that has already passed is not a lock at all: the transaction can no longer
-  // reach consensus, which is the same exit the running daemon takes on the clock.
-  writeFileSync(lock, JSON.stringify({ txId: "0.0.9185802@1800000000.0", deadline: Date.now() - 1 }));
-  assert.equal(open(dir).state.settling, null, "an expired lock outlived the transaction it named");
+  // And one that has already passed is not held at all: the transaction can no longer reach
+  // consensus, which is the same exit the running daemon takes on the clock.
+  writeFileSync(file, row(Date.now() - 1));
+  assert.equal(open(dir).state.inFlight.length, 0, "an expired entry outlived the transaction it named");
 });
 
-test("a lock we cannot read is a lock we honour", () => {
-  // Fail-closed, and bounded: the file is unreadable, so we do not know whether anything is in
-  // flight — and "assume nothing is" is the reading that authorises a second payment. Holding
-  // costs at most TransactionValidDuration of denial, after which the clock opens the lane with
-  // no file involved at all.
-  for (const damage of ["{ not json", '"a string"', "", "[1,2,3]", '{"txId":"0.0.1@1.0"}', '{"deadline":"soon"}']) {
+test("a list we cannot read commits everything, for as long as any entry could have lasted", () => {
+  // Fail-closed, and bounded. The file is unreadable, so we do not know what is in the air — and
+  // "assume nothing is" is the reading that authorises a second payment. Committing the whole
+  // allowance costs at most a little over two minutes of denial, after which every entry expires on
+  // its own deadline with no file involved at all.
+  for (const damage of ["{ not json", '"a string"', "", "[1,2,3]", '{"accountId":"0.0.10193689"}', '{"accountId":"0.0.10193689","entries":[{"asset":"usdc"}]}']) {
     const dir = scratch();
-    writeFileSync(join(dir, "settling.json"), damage);
-    const held = open(dir).state.settling;
-    assert.notEqual(held, null, `damage was read as "nothing in flight": ${JSON.stringify(damage)}`);
-    assert.ok(held!.deadline > Date.now() && held!.deadline <= Date.now() + LOCK_DURATION);
-    // With no id, only the clock can end it — there is nothing to ask the chain about.
-    assert.equal(held!.txId, null);
+    const purse = open(dir);
+    purse.setLimit("usdc", "allowance", 2_000_000n);
+    purse.persist();
+    writeFileSync(join(dir, INFLIGHT), damage);
+    const held = open(dir).state.inFlight;
+    assert.ok(held.length > 0, `damage was read as "nothing in flight": ${JSON.stringify(damage)}`);
+    const usdc = held.find((entry) => entry.asset === "usdc")!;
+    assert.equal(usdc.amount, 2_000_000n, "damage did not commit the whole allowance");
+    assert.ok(usdc.deadline > Date.now() && usdc.deadline <= Date.now() + AUTHORIZATION_MS);
+    // With no id there is nothing to ask the chain about; only the deadline can end it.
+    assert.equal(usdc.txId, null);
   }
 });
 
-test("releasing the lock takes the file with it", () => {
+test("the lock the previous build kept is honoured once and then gone", () => {
+  // Upgrading over a daemon that had a payment in the air. The old file carried no amount, so the
+  // only safe reading of it is "all of it" — and then it is deleted, because this build never
+  // writes one and a file nobody writes is a file nobody should keep reading.
   const dir = scratch();
   const purse = open(dir);
-  purse.beginSettling("0.0.9185802@1800000000.0", Date.now());
-  assert.ok(existsSync(join(dir, "settling.json")));
-  purse.finishSettling();
-  assert.equal(existsSync(join(dir, "settling.json")), false, "a released lock still shuts the next daemon's lane");
-  assert.equal(open(dir).state.settling, null);
+  purse.setLimit("usdc", "allowance", 2_000_000n);
+  purse.persist();
+  writeFileSync(join(dir, "settling.json"), JSON.stringify({ txId: "0.0.9185802@1800000000.0", deadline: Date.now() + 60_000 }));
+  const held = open(dir).state.inFlight;
+  assert.equal(held.find((entry) => entry.asset === "usdc")?.amount, 2_000_000n);
+  assert.equal(existsSync(join(dir, "settling.json")), false, "the old lock file is still there to be read again");
 });
 
-test("the lock cannot be taken at all if it cannot be written down", () => {
-  // A lock only this process remembers is not a lock. `beginSettling` therefore writes first and
-  // sets the field second, and it is allowed to throw — wallet.ts takes it before it reaches the
-  // key precisely so that this is a refusal to pay rather than a payment that has already been
-  // signed failing on a file operation.
+test("answering for a payment takes it out of the file, and the file with it", () => {
   const dir = scratch();
   const purse = open(dir);
-  mkdirSync(join(dir, "settling.json.tmp"));      // writeAtomic cannot create its temp file
-  assert.throws(() => purse.beginSettling("0.0.9185802@1800000000.0", Date.now()));
-  assert.equal(purse.state.settling, null, "the lane closed on a lock that was never written");
+  const entry = purse.authorize("usdc", 10_000n, Date.now());
+  assert.ok(existsSync(join(dir, INFLIGHT)));
+  purse.settled(entry);
+  assert.equal(existsSync(join(dir, INFLIGHT)), false, "an answered payment still commits the next daemon's allowance");
+  assert.equal(open(dir).state.inFlight.length, 0);
+});
+
+test("nothing may be authorised that cannot be written down", () => {
+  // An authorisation only this process remembers is no authorisation at all: the daemon that has to
+  // honour it may be the next one. `authorize` therefore writes first and sets the field second, and
+  // it is allowed to throw — wallet.ts calls it before it reaches the key precisely so that this is
+  // a refusal to pay rather than a payment already signed failing on a file operation.
+  const dir = scratch();
+  const purse = open(dir);
+  mkdirSync(join(dir, `${INFLIGHT}.tmp`));          // writeAtomic cannot create its temp file
+  assert.throws(() => purse.authorize("usdc", 10_000n, Date.now()));
+  assert.equal(purse.state.inFlight.length, 0, "an amount was committed that was never written");
 });
 
 test("upgrading from the old build keeps the host names and nothing else", () => {
@@ -257,21 +252,84 @@ test("upgrading from the old build keeps the host names and nothing else", () =>
   assert.equal(open(dir).legacyLabels.length, 0);
 });
 
-test("the lane closes on a signature and only the chain or the clock opens it", () => {
+test("an authorisation is answered for by the chain or by its own deadline, and by nothing else", () => {
   const purse = open(scratch());
-  assert.equal(purse.state.settling, null);
+  purse.observe(ledger(), false);
+  assert.equal(purse.state.inFlight.length, 0);
   const validStart = 1_800_000_000_000;
-  purse.beginSettling("0.0.9185802@1800000000.0", validStart);
-  const settling = purse.state.settling as { txId: string | null; deadline: number } | null;
-  assert.equal(settling?.txId, "0.0.9185802@1800000000.0");
+  const entry = purse.authorize("usdc", 10_000n, validStart);
+  purse.identify(entry, "0.0.9185802@1800000000.0", validStart);
+  assert.equal(entry.txId, "0.0.9185802@1800000000.0");
   // 120 seconds because that is Hedera's TransactionValidDuration and not a number we chose, plus
   // the indexing margin — the gap between "the chain can no longer accept it" and "the mirror node
-  // can no longer start showing it". Releasing at 120 s exactly would open the lane for the second
-  // or three a transaction submitted at the very end of its window takes to appear.
-  assert.equal(settling?.deadline, validStart + 120_000 + INDEXING_MARGIN_MS);
+  // can no longer start showing it". Letting go at 120 s exactly would forget a transaction
+  // submitted at the very end of its window for the second or three it takes to appear.
+  assert.equal(entry.deadline, validStart + 120_000 + INDEXING_MARGIN_MS);
   assert.ok(INDEXING_MARGIN_MS > 0, "a zero margin is the bug this line exists for");
-  purse.finishSettling();
-  assert.equal(purse.state.settling, null);
+
+  // The chain has it. The amount moves out of the air and into the day, and the total does not
+  // move — it was already counted the moment it was authorised.
+  purse.settled(entry);
+  assert.equal(purse.state.inFlight.length, 0);
+  assert.equal(purse.state.spent?.totals.usdc, 10_000n);
+
+  // And the other exit gives nothing back, because nothing was taken.
+  const lost = purse.authorize("usdc", 50_000n, validStart);
+  purse.abandon(lost);
+  assert.equal(purse.state.inFlight.length, 0);
+  assert.equal(purse.state.spent?.totals.usdc, 10_000n, "a payment that never happened was counted");
+});
+
+test("a payment is counted exactly once, whichever of the chain's two answers lands first", () => {
+  // Found by a test that expected ten payments out of an allowance for ten and got nine. There are
+  // two ways the chain tells us a payment happened — a reading of the day that contains it, and a
+  // direct lookup of its id — and they can arrive in either order. Adding the amount on the second
+  // one without checking the first charged the day twice for one payment.
+  const txId = "0.0.9185802@1800000000.0";
+  const row = { txId, at: NOW, asset: "usdc" as const, amount: 10_000n, payTo: "0.0.5005" };
+
+  // The lookup first, then the reading. The reading contains it, so it may only raise to where the
+  // lookup already put it.
+  const lookupFirst = open(scratch());
+  lookupFirst.observe(ledger(), false);
+  const one = lookupFirst.authorize("usdc", 10_000n, Date.now());
+  lookupFirst.identify(one, txId, Date.now());
+  lookupFirst.settled(one);
+  assert.equal(lookupFirst.state.spent?.totals.usdc, 10_000n);
+  lookupFirst.observe(ledger({ at: NOW + 1, spent: { usdc: 10_000n, hbar: 0n }, payments: [row] }), false);
+  assert.equal(lookupFirst.state.spent?.totals.usdc, 10_000n, "the day was charged twice for one payment");
+
+  // The reading first, then the lookup. The lookup finds it already counted and adds nothing.
+  const readingFirst = open(scratch());
+  readingFirst.observe(ledger(), false);
+  const two = readingFirst.authorize("usdc", 10_000n, Date.now());
+  readingFirst.identify(two, txId, Date.now());
+  readingFirst.observe(ledger({ at: NOW + 1, spent: { usdc: 10_000n, hbar: 0n }, payments: [row] }), false);
+  assert.equal(readingFirst.state.spent?.totals.usdc, 10_000n);
+  readingFirst.settled(two);
+  assert.equal(readingFirst.state.spent?.totals.usdc, 10_000n, "the day was charged twice for one payment");
+});
+
+test("a reading may seed a day or raise it, and may never talk it down", () => {
+  // The whole of what a chain reading is allowed to do to the figure. It seeds one for an account
+  // and a day it has none for — but only if it read the day to the end, because a partial sum is
+  // not a day's spending. After that it may only raise: by then this purse knows about payments the
+  // mirror node has not indexed yet, and letting a reading lower the figure is how an allowance
+  // gets spent twice.
+  const purse = open(scratch());
+  purse.observe(ledger({ spent: { usdc: 1_000_000n, hbar: 0n } }), false);
+  assert.equal(purse.state.spent?.totals.usdc, 1_000_000n);
+
+  purse.observe(ledger({ at: NOW + 1, spent: { usdc: 500_000n, hbar: 0n } }), false);
+  assert.equal(purse.state.spent?.totals.usdc, 1_000_000n, "a later reading talked the day down");
+
+  purse.observe(ledger({ at: NOW + 2, spent: { usdc: 1_400_000n, hbar: 0n } }), false);
+  assert.equal(purse.state.spent?.totals.usdc, 1_400_000n, "a later reading could not raise the day");
+
+  // A partial walk of a day this purse has no figure for is not enough to seed one.
+  const fresh = open(scratch());
+  fresh.observe(ledger({ complete: false, spent: { usdc: 900_000n, hbar: 0n } }), false);
+  assert.equal(fresh.state.spent, null, "a day was seeded from a walk that never reached its end");
 });
 
 test("the snapshot the panel sees is the chain's answer, with no key material in it", () => {
@@ -352,23 +410,26 @@ test("a purse.json too large to be limits is refused rather than read", () => {
   assert.throws(() => open(dir), /too large/);
 });
 
-test("the settling lock is taken and released under node --permission too", () => {
+test("an authorisation is written and cleared under node --permission too", () => {
   // The same class of bug as the fsync one below, and the reason this is a subprocess rather than
-  // a mock: the lock adds a write and an unlink to the payment path, and the daemon runs under a
-  // permission model that disables whole syscall families. A lock that could not be written would
-  // refuse every payment; a lock that could not be removed would deny for two minutes after each
-  // one. Both would only ever show on the installed service.
+  // a mock: committing a payment adds a write and an unlink to the payment path, and the daemon
+  // runs under a permission model that disables whole syscall families. A write that could not be
+  // made would refuse every payment; an unlink that could not be made would commit part of the
+  // allowance for two minutes after each one. Both would only ever show on the installed service.
   const dir = scratch();
   const script = join(dir, "lock.ts");
   const repo = new URL("../", import.meta.url).pathname;
+  const path = JSON.stringify(join(dir, "purse.json"));
+  const account = JSON.stringify(OUR_ACCOUNT);
   writeFileSync(
     script,
     `import { Purse } from "${repo}src/purse.ts";\n` +
-      `const purse = Purse.open(${JSON.stringify(join(dir, "purse.json"))});\n` +
-      `purse.beginSettling("0.0.9185802@1800000000.0", Date.now());\n` +
-      `if (Purse.open(${JSON.stringify(join(dir, "purse.json"))}).state.settling === null) throw new Error("the lock was not written");\n` +
-      `purse.finishSettling();\n` +
-      `if (Purse.open(${JSON.stringify(join(dir, "purse.json"))}).state.settling !== null) throw new Error("the lock was not released");\n`,
+      `const purse = Purse.open(${path}, ${account});\n` +
+      `const entry = purse.authorize("usdc", 10000n, Date.now());\n` +
+      `purse.identify(entry, "0.0.9185802@1800000000.0", Date.now());\n` +
+      `if (Purse.open(${path}, ${account}).state.inFlight.length !== 1) throw new Error("the authorisation was not written");\n` +
+      `purse.settled(entry);\n` +
+      `if (Purse.open(${path}, ${account}).state.inFlight.length !== 0) throw new Error("the authorisation was not cleared");\n`,
   );
   execFileSync(
     process.execPath,

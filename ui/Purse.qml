@@ -40,7 +40,7 @@ Item {
   readonly property bool keyMismatch: status ? status.keyMismatch === true : false
   // A transaction has been signed and the chain has not shown it yet. Payment is refused for the
   // few seconds that lasts, which is worth saying rather than leaving as a mysterious denial.
-  readonly property bool settling: status ? status.settling === true : false
+  readonly property int inFlight: status ? (status.inFlight || 0) : 0
   // The account id with its HIP-15 checksum: five letters derived from the id and the network,
   // so they change completely if any digit does. Five characters is a comparison a human will
   // actually make; forty-two hex characters is one they will skip.

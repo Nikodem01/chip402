@@ -11,6 +11,7 @@ import type { AssetKey } from "./networks.ts";
 import { assetFor } from "./networks.ts";
 import type { Ledger } from "./chain.ts";
 import { readLedger, transactionSeen, validStartOf } from "./chain.ts";
+import type { Authorization } from "./purse.ts";
 import { digits, parseUnits } from "./money.ts";
 import { dayStart, decide } from "./policy.ts";
 import type { PolicyConfig } from "./policy.ts";
@@ -73,15 +74,25 @@ export type PaidResult = {
   receipt: Receipt | null;
 };
 
-// How long a payment waits at its tail for the mirror node to catch up. Indexing lag is a
-// couple of seconds, and the facilitator has already waited for a consensus receipt before the
-// seller could answer 200 — so this is patience for the ordinary case, not a timeout for the
-// hostile one. Giving up here does not release anything: the lane stays closed until the chain
-// answers or until the transaction can no longer reach it.
+// How long the *caller* waits at the tail of its own payment for the mirror node to catch up, so
+// that the receipt it is handed says what the chain says. Indexing lag is a couple of seconds and
+// the facilitator has already waited for a consensus receipt before the seller could answer 200, so
+// this is patience for the ordinary case rather than a timeout for the hostile one.
+//
+// It bounds one caller and nothing else. Other payments do not queue behind it — there is no lane
+// to hold — and giving up does not abandon the question: `resolve` carries on asking in the
+// background until the chain answers or the transaction can no longer reach it.
 const SETTLE_WAIT_MS = 20_000;
 const SETTLE_POLL_MS = 1_000;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+// Unref'd: a background `resolve` still asking about a payment must never be the reason a process
+// stays alive. The daemon is held open by its listeners, and nothing else should be held open by a
+// question about a transaction that may never have happened.
+const sleep = (ms: number): Promise<void> =>
+  new Promise((done) => {
+    const timer = setTimeout(done, ms);
+    timer.unref?.();
+  });
 
 // SECURITY: the guard. `inner` is the real signer and is never handed out; every caller in the
 // process reaches the key through this object or not at all. Deliberately not the SDK's
@@ -95,7 +106,7 @@ export function guard(
   purse: Purse,
   config: PolicyConfig,
   seen: Sighting,
-  onCharge: (receipt: Receipt) => void,
+  onCharge: (receipt: Receipt, entry: Authorization) => void,
 ): ClientHederaSigner {
   let signed = false;
   return {
@@ -133,27 +144,31 @@ export function guard(
       );
       if (!decision.ok) throw new Error(DENIED + decision.reason);
 
-      // SECURITY: the lane closes on the way to the key, not on the way back — and it is written
-      // to disk here, before anything is signed. Both halves matter and they are the same fix.
+      // SECURITY: the amount is committed against the day on the way to the key, not on the way
+      // back, and it is written to disk here, before anything is signed. Three things ride on that
+      // ordering and they are all the same fix.
       //
-      // Durable, because the daemon that has to honour this lock may not be this one. `settling`
-      // used to live only in memory, so a restart between the signature and the mirror node
-      // catching up came back with the lane open and authorised a second payment against a ledger
-      // that did not yet contain the first — demonstrated end to end, and reachable by anyone who
-      // could `systemctl restart chip402` inside the indexing window, or by `Restart=on-failure`
-      // after a crash.
+      // *Before the key*, because `decide` has just read the figure this raises and there is no
+      // `await` between the two. Two payments cannot both see the same figure and both pass, so a
+      // hundred at once are counted exactly — which is why this daemon needs no lane and no lock,
+      // and why concurrency is no longer bought with latency.
       //
-      // Before, because a write that cannot be made has to be a refusal rather than a surprise.
-      // Taken here it is a denial with nothing signed; taken after the signature it would be a
-      // payment that has already been authorised failing on a file operation, which is the exact
-      // shape of bug the label store was rewritten to make impossible. The id is not known yet, so
-      // this first lock carries none — `now` is a deliberate over-estimate of the deadline, since
-      // the SDK generates validStart three to eight seconds in the *past*, and the refinement
-      // below replaces it with the truth.
+      // *Durable*, because the daemon that has to honour this may not be this one. It used to live
+      // in memory alone, so a restart between the signature and the mirror node catching up came
+      // back knowing nothing and authorised a second payment against a day that did not yet contain
+      // the first — demonstrated end to end, and reachable by anyone who could
+      // `systemctl restart chip402` inside the indexing window, or by `Restart=on-failure`.
+      //
+      // *Allowed to throw*, because a write that cannot be made has to be a refusal rather than a
+      // surprise. Taken here it is a denial with nothing signed; taken after the signature it would
+      // be a payment already authorised failing on a file operation. The id is not known yet, so
+      // `now` is a deliberate over-estimate of the deadline — the SDK dates validStart three to
+      // eight seconds in the *past* — and the refinement below replaces it with the truth.
+      let entry: Authorization;
       try {
-        purse.beginSettling(null, now);
+        entry = purse.authorize(decision.asset.key, amount, now);
       } catch {
-        throw new Error(DENIED + "the settling lock could not be written");
+        throw new Error(DENIED + "the payment could not be written down");
       }
 
       // Set before the key is reached, not after. Whatever the signer then does — returns,
@@ -165,11 +180,11 @@ export function guard(
       } catch (error) {
         // The signer builds and signs locally and returns the bytes; there is no network in it.
         // A throw therefore means no payload was produced, so nothing can have left this process
-        // — the caller submits what it is handed, and it was handed an exception. Releasing the
-        // lane here is what keeps a signer that refuses a malformed request from costing two
-        // minutes of denial per attempt. Anything that could return bytes *and* throw would have
-        // to release them itself, and there is no such path.
-        purse.finishSettling();
+        // — the caller submits what it is handed, and it was handed an exception. Giving the
+        // amount back here is what keeps a signer that refuses a malformed request from holding
+        // part of the allowance for two minutes per attempt. Anything that could return bytes
+        // *and* throw would have to give it back itself, and there is no such path.
+        purse.abandon(entry);
         throw error;
       }
 
@@ -181,114 +196,102 @@ export function guard(
       try {
         txId = inspectHederaTransaction(payload).transactionId ?? null;
       } catch {
-        // Bytes we cannot read back are bytes we cannot ask the chain about. The lane is already
-        // shut — with no id, only the clock can reopen it, which is the fail-closed reading of
+        // Bytes we cannot read back are bytes we cannot ask the chain about. The amount is already
+        // committed — with no id, only the deadline can end it, which is the fail-closed reading of
         // "we do not know what we just signed".
       }
       const validStart = txId === null ? null : validStartOf(txId);
-      try {
-        // Name it, so the chain can end the wait rather than only the clock. This second write
-        // moves the deadline to the one measured from `validStart`, which is *earlier* than
-        // the one above, so a failure here leaves a lock that is honoured for a few seconds longer
-        // than it needed to be — a denial, never an extra payment, which is why this one is
-        // allowed to fail and the first one is not.
-        purse.beginSettling(txId, validStart ?? now);
-      } catch {
-        // Deliberately nothing. See above.
-      }
+      purse.identify(entry, txId, validStart ?? now);
 
       // The host is recorded by the caller, not here — see payer(). The guard is about the key
       // and the decision; a display label is neither, and does not belong on the same side of
       // this door.
       const host = new URL(seen.finalUrl).host;
-      onCharge({ txId, at: now, asset: decision.asset.key, amount: amount.toString(), host, url: seen.finalUrl, onChain: false });
+      onCharge(
+        { txId, at: now, asset: decision.asset.key, amount: amount.toString(), host, url: seen.finalUrl, onChain: false },
+        entry,
+      );
       return payload;
     },
   };
 }
 
-// Wait for a transaction we signed to show up on the mirror node, and reopen the lane the moment
-// it does. Two exits and no third: the chain has it, or the chain can never have it. Giving up
-// on patience is not an exit — it leaves the lane closed and lets policy.ts deny until one of
-// the two real answers arrives.
+// Ask the chain about one payment we authorised, and keep asking until it answers. There are two
+// answers and no third: the chain has it, or the chain can never have it. Running out of patience
+// is not an answer — it only stops the *caller* waiting, and the asking carries on in the
+// background, because an authorisation nobody finished resolving would hold part of the day against
+// a payment that may never have happened.
 //
-// The boolean is the receipt's `onChain`, and it is a claim about the chain rather than about who
-// asked it. That distinction is load-bearing: `pollChain` runs every 60 s and is *not* serialized
-// against a payment in flight — `inLane` wraps `pay`, not the poll — so a refresh landing between
-// the signature and this call can clear the lane first. This used to return `false` there and put
-// `onChain: false` on a receipt for a payment that had settled a moment earlier. The ledger was
-// right either way, but the receipt was not, and a receipt that lies in the pessimistic direction
-// is still a receipt that lies. So when the lane is open and this call did not open it, the
-// question goes to the mirror node instead of to the lock.
-export async function settle(
+// The boolean is the receipt's `onChain`, and it is a claim about the chain rather than about this
+// process's memory. Nothing else is waiting on it: payments do not queue behind one another any
+// more, so a slow answer here costs one caller a few seconds of latency and costs nobody else
+// anything at all.
+//
+// `reread` is only reached by an authorisation we could never name — bytes we signed and could not
+// read back. Its deadline is the only thing that can end it, and letting go on the clock alone
+// would forget a payment that did happen, so the day is read once more first and `Purse.observe`
+// raises the figure if the chain shows it. Every other entry is answered for by its own id.
+export async function resolve(
   config: PolicyConfig,
   purse: Purse,
-  txId: string | null,
+  entry: Authorization,
   patienceMs: number = SETTLE_WAIT_MS,
+  reread?: () => Promise<unknown>,
 ): Promise<boolean> {
   const giveUpAt = Date.now() + patienceMs;
   for (;;) {
-    const settling = purse.state.settling;
-    if (settling === null) {
-      // Somebody else ended the wait: `refresh()` from the chain-poll loop, or the clock inside
-      // it. Ask the chain what actually happened. An id we never read back, or a mirror node that
-      // will not answer, is reported as "not seen" — the honest reading of the one thing this
-      // field claims.
-      if (txId === null) return false;
-      return transactionSeen(config.network, txId).catch(() => false);
-    }
-    const now = Date.now();
-    if (now >= settling.deadline) {
-      // validStart + TransactionValidDuration has passed, *and* the margin the mirror node is
-      // allowed to be behind that. Hedera will not accept the transaction now and the mirror has
-      // had long enough to start showing it if it ever will, so it is not "not yet", it is "never".
-      // Those are two different instants and the lock waits for the later one — see
-      // INDEXING_MARGIN_MS. Nothing is given back because nothing was taken: a payment that never
-      // settled simply never appears in the chain's sum.
-      purse.finishSettling();
-      return false;
-    }
-    if (txId !== null) {
+    if (entry.txId !== null) {
       try {
-        if (await transactionSeen(config.network, txId)) {
-          purse.finishSettling();
+        if (await transactionSeen(config.network, entry.txId)) {
+          purse.settled(entry);
           return true;
         }
       } catch {
-        // An unreachable mirror node is not evidence of anything. Keep the lane closed and try
-        // again; the deadline is what ends this loop if it never comes back.
+        // An unreachable mirror node is not evidence of anything. Ask again; the deadline is what
+        // ends this loop if it never comes back.
       }
     }
-    if (Date.now() >= giveUpAt) return false;
+    const now = Date.now();
+    if (now >= entry.deadline) {
+      // validStart + TransactionValidDuration has passed, *and* the margin the mirror node is
+      // allowed to be behind it — see INDEXING_MARGIN_MS. Hedera will not accept the transaction
+      // now and the mirror has had long enough to start showing it if it ever will, so this is not
+      // "not yet", it is "never". Nothing is given back because nothing was taken.
+      if (entry.txId === null && reread !== undefined) await reread().catch(() => undefined);
+      purse.abandon(entry);
+      return false;
+    }
+    if (now >= giveUpAt) {
+      // The caller's patience, not the question's. Hand back what we know and go on asking with the
+      // time the entry has left.
+      void resolve(config, purse, entry, entry.deadline - now, reread).catch(() => undefined);
+      return false;
+    }
     await sleep(SETTLE_POLL_MS);
   }
 }
 
-// Ask the chain everything, in the order that makes the answer usable: resolve anything in
-// flight first, so that the ledger we then read either contains it or provably never will.
+// Read the chain. Two requests: the account, for the balances and the key check, and one walk of
+// the day's outgoing transactions.
+//
+// This is not on the payment path and that is the point. It runs when the daemon starts, when the
+// local day rolls over, and when somebody is actually looking at the panel — not before and after
+// every payment, and not on a timer. What a payment needs to know, this process already knows: it
+// signed every transaction that could have moved the figure, and only its own key can make the
+// balance smaller. The daemon used to ask the mirror node roughly 1,440 times a day to be told
+// things it had told the mirror node itself.
+//
+// `maxPages` is the difference between the two callers. The reading that seeds a day has to reach
+// the end of it; the reading that keeps a panel current takes the newest page and stops, because
+// its sum may only ever raise the figure and never set it.
 export async function refresh(
   config: PolicyConfig,
   purse: Purse,
   publicKeyHex: string,
   evmAddress: string | null,
+  maxPages?: number,
 ): Promise<Ledger> {
-  const settling = purse.state.settling;
-  if (settling !== null) {
-    if (Date.now() >= settling.deadline) purse.finishSettling();
-    else if (settling.txId !== null && (await transactionSeen(config.network, settling.txId).catch(() => false))) {
-      purse.finishSettling();
-    }
-  }
-  // Local midnight, and nothing earlier. This used to widen the window to `now - 120 s` whenever
-  // something was settling, on the theory that a transaction signed just before midnight has to be
-  // looked for in yesterday too — but nothing ever looked. `readLedger` hands its rows to
-  // `paymentsIn`, which drops every row before `since`, and the in-flight question is asked by
-  // `transactionSeen` above: a direct lookup of one id, which has no window at all. So the reach
-  // back fetched rows only to throw them away, and every one of them counted against the page
-  // bound that chain.ts's fallback exists to keep us under. A payment signed at 23:59:30 that
-  // reaches consensus at 00:00:02 is in today's window on its own merits, because the chain dates
-  // it by consensus and not by signature.
-  return readLedger(config.network, config.accountId, publicKeyHex, evmAddress, dayStart(Date.now()));
+  return readLedger(config.network, config.accountId, publicKeyHex, evmAddress, dayStart(Date.now()), maxPages);
 }
 
 export type Wallet = {
@@ -307,7 +310,13 @@ export type Wallet = {
   // is one we do not claim to understand — see readKeyMatch.
   readonly verified: boolean | null;
   pay(url: string, init?: RequestInit): Promise<PaidResult>;
-  refresh(): Promise<void>;
+  // A reading of the chain. With no argument it walks the whole day and is what seeds a new one;
+  // with `1` it takes the newest page for the display's sake and may be dropped if the last
+  // reading was recent. See `refresh` and the shared reader in `openWallet`.
+  refresh(maxPages?: number): Promise<void>;
+  // Ask the chain about everything a previous daemon signed and was not around to hear the answer
+  // for. Returns as soon as each has been asked once; the asking continues in the background.
+  resume(): Promise<void>;
 };
 
 // The payment path, with the real signer injected. Everything a hostile seller can reach is on
@@ -317,23 +326,30 @@ export function payer(
   config: PolicyConfig,
   purse: Purse,
   labels: Labels,
-  refreshChain: () => Promise<void>,
+  refreshChain: (maxPages?: number) => Promise<void>,
   limits: Limits = LIMITS,
   patienceMs: number = SETTLE_WAIT_MS,
 ): (url: string, init?: RequestInit) => Promise<PaidResult> {
   const network = config.network;
 
   return async function pay(url: string, init?: RequestInit): Promise<PaidResult> {
-    // Nothing in this process knows what has been spent today until the mirror node says so, and
-    // an answer policy.ts considers stale is a denial — so every payment starts by asking.
-    await refreshChain();
+    // The chain is asked here only when this process does not yet have a day to measure against:
+    // the first payment after a start, and the first after local midnight. Every payment in between
+    // decides against a figure this process maintains itself, because it signed everything that
+    // could have moved it. That is the whole difference between a purse that can serve
+    // per-request metering and one that cannot — the mirror node used to be asked twice per
+    // payment, and every answer was a page of rows it had already been told about.
+    const spent = purse.state.spent;
+    if (spent === null || spent.dayStart !== dayStart(Date.now())) await refreshChain();
 
     // Everything below is built per payment and thrown away after, so no state about one
     // seller can leak into the next one.
     const seen: Sighting = { finalUrl: url, x402Version: 0 };
     let charged: Receipt | null = null;
-    const signer = guard(inner, purse, config, seen, (receipt) => {
+    let authorized: Authorization | null = null;
+    const signer = guard(inner, purse, config, seen, (receipt, entry) => {
       charged = receipt;
+      authorized = entry;
       // One short append, the moment the transaction id and the host are both known. This runs
       // after the signature, so it must not be able to fail a payment that has already been
       // authorised — every write in labels.ts is best-effort for exactly that reason, and the
@@ -385,14 +401,15 @@ export function payer(
     // is not the seller's to write, so a whole class of seller-controlled input is simply gone.
     //
     // `onChain` is the mirror node's answer and not this process's memory — see settle().
-    if (charged !== null) {
+    if (charged !== null && authorized !== null) {
       const receipt = charged as Receipt;
-      receipt.onChain = await settle(config, purse, receipt.txId, patienceMs);
-      // Once the chain has it, read the chain again — so the panel, the CLI and the next
-      // decision all see this payment as a row the mirror node returned rather than as
-      // something we remembered doing. It is the last step of the payment and the reason the
-      // figures on screen match a direct mirror query a second after one goes out.
-      if (receipt.onChain) await refreshChain().catch(() => undefined);
+      receipt.onChain = await resolve(config, purse, authorized as Authorization, patienceMs, () => refreshChain());
+      // A single page of the day, so the panel and the CLI show the payment as a row the mirror
+      // node returned rather than as something we remembered doing. Not awaited and not needed:
+      // the figure the next decision uses was raised the moment the chain confirmed the id, and
+      // this only fetches the row behind it. `refreshChain` drops it if the last reading is recent,
+      // so a hundred payments a minute do not become a hundred requests.
+      if (receipt.onChain) void refreshChain(1).catch(() => undefined);
     }
 
     return {
@@ -415,6 +432,12 @@ export function payer(
 // it from a config file, so there is no setting an attacker could widen.
 const STRIKE_GAP_MS = 60_000;
 const STRIKES_TO_DENY = 3;
+
+// How stale a reading may be before a request made for the display's sake is worth serving. It
+// bounds nothing about spending — the figures a decision uses are this process's own — so it is
+// chosen for how fresh a panel should look and for how little a busy purse should cost the public
+// mirror node, and for nothing else.
+const DISPLAY_GAP_MS = 5_000;
 
 export function openWallet(
   config: PolicyConfig,
@@ -470,8 +493,26 @@ export function openWallet(
     lastStrike = disagrees ? (counts ? ledger.at : lastStrike) : 0;
   };
 
-  const refreshChain = async (): Promise<void> => {
-    observe(await refresh(config, purse, publicKeyHex, evmAddress));
+  // One reader, not many. Callers that want the chain read while a read is already running share
+  // that one rather than starting a second, which is what keeps a burst of payments from becoming a
+  // burst of requests. And a single-page reading — the kind a payment's tail and a connecting panel
+  // ask for — is dropped outright if the last one was recent, because it is for the display and the
+  // display was already right. A full reading is never dropped: it is the one that seeds a day.
+  let reading: Promise<void> | null = null;
+  let readAt = 0;
+  const refreshChain = async (maxPages?: number): Promise<void> => {
+    if (maxPages !== undefined && Date.now() - readAt < DISPLAY_GAP_MS) return;
+    if (reading !== null) return reading;
+    const run = (async (): Promise<void> => {
+      try {
+        observe(await refresh(config, purse, publicKeyHex, evmAddress, maxPages));
+        readAt = Date.now();
+      } finally {
+        reading = null;
+      }
+    })();
+    reading = run;
+    return run;
   };
 
   return {
@@ -483,6 +524,12 @@ export function openWallet(
     },
     pay: payer(inner, config, purse, labels, refreshChain),
     refresh: refreshChain,
+    resume: async (): Promise<void> => {
+      const waiting = purse.state.inFlight.map((entry) =>
+        resolve(config, purse, entry, 0, () => refreshChain()).catch(() => false),
+      );
+      await Promise.all(waiting);
+    },
   };
 }
 

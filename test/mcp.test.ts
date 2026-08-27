@@ -142,8 +142,8 @@ async function agentHost(t: { after: (fn: () => unknown) => void }) {
     // The real payment path, with a stub where the Hedera key would be. Everything above it —
     // the hardened fetch, the guarded signer, the policy, the chain read — is the shipping code.
     makeWallet: (_walletConfig, purse, labels) => {
-      const refreshChain = async (): Promise<void> => {
-        purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS), false);
+      const refreshChain = async (maxPages?: number): Promise<void> => {
+        purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, maxPages), false);
       };
       return {
         accountId: OUR_ACCOUNT,
@@ -151,6 +151,7 @@ async function agentHost(t: { after: (fn: () => unknown) => void }) {
         accountWithChecksum: OUR_ACCOUNT + "-wkdxo",
         verified: true,
         refresh: refreshChain,
+        resume: async (): Promise<void> => undefined,
         pay: payer(inner, walletConfig, purse, labels, refreshChain, undefined, 0),
       };
     },

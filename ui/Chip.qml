@@ -286,11 +286,13 @@ Panel {
         }
 
         Text {
-          visible: purse.live && !purse.awaitingFunding && purse.settling
+          visible: purse.live && !purse.awaitingFunding && purse.inFlight > 0
           width: parent.width
           textFormat: Text.PlainText
           wrapMode: Text.WordWrap
-          text: qsTr("A payment is still settling; the next one waits for the chain to show it.")
+          text: purse.inFlight === 1
+            ? qsTr("One payment is settling. It already counts against today; nothing else is waiting on it.")
+            : qsTr("%1 payments are settling. They already count against today; nothing else is waiting on them.").arg(purse.inFlight)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

@@ -21,8 +21,8 @@ import { NETWORKS } from "../src/networks.ts";
 import type { AssetKey, NetworkRow } from "../src/networks.ts";
 import type { Invoice, PolicyConfig } from "../src/policy.ts";
 import { dayStart } from "../src/policy.ts";
-import type { PurseState } from "../src/purse.ts";
-import { Purse } from "../src/purse.ts";
+import type { Authorization, PurseState } from "../src/purse.ts";
+import { AUTHORIZATION_MS, Purse } from "../src/purse.ts";
 import { Labels } from "../src/labels.ts";
 
 export const testnet = NETWORKS["hedera:testnet"]!;
@@ -42,8 +42,10 @@ export const NOW = 1_800_000_000_000;
 
 export function ledger(overrides: Partial<Ledger> = {}, now = NOW): Ledger {
   return {
+    accountId: OUR_ACCOUNT,
     since: dayStart(now),
     at: now,
+    complete: true,
     balances: { usdc: 5_000_000n, hbar: 50_000_000_000n },
     spent: { usdc: 0n, hbar: 0n },
     payments: [],
@@ -53,15 +55,27 @@ export function ledger(overrides: Partial<Ledger> = {}, now = NOW): Ledger {
 }
 
 export function purseState(overrides: Partial<PurseState> = {}): PurseState {
+  const reading = overrides.ledger === undefined ? ledger() : overrides.ledger;
   return {
     paused: false,
     usdc: { allowance: 2_000_000n, maxPayment: 250_000n },
     hbar: { allowance: 10_000_000_000n, maxPayment: 1_000_000_000n },
-    ledger: ledger(),
+    ledger: reading,
+    // Seeded from that reading exactly as `Purse.observe` does it, so a test that says "the chain
+    // showed this much gone out today" gets a purse that has taken the reading in.
+    spent:
+      reading === null
+        ? null
+        : { accountId: reading.accountId, dayStart: reading.since, totals: { ...reading.spent } },
     mismatch: false,
-    settling: null,
+    inFlight: [],
     ...overrides,
   };
+}
+
+// One payment signed and not yet answered for, as `Purse.authorize` leaves it.
+export function inFlight(asset: AssetKey, amount: bigint, over: Partial<Authorization> = {}): Authorization {
+  return { asset, amount, txId: null, deadline: NOW + AUTHORIZATION_MS, ...over };
 }
 
 export function invoice(overrides: Partial<Invoice> = {}): Invoice {
@@ -386,7 +400,7 @@ import { start } from "../src/daemon.ts";
 import { open } from "../src/protocol.ts";
 import type { Daemon } from "../src/daemon.ts";
 import type { PaidResult, Receipt, Wallet } from "../src/wallet.ts";
-import { guard, refresh, settle } from "../src/wallet.ts";
+import { guard, refresh, resolve } from "../src/wallet.ts";
 
 // A wallet with a stub in place of the key, but the *real* guard, the real policy, the real
 // chain read and the real settlement wait in front of it — so the daemon tests exercise the
@@ -402,8 +416,8 @@ export function stubWallet(
 ): Wallet & { signatures: () => number } {
   const walletConfig: PolicyConfig = { network: mirror.network, accountId: OUR_ACCOUNT };
   const inner = testSigner(mirror);
-  const refreshChain = async (): Promise<void> => {
-    purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS), false);
+  const refreshChain = async (maxPages?: number): Promise<void> => {
+    purse.observe(await refresh(walletConfig, purse, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, maxPages), false);
   };
   return {
     accountId: OUR_ACCOUNT,
@@ -412,12 +426,22 @@ export function stubWallet(
     verified: true,
     signatures: inner.calls,
     refresh: refreshChain,
+    resume: async (): Promise<void> => {
+      await Promise.all(
+        purse.state.inFlight.map((entry) => resolve(walletConfig, purse, entry, 0).catch(() => false)),
+      );
+    },
     async pay(url: string): Promise<PaidResult> {
-      await refreshChain();
+      // The same rule the real `payer` follows: read the chain only when this process has no day to
+      // measure against yet.
+      const known = purse.state.spent;
+      if (known === null || known.dayStart !== dayStart(Date.now())) await refreshChain();
       const seen = { finalUrl: url, x402Version: 2 };
       let receipt: Receipt | null = null;
-      const signer = guard(inner, purse, walletConfig, seen, (charged) => {
+      let entry: Authorization | null = null;
+      const signer = guard(inner, purse, walletConfig, seen, (charged, authorized) => {
         receipt = charged;
+        entry = authorized;
         labels.record(charged.txId, charged.host);
       });
       // Stands in for the 402 round trip: the gap that makes two concurrent payments a race if
@@ -433,9 +457,10 @@ export function stubWallet(
         extra: { feePayer: FACILITATOR },
       } as PaymentRequirements);
       const charged = receipt as Receipt | null;
-      if (charged !== null) {
-        charged.onChain = await settle(walletConfig, purse, charged.txId, 0);
-        if (charged.onChain) await refreshChain();
+      const authorized = entry as Authorization | null;
+      if (charged !== null && authorized !== null) {
+        charged.onChain = await resolve(walletConfig, purse, authorized, 0);
+        if (charged.onChain) await refreshChain(1);
       }
       return { status: 200, contentType: "text/plain", body: "the secret", paid: charged !== null, receipt: charged };
     },
@@ -445,7 +470,7 @@ export function stubWallet(
 export type TestDaemon = {
   daemon: Daemon;
   mirror: Mirror;
-  // Where purse.json, labels.jsonl and settling.json live, so a test can look at what a restart
+  // Where purse.json, labels.jsonl and inflight.json live, so a test can look at what a restart
   // would actually find rather than at what the daemon remembers.
   stateDir: string;
   reload: () => Purse;
@@ -467,7 +492,7 @@ export async function startTestDaemon(
   writeFileSync(join(dir, "config.json"), JSON.stringify({ network: testnet.caip2, accountId: OUR_ACCOUNT }));
   // The limits are written to disk before the daemon starts, the same way a real install does
   // it: the daemon reads purse.json once at start-up and is the only writer afterwards.
-  const seed = Purse.open(join(dir, "purse.json"));
+  const seed = Purse.open(join(dir, "purse.json"), OUR_ACCOUNT);
   setup(seed);
   seed.persist();
 
@@ -498,7 +523,7 @@ export async function startTestDaemon(
     },
     mirror,
     stateDir: dir,
-    reload: () => Purse.open(join(dir, "purse.json")),
+    reload: () => Purse.open(join(dir, "purse.json"), OUR_ACCOUNT),
     signatures: () => earlier + signatures(),
     restart: async () => {
       earlier += signatures();

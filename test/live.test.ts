@@ -102,7 +102,7 @@ test("a real testnet payment, and the panel agreeing with the chain about it", {
     // "seller takes a signature and never settles" row of the README's table, live.
     const unpaid = (await session.ask({ cmd: "purse" })) as Record<string, any>;
     assert.equal(BigInt(unpaid["assets"].usdc.spent), spentBefore, "a payment that never settled was counted");
-    assert.equal(unpaid["settling"], false, "the lane never reopened for a transaction that can never arrive");
+    assert.equal(unpaid["inFlight"], 0, "a transaction that can never arrive was still counted");
     assert.equal(receipt["onChain"], false, "the receipt claimed a settlement the chain never had");
     assert.fail(
       `the facilitator did not settle ${receipt["txId"]} — it is absent from the mirror node past its ` +

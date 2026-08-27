@@ -222,7 +222,8 @@ test("a thousand dust transfers in cannot stop the purse from counting what went
   // chain read threw, `refresh()` threw, and every payment was denied until local midnight.
   //
   // The fix is not more pages. It is asking the mirror node the narrower question — what came
-  // *out* of this account — which is the only half the sum was ever going to keep.
+  // *out* of this account — which is the only half the sum was ever going to keep, and which
+  // nobody but this daemon can add a row to.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const since = dayStart(Date.now());
@@ -236,11 +237,11 @@ test("a thousand dust transfers in cannot stop the purse from counting what went
   assert.equal(ledger.spent.usdc, 20_000n, "the dust made spending uncomputable");
   assert.equal(ledger.spent.hbar, 0n, "dust arriving was counted as dust spent");
   assert.equal(ledger.payments.length, 2);
-  // And it got there by narrowing the question, not by reading more pages.
-  assert.ok(
-    mirror.requests.some((path) => path.includes("type=debit")),
-    "the fallback never asked for outgoing transactions",
-  );
+  // And it got there by asking the narrow question, not by reading more pages: one request, and
+  // the fifteen hundred rows of dust were never fetched at all.
+  const walks = mirror.requests.filter((path) => path.startsWith("/api/v1/transactions?"));
+  assert.equal(walks.length, 1, `the day took ${walks.length} requests to read`);
+  assert.ok(walks[0]!.includes("type=debit"), "the walk asked for anything but outgoing transactions");
 });
 
 test("the window that is read is the window that is summed", async (t) => {
@@ -268,10 +269,11 @@ test("the window that is read is the window that is summed", async (t) => {
   }
 });
 
-test("the narrow question is a fallback and never the first answer", async (t) => {
-  // The wide query is what the three rules were verified against, so an ordinary day must not
-  // touch `type=debit` at all — otherwise the path everything depends on would be the one that
-  // almost never runs.
+test("a day costs two requests, and one of them is not a page of rows", async (t) => {
+  // What a whole day's reading is, measured rather than asserted. The account endpoint for the
+  // balances and the key, and one walk of the outgoing transactions — and the account endpoint is
+  // asked not to bundle a transaction list it would then be parsed out of and thrown away. Against
+  // the public testnet node that one parameter is 23,072 bytes against 740.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const since = dayStart(Date.now());
@@ -279,47 +281,50 @@ test("the narrow question is a fallback and never the first answer", async (t) =
 
   const ledger = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
   assert.equal(ledger.spent.usdc, 10_000n);
-  assert.equal(
-    mirror.requests.filter((path) => path.includes("type=")).length,
-    0,
-    "an ordinary day asked the fallback question",
-  );
+  assert.equal(ledger.accountId, OUR_ACCOUNT, "a reading that cannot say whose it is");
+  assert.equal(ledger.complete, true);
+  assert.equal(mirror.requests.length, 2, mirror.requests.join(" "));
+  const account = mirror.requests.find((path) => path.startsWith("/api/v1/accounts/"))!;
+  assert.ok(account.includes("transactions=false"), "the account read still drags a page of rows behind it");
 });
 
-test("if even the outgoing transactions overflow, the purse still refuses to say what was spent", async (t) => {
-  // Fail-closed is not weakened by the fallback: it is only reached later. These rows are debits
-  // of our account paid for by somebody else — the shape `type=debit` keeps — so both walks
-  // overflow and the throw stands. (Unreachable in practice: every debit of this account needs a
-  // signature only this daemon can produce. It is here so that the fallback cannot quietly
-  // become a way to pay against a number nobody could compute.)
+test("a reading that stopped at the page bound says so instead of pretending", async (t) => {
+  // The walk is bounded, and the bound is generous because it runs once per daemon start rather
+  // than twice per payment. What matters is that a walk which stopped short cannot be mistaken for
+  // a day: `complete` is false, and `Purse.observe` refuses to seed a figure from it.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const since = dayStart(Date.now());
-  for (let i = 0; i < 1_300; i++) {
-    mirror.rows.push({
-      transaction_id: `0.0.9185802-${Math.floor(since / 1000) + i}-000000001`,
-      consensus_timestamp: `${Math.floor(since / 1000) + i}.000000001`,
-      result: "SUCCESS",
-      name: "CRYPTOTRANSFER",
-      transfers: [
-        { account: OUR_ACCOUNT, amount: -1 },
-        { account: SELLER, amount: 1 },
-      ],
-      token_transfers: [],
-    });
-  }
-  await assert.rejects(
-    () => readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since),
-    (error: unknown) => {
-      const message = String(error instanceof Error ? error.message : error);
-      // "At least", because a full last page is indistinguishable from a full page with more
-      // behind it — and the window is named by the instant it starts at rather than called
-      // "today", which it is not when a transaction signed just before midnight is in flight.
-      assert.match(message, /at least 1200 outgoing transactions since \d{4}-\d\d-\d\dT/);
-      assert.match(message, /cannot say what was spent/);
-      return true;
-    },
-  );
+  for (let i = 0; i < 150; i++) mirror.record(`0.0.9185802@18000001${String(i).padStart(2, "0")}.0`, "usdc", 1n, since + i);
+
+  const stopped = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since, 1);
+  assert.equal(stopped.complete, false, "a walk that stopped at the bound called itself a day");
+  assert.equal(stopped.payments.length, 100);
+
+  const whole = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
+  assert.equal(whole.complete, true);
+  assert.equal(whole.payments.length, 150);
+  assert.equal(whole.spent.usdc, 150n);
+});
+
+test("nobody but this daemon can add a row to the question that is asked", async (t) => {
+  // Why the bound stopped being something an outsider could reach. Every row `type=debit` keeps is
+  // a transaction that took money out of this account, and every one of those needs a signature only
+  // this daemon can produce. Money arriving — the thing anyone can send, for nothing on testnet and
+  // about $0.12 a day on mainnet — is not in the answer at all. So the walk is bounded by our own
+  // spending, and the only way to reach the bound is to have made twenty thousand payments today.
+  const mirror = await fakeMirror();
+  t.after(() => mirror.close());
+  const since = dayStart(Date.now());
+  mirror.record("0.0.9185802@1800000001.0", "usdc", 10_000n, since + 10_000);
+  mirror.dust(5_000, "usdc", since + 1_000);
+  mirror.dust(5_000, "hbar", since + 20_000);
+
+  const ledger = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
+  assert.equal(ledger.complete, true, "ten thousand rows of somebody else's dust bounded our walk");
+  assert.equal(ledger.spent.usdc, 10_000n);
+  assert.equal(ledger.payments.length, 1);
+  assert.equal(mirror.requests.filter((path) => path.startsWith("/api/v1/transactions?")).length, 1);
 });
 
 // --- "is this key ours?", asked at two doors ----------------------------------------------------

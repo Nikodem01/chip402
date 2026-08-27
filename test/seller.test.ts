@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { Limits } from "../src/fetch.ts";
 import { LIMITS } from "../src/fetch.ts";
+import { INDEXING_MARGIN_MS } from "../src/chain.ts";
 import { Purse } from "../src/purse.ts";
 import { denialReason, payer, refresh } from "../src/wallet.ts";
 import type { Mirror } from "./support.ts";
@@ -316,12 +317,16 @@ test("a seller that takes a signature and never settles costs nothing", async (t
   const result = await pay(`${thief.base}/secret`);
   assert.equal(signatures(), 1);
   assert.equal(result.receipt?.onChain, false, "the chain showed a transaction that never settled");
-  // The lane is still shut, so nothing else may go out until the answer is known.
-  assert.notEqual(purse.state.settling, null);
+  // The amount is still committed, so the day counts it until the answer is known — but nothing is
+  // blocked by it, which is the difference between a commitment and a lock.
+  assert.equal(purse.state.inFlight.length, 1);
+  assert.equal(purse.state.spent?.totals.usdc, 0n, "an unsettled payment reached the chain's figure");
   assert.equal((await spent()).usdc, 0n, "an unsettled payment was counted against the allowance");
 
-  // Wind past validStart + 120s. The lane opens, and the allowance is exactly where it started.
-  purse.beginSettling(purse.state.settling!.txId, Date.now() - 121_000);
+  // Wind past validStart + the indexing margin. The commitment lapses, and the allowance is exactly
+  // where it started: nothing is given back because nothing was taken.
+  const committed = purse.state.inFlight[0]!;
+  purse.identify(committed, committed.txId, Date.now() - 121_000 - INDEXING_MARGIN_MS);
   await pay(`${thief.base}/secret`).catch(() => undefined);
   assert.equal((await spent()).usdc, 0n);
 });
@@ -352,8 +357,8 @@ test("a label store that cannot be written costs a name, never the payment", asy
   // The host name is decoration: `hostFor` is read by the status snapshot and by nothing else, so
   // losing it costs a row that says 0.0.5005 instead of a hostname. It must therefore be
   // impossible for it to cost a payment — and the append happens *after* the signature, so a
-  // throw here would fail a payment that had already been authorised, and leave the settling lane
-  // shut behind it for the whole validity window.
+  // throw here would fail a payment that had already been authorised, and leave its amount
+  // committed behind it for the whole validity window.
   const shop = await seller((req, res) => {
     if (!req.headers["payment-signature"]) {
       res.writeHead(402, { "PAYMENT-REQUIRED": offer() }).end();
@@ -381,8 +386,8 @@ test("a label store that cannot be written costs a name, never the payment", asy
   assert.equal(result.body, "the goods", "a name that could not be written failed the payment");
   assert.equal(result.paid, true);
   assert.equal(labels.hostFor(String(result.receipt?.txId)), new URL(shop.base).host, "the name is still usable in memory");
-  // And the lane is not left shut behind a payment that was never delivered.
-  assert.equal(purse.state.settling, null);
+  // And no amount is left committed behind a payment that was never delivered.
+  assert.equal(purse.state.inFlight.length, 0);
 });
 
 test("a paused purse denies even a perfectly well-behaved seller", async (t) => {
