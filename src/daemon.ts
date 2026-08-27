@@ -300,14 +300,23 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
   let dayTimer: ReturnType<typeof setTimeout> | undefined;
 
   async function seed(): Promise<void> {
+    const again = (why: string): void => {
+      console.error(`chip402: ${why}, retrying — nothing can be paid until the chain answers`);
+      chainTimer = setTimeout(() => void seed(), CHAIN_RETRY_MS);
+      chainTimer.unref();
+    };
     try {
       await open().refresh();
     } catch (error) {
-      console.error("chip402: chain read failed, retrying:", error instanceof Error ? error.message : error);
-      chainTimer = setTimeout(() => void seed(), CHAIN_RETRY_MS);
-      chainTimer.unref();
-      return;
+      return again(`chain read failed (${error instanceof Error ? error.message : String(error)})`);
     }
+    // A reading that did not reach the end of the day is not a day, so `Purse.observe` refuses to
+    // seed a figure from it and `policy.decide` keeps denying — correctly, and silently, which is
+    // the part worth fixing. It does not throw, so without this the daemon would sit refusing every
+    // payment until local midnight with nothing in the journal to say why. Reaching the page bound
+    // means twenty thousand outgoing transactions today, which needs a signature only this daemon
+    // can produce: `type=debit` is what keeps it off the list of things somebody else can arrange.
+    if (purse.state.spent === null) return again("the chain read did not reach the end of today");
     // Whatever the last daemon signed and did not stay alive to hear the answer for. Asked once
     // each here and then chased in the background until the chain answers or the deadline passes.
     await open().resume().catch(() => undefined);

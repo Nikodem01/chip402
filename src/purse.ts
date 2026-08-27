@@ -599,9 +599,15 @@ export function snapshot(
     // Local midnight, computed rather than stored — it is a question about this machine's
     // timezone, not a number anybody has to keep in sync.
     resetsAt: dayEnd(now),
-    // When the chain last answered. 0 means it never has, which is a refusal to pay and not a
-    // zero balance.
-    chainAt: ledger?.at ?? 0,
+    // When the chain last answered *usefully*: not merely when a request came back, but when one
+    // came back with a day in it that spending can be measured against. 0 means it never has, and
+    // the panel says so rather than showing a zero balance.
+    //
+    // Gated on the figure and not on the reading, because those two came apart. A walk that stops
+    // at the page bound answers, and `Purse.observe` still refuses to seed a day from it — so the
+    // panel would have said the chain had answered while every payment was denied for the opposite
+    // reason. The claim on screen and the claim in `policy.decide` are now the same claim.
+    chainAt: state.spent === null ? 0 : (ledger?.at ?? 0),
     // How many payments are signed and not yet answered for. Ordinary rather than exceptional now:
     // payments run alongside each other, so this is a count and not a lane.
     inFlight: state.inFlight.filter((entry) => now < entry.deadline).length,

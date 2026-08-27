@@ -360,17 +360,17 @@ The seller picks its own facilitator (`--facilitator`, or `CHIP402_FACILITATOR`)
 
 ## The code
 
-Twelve core files, each with one job, each meant to be read aloud: 1,620 lines of code, 2,920 with
+Twelve core files, each with one job, each meant to be read aloud: 1,649 lines of code, 2,974 with
 the comments. The comments are part of the deliverable — they say *why*, and several of them are
 load-bearing arguments rather than descriptions.
 
 | file | owns | code / total |
 |---|---|---|
-| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also local midnight, the one thing about "today" that is ours | 85 / 191 |
+| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also local midnight, the one thing about "today" that is ours | 85 / 195 |
 | `src/chain.ts` | Everything Hedera says, and the only place it is asked. Five facts, none of them ours | 216 / 405 |
-| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement chase | 309 / 536 |
-| `src/purse.ts` | The limits, the kill switch, the day's figure, and the payments still in the air | 325 / 610 |
-| `src/daemon.ts` | Two listeners in one process. The plane is the listener. The reading loop that mostly does not run | 234 / 370 |
+| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement chase | 335 / 571 |
+| `src/purse.ts` | The limits, the kill switch, the day's figure, and the payments still in the air | 325 / 616 |
+| `src/daemon.ts` | Two listeners in one process. The plane is the listener. The reading loop that mostly does not run | 237 / 379 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK — a hostile seller is the normal case | 83 / 132 |
 | `src/safe.ts` | File operations that have to be paranoid, and the two opposite contracts they come in | 107 / 199 |
 | `src/labels.ts` | The one thing chip402 knows that the chain cannot: which host an account id was reached at. Append-only, capped at 100,000 | 67 / 150 |
