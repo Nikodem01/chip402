@@ -2,7 +2,7 @@
   "name": "chip402",
   "version": "0.1.0",
   "private": true,
-  "description": "Agentic pocket money: a small, hard-capped Hedera purse a local AI agent can spend from without asking.",
+  "description": "An Omarchy OS plugin enabling safe agentic commerce through spend-capped x402 payments on Hedera.",
   "license": "MIT",
   "type": "module",
   "engines": {

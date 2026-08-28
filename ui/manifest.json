@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Nikodem Dominiak",
   "license": "MIT",
-  "description": "A small, hard-capped Hedera purse local agents can spend from, with a live view of the spending and a one-click kill switch.",
+  "description": "An Omarchy OS plugin enabling safe agentic commerce through spend-capped x402 payments on Hedera.",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "Chip.qml" },
   "barWidget": {
