@@ -3,3 +3,6 @@
 .DS_Store
 preview-raw.*
 node_modules/
+.agents/
+.grok/
+demo/
