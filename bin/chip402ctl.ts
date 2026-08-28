@@ -13,6 +13,8 @@ import {
   AccountId,
   Hbar,
   PrivateKey,
+  TokenAssociateTransaction,
+  TokenId,
   TransactionId,
   TransferTransaction,
   createHederaClient,
@@ -84,10 +86,20 @@ function seal(keyDer: string): void {
 }
 
 async function mirror(network: NetworkRow, id: string): Promise<Record<string, any> | null> {
-  const response = await fetch(`${network.mirror}/api/v1/accounts/${id}`, { signal: AbortSignal.timeout(10_000) });
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`mirror node said ${response.status}`);
-  return (await response.json()) as Record<string, any>;
+  const mirrors = [network.mirror, ...(network.mirrors ?? []).filter((m) => m !== network.mirror)];
+  let lastError: unknown = null;
+  for (const base of mirrors) {
+    const cleanBase = base.replace(/\/+$/, "");
+    try {
+      const response = await fetch(`${cleanBase}/api/v1/accounts/${id}`, { signal: AbortSignal.timeout(10_000) });
+      if (response.status === 404) return null;
+      if (!response.ok) throw new Error(`mirror node ${cleanBase} said ${response.status}`);
+      return (await response.json()) as Record<string, any>;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 // root:root 0644 — readable so the panel and CLI can see which network they are on, writable by
@@ -168,11 +180,21 @@ function evmAddressOf(key: PrivateKey): string | null {
 }
 
 async function mirrorAccountsByKey(network: NetworkRow, publicKeyHex: string): Promise<Record<string, any>[]> {
-  const response = await fetch(`${network.mirror}/api/v1/accounts?account.publickey=${publicKeyHex}&limit=5`, {
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) return [];
-  return ((await response.json()) as { accounts?: Record<string, any>[] }).accounts ?? [];
+  const mirrors = [network.mirror, ...(network.mirrors ?? []).filter((m) => m !== network.mirror)];
+  for (const base of mirrors) {
+    const cleanBase = base.replace(/\/+$/, "");
+    try {
+      const response = await fetch(`${cleanBase}/api/v1/accounts?account.publickey=${publicKeyHex}&limit=5`, {
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (response.ok) {
+        return ((await response.json()) as { accounts?: Record<string, any>[] }).accounts ?? [];
+      }
+    } catch {
+      // Try next mirror
+    }
+  }
+  return [];
 }
 
 // Find the account this key already controls. Given an id, verify it; given none, discover it —
@@ -219,6 +241,24 @@ async function completeAccount(network: NetworkRow, key: PrivateKey, accountId: 
     const transaction = new TransferTransaction()
       .addHbarTransfer(payer, Hbar.fromTinybars(-1))
       .addHbarTransfer(AccountId.fromString(TREASURY), Hbar.fromTinybars(1))
+      .setTransactionId(TransactionId.generate(payer))
+      .freezeWith(client);
+    const signed = await transaction.sign(key);
+    const response = await signed.execute(client);
+    await response.getReceipt(client);
+  } finally {
+    client.close();
+  }
+}
+
+// Associate the account with the network's USDC token if auto-association is not enabled.
+async function associateUsdc(network: NetworkRow, key: PrivateKey, accountId: string): Promise<void> {
+  const client = createHederaClient(network.caip2);
+  try {
+    const payer = AccountId.fromString(accountId);
+    const transaction = new TokenAssociateTransaction()
+      .setAccountId(payer)
+      .setTokenIds([TokenId.fromString(network.assets.usdc.id)])
       .setTransactionId(TransactionId.generate(payer))
       .freezeWith(client);
     const signed = await transaction.sign(key);
@@ -299,7 +339,23 @@ async function setup(): Promise<void> {
   const settled = await mirror(network, accountId);
   if (settled) {
     reportBalances(network, settled);
-    console.log(`  auto-association ....... ${settled["max_automatic_token_associations"] ?? "unknown"}`);
+    const autoAssoc = settled["max_automatic_token_associations"] ?? 0;
+    const tokens = settled["balance"]?.tokens ?? [];
+    const hasUsdc = tokens.some((t: Record<string, any>) => t["token_id"] === network.assets.usdc.id);
+    if (hasUsdc) {
+      console.log(`  usdc token ............. associated (${network.assets.usdc.id})`);
+    } else if (autoAssoc === -1 || autoAssoc > 0) {
+      console.log(`  usdc token ............. auto-associates on transfer (slots: ${autoAssoc === -1 ? "unlimited" : autoAssoc})`);
+    } else {
+      process.stdout.write(`  associating usdc (${network.assets.usdc.id}) `);
+      try {
+        await associateUsdc(network, key, accountId);
+        console.log("done.");
+      } catch (err: any) {
+        console.log(`not completed (${err?.message ?? err}) — fund HBAR to enable USDC payments`);
+      }
+    }
+    console.log(`  auto-association ....... ${autoAssoc === -1 ? "unlimited" : autoAssoc}`);
   }
 
   writeConfig(network.caip2, accountId, evmAddress);

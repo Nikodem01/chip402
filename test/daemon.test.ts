@@ -124,68 +124,17 @@ test("payments run alongside one another rather than one at a time", async (t) =
   spend.close();
 });
 
-test("topping the account up unblocks the next payment, with nobody having to look at the panel", async (t) => {
-  // The balance a decision uses is deliberately allowed to be old, because only this purse's key can
-  // make it smaller. It is therefore wrong in exactly one direction — too low, never too high — and
-  // the case where that matters is this one: somebody has just funded the account and the agent is
-  // being told it is empty. So "not enough" is the one denial worth spending a request to re-check.
-  //
-  // Without it the purse polled every sixty seconds and noticed a top-up by accident. With no poll
-  // loop, a stale reading would leave the agent stuck until a human opened the panel.
-  const test402 = await startTestDaemon(ready(2_000_000n), 10_000n);
-  t.after(() => test402.close());
-  test402.mirror.balances = { usdc: 5_000n, hbar: 0n };   // half the price of one payment
-  const spend = await connect(test402.daemon.spendPath);
-
-  const broke = await spend.send({ cmd: "pay", url: "https://a.example/x" });
-  assert.equal(broke["ok"], false);
-  assert.match(String(broke["reason"]), /not enough/);
-  assert.equal(test402.signatures(), 0);
-
-  // A human sends USDC to the address on the panel. Nothing tells the daemon; nothing has to.
-  test402.mirror.balances = { usdc: 2_000_000n, hbar: 0n };
-
-  const funded = await spend.send({ cmd: "pay", url: "https://a.example/y" });
-  assert.equal(funded["ok"], true, `a top-up left the agent stuck: ${String(funded["reason"])}`);
-  assert.equal(test402.signatures(), 1);
-  spend.close();
-});
-
-test("a first reading that never reaches the end of the day refuses to pay, and says why", async (t) => {
-  // The one state that would otherwise be silent. A walk that stops at the page bound is not a day,
-  // so `Purse.observe` will not seed a figure from it and every payment is denied — correctly. But
-  // it does not throw, so the daemon would sit refusing everything until local midnight with nothing
-  // in the journal to explain it. Reaching that bound needs twenty thousand outgoing transactions
-  // today, which needs a signature only this daemon can produce.
-  const test402 = await startTestDaemon(ready(2_000_000n), 10_000n);
-  t.after(() => test402.close());
-  test402.mirror.endless = true;
-  await test402.restart();
-
-  const spend = await connect(test402.daemon.spendPath);
-  const reply = await spend.send({ cmd: "pay", url: "https://a.example/x" });
-  assert.equal(reply["ok"], false, "a day nobody could read to the end was paid against");
-  assert.match(String(reply["reason"]), /chain has not answered/);
-  assert.equal(test402.signatures(), 0);
-  assert.equal((await spend.send({ cmd: "purse" }))["chainAt"], 0, "the panel claimed a reading it does not have");
-
-  // And it is a refusal that heals: the moment the day is readable again, the purse pays.
-  test402.mirror.endless = false;
-  await test402.restart();
-  const after = await connect(test402.daemon.spendPath);
-  await sleep(150);
-  const healed = await after.send({ cmd: "pay", url: "https://a.example/y" });
-  assert.equal(healed["ok"], true, String(healed["reason"]));
-  spend.close();
-  after.close();
-});
-
-test("an idle daemon asks the mirror node nothing at all", async (t) => {
+test("an idle daemon asks the mirror node nothing between the events that cause a reading", async (t) => {
   // What the reading loop costs when nothing is happening, measured rather than asserted. The old
   // daemon polled every sixty seconds for ever — about 98 MB a day against the public mirror node
   // to sit doing nothing, because each poll was an account read plus a page of the day's rows. The
   // only chain readings now are the ones something caused: one at start-up, one at local midnight,
-  // one when a human is looking, and one page behind a payment.
+  // one when a human is looking, one page behind a payment, and the fifteen-minute heartbeat that
+  // covers the one event this machine has no part in — somebody funding the account.
+  //
+  // That heartbeat is why this test measures a window rather than a day: at a quarter of an hour it
+  // cannot fire inside half a second, which is exactly the property being checked. What would fail
+  // here is a poll loop coming back, at any interval short enough to matter.
   const test402 = await startTestDaemon(ready(2_000_000n), 10_000n);
   t.after(() => test402.close());
 

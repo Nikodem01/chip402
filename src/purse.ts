@@ -1,31 +1,39 @@
 // The purse: the limits, the kill switch, the day's figure, and the payments still in the air.
 //
-// The day's figure is a number this file keeps, and the previous build kept one too and got it
-// wrong — it carried two HBAR payments made by a wallet this machine no longer held across a
-// `setup --import` and charged a fresh account's allowance for them. Nothing was attacking it. So
-// the difference is worth being exact about, because "we keep a number again" is the sentence that
-// deserves the most suspicion in this file:
+// The day's figure is a number this file keeps on disk, which is the sentence here that deserves
+// the most suspicion — because the previous build kept one on disk too and got it wrong. It carried
+// two HBAR payments made by a wallet this machine no longer held across a `setup --import` and
+// charged a fresh account's allowance for them. Nothing was attacking it. So what changed is worth
+// being exact about, and it is not "we stopped writing it down":
 //
-//   then                                    now
-//   in purse.json, written on every payment  in memory, gone on restart
-//   nothing said which account it was for    tagged with the account and the local day, and
-//                                            discarded rather than carried when either changes
-//   nothing ever re-derived it               seeded from the chain at start-up and at midnight,
-//                                            and raised by a chain reading, never by arithmetic
-//                                            alone
+//   then                                     now
+//   nothing said which account it was for     tagged with the account and the local day, checked
+//                                             on the way in and again in policy.decide, and
+//                                             discarded rather than carried when either changes
+//   nothing ever re-derived it                every reading of the chain corrects it, and a
+//                                             reading may only ever raise it, never talk it down
+//   kept beside the limits                    kept beside the in-flight list, which is the other
+//                                             half of the same fact and moves with it in one write
 //
-// What is on disk is not that figure. It is the list of payments signed in the last two minutes
-// that the chain has not answered for yet, and every entry in it expires — see `Authorization`.
+// Why it is written down at all. The figure is (everything settled today) + (everything in flight),
+// and the second half was always durable; only the first was thrown away. That is what made a
+// restart walk a whole local day before the purse could pay anything — unbounded work whose size is
+// set by how busy the agent has been. The one thing that had to finish before the purse would open
+// was the one thing a busy agent could make too big to finish. See `readSpent`.
+//
+// The chain is still what the figure answers to. This is a file corrected by the ledger, not a
+// substitute for it.
 //
 // So there are three kinds of state here and each lives where it belongs:
 //
 //   purse.json     policy, and only policy — four numbers and a flag, set by root and changeable
 //                  only over the admin socket. Unreadable ⇒ refuse to start.
-//   memory         the chain's last answer and the day's running figure, thrown away on restart.
-//                  The next daemon asks the mirror node again, which is the point.
-//   inflight.json  payments we have signed and the chain has not yet shown us. Every entry dies
-//                  within a little over two minutes of being written — see `Authorization`.
-//                  Unreadable ⇒ assume the whole allowance is committed until then.
+//   memory         the chain's last answer — balances, the key check, the rows the panel draws.
+//                  Thrown away on restart, and the next daemon asks the mirror node again.
+//   inflight.json  what we have spent today, and what we have signed and not been shown yet. Every
+//                  entry expires within a little over two minutes — see `Authorization`. Unreadable
+//                  ⇒ assume the whole allowance is committed until then, and ask the chain for the
+//                  figure rather than guessing at one.
 //
 // The host names used to be in this file too. They are in labels.ts now, because a file that must
 // refuse to start when it cannot be read has no business also holding something that grows and is
@@ -36,7 +44,7 @@ import { ASSET_KEYS } from "./networks.ts";
 import type { Ledger, Payment } from "./chain.ts";
 import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "./chain.ts";
 import type { Label, Labels } from "./labels.ts";
-import { committed, dayEnd } from "./policy.ts";
+import { committed, dayEnd, dayStart } from "./policy.ts";
 import { parseUnits } from "./money.ts";
 import { readJson, removeFile, writeAtomic } from "./safe.ts";
 import { dirname, join } from "node:path";
@@ -92,7 +100,8 @@ export type Spent = {
 //   purse.json     refuse to start   — "I do not know the limits" must never become "no limits"
 //   labels.jsonl   carry on          — losing every host name costs rows that show account ids
 //   inflight.json  assume committed  — a list we cannot read is a list we honour, for as long as
-//                                      any entry in it could possibly have lasted
+//                                      any entry in it could possibly have lasted; and a figure we
+//                                      cannot read is one we ask the chain for
 //
 // It would also have been a third writer on a file that already has two — root raising a limit over
 // the admin socket, and anyone pressing PAUSE over the spend one — writing on the payment path,
@@ -134,7 +143,25 @@ const legacyLockPath = (pursePath: string): string => join(dirname(pursePath), L
 //                    `deadline` is `validStart + AUTHORIZATION_MS` and `validStart` is already in
 //                    the past when it is written, so a value beyond `now + that` is damage rather
 //                    than data, and clamping is what stops a garbled number wedging the purse.
-function readInFlight(pursePath: string, accountId: string | null, budgets: Record<AssetKey, Budget>, now: number): Authorization[] {
+// Read once, so that the two halves of the same fact are read from the same bytes. A payment moves
+// out of `entries` and into `spent` in one write; reading the file twice could see it in neither.
+type Persisted = { raw: unknown; unreadable: boolean };
+
+function readPersisted(pursePath: string): Persisted {
+  try {
+    return { raw: readJson(inFlightPath(pursePath)), unreadable: false };
+  } catch {
+    return { raw: undefined, unreadable: true };
+  }
+}
+
+function readInFlight(
+  pursePath: string,
+  accountId: string | null,
+  budgets: Record<AssetKey, Budget>,
+  now: number,
+  file: Persisted,
+): Authorization[] {
   const ceiling = now + AUTHORIZATION_MS;
   const everything = (deadline: number): Authorization[] =>
     ASSET_KEYS.map((asset) => ({ asset, amount: budgets[asset].allowance, txId: null, deadline }));
@@ -155,12 +182,8 @@ function readInFlight(pursePath: string, accountId: string | null, budgets: Reco
   }
   removeFile(legacy);
 
-  let raw: unknown;
-  try {
-    raw = readJson(inFlightPath(pursePath));
-  } catch {
-    return everything(ceiling);
-  }
+  if (file.unreadable) return everything(ceiling);
+  const raw = file.raw;
   if (raw === undefined) return carried;
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return everything(ceiling);
   const row = raw as Record<string, unknown>;
@@ -189,6 +212,74 @@ function readInFlight(pursePath: string, accountId: string | null, budgets: Reco
   return live;
 }
 
+// SECURITY: the day's figure, recovered from disk rather than re-derived from the chain — and the
+// reason the boot walk is no longer the thing everything waits on.
+//
+// The figure is (everything settled today) + (everything in flight). The second half has always
+// been durable; the first was thrown away on every restart, which is the *only* reason a daemon had
+// to walk a whole local day before it could pay anything. Walking a day is unbounded work whose size
+// is set by how busy the agent has been, so the one thing that had to finish before the purse opened
+// was the one thing a busy agent could make too big. Writing the number down deletes that.
+//
+// This is the copy the old build got wrong, so the difference is worth stating rather than assuming:
+// that one said nothing about *whose* spending it was, so `setup --import` carried an older wallet's
+// figure onto a fresh account. This one is tagged with the account and the local day, both are
+// checked here and checked again in `policy.decide`, and a figure that does not match this purse and
+// this day is discarded rather than reinterpreted.
+//
+// What makes it safe to trust is not the file, it is who can write one. Nothing but this daemon can
+// spend against this allowance: the key is sealed to this machine, the signer never leaves
+// wallet.ts, and `paymentsIn` excludes anything the owner initiated. So an absent figure means this
+// purse has spent nothing today, not that we cannot know. And the state directory is 0700
+// chip402:chip402 — the agent's uid cannot read it, let alone forge it, and root could raise the
+// allowance directly rather than bother.
+//
+// Five readings, and the two that cannot be trusted fall back to the chain rather than to a guess:
+//
+//   no file          nothing has been spent today. See above for why that is a fact and not a hope.
+//   unreadable       no figure — let the boot walk seed it. Deliberately *not* "assume the whole
+//                    allowance": `#absorb` may only ever raise a figure, so a pessimistic guess
+//                    here could never be corrected back down and would deny all day.
+//   another account  the same, and for the same reason `readInFlight` discards those entries.
+//   another day      nothing has been spent *today*. A payment today would have written today.
+//   a figure         use it, and let every later reading of the chain raise it.
+function readSpent(accountId: string | null, now: number, file: Persisted): Spent | null {
+  if (accountId === null) return null;
+  const today = dayStart(now);
+  const nothing: Spent = { accountId, dayStart: today, totals: { usdc: 0n, hbar: 0n } };
+
+  if (file.unreadable) return null;
+  if (file.raw === undefined) return nothing;
+  if (file.raw === null || typeof file.raw !== "object" || Array.isArray(file.raw)) return null;
+  const row = file.raw as Record<string, unknown>;
+  if (row["accountId"] !== accountId) return null;
+
+  // A file written before this field existed. The entries in it are still honoured by
+  // `readInFlight`; what it cannot tell us is a figure, and not having spent anything is what an
+  // upgrade over a running purse actually means for every day but the one it happens on.
+  const written = row["spent"];
+  if (written === undefined || written === null) return nothing;
+  if (typeof written !== "object" || Array.isArray(written)) return null;
+  const held = written as Record<string, unknown>;
+
+  const day = held["dayStart"];
+  if (typeof day !== "number" || !Number.isFinite(day)) return null;
+  if (day !== today) return nothing;
+
+  const source = (held["totals"] ?? {}) as Record<string, unknown>;
+  const totals: Record<AssetKey, bigint> = { usdc: 0n, hbar: 0n };
+  for (const key of ASSET_KEYS) {
+    try {
+      totals[key] = BigInt(String(source[key] ?? "0"));
+    } catch {
+      return null;
+    }
+    // A negative figure is damage, and damage that would hand back allowance.
+    if (totals[key] < 0n) return null;
+  }
+  return { accountId, dayStart: today, totals };
+}
+
 // How many payment rows the status frame carries per asset. The panel draws six and the CLI five,
 // so this is headroom rather than a constraint on either — what it bounds is the frame itself.
 // Today's spending is summed from every row the chain returned before this cut, so the number is
@@ -206,10 +297,10 @@ export type PurseState = {
   // draw. Null until the mirror node has answered once, which policy.ts treats as a reason to
   // refuse rather than as a zero. Memory only: a restart asks again.
   ledger: Ledger | null;
-  // What has gone out today. Seeded from the chain when the daemon starts and when the day rolls
-  // over, raised by every payment of ours the chain confirms, and never lowered. Memory only, for
-  // the same reason as above and for one more: a figure that cannot survive a restart cannot
-  // survive an account change either.
+  // What has gone out today: recovered from inflight.json when the daemon starts, raised by every
+  // payment of ours the chain confirms, corrected upward by every reading, and never lowered. Null
+  // only when the file could not be trusted — a foreign account, damage — and then the boot walk is
+  // what seeds it. `policy.decide` reads null as a refusal to pay, not as a zero.
   spent: Spent | null;
   // Three consecutive readings, a minute apart, that the account is controlled by a different
   // key. See wallet.ts for the counting and policy.ts for what it costs. Memory only, and the
@@ -298,16 +389,18 @@ export class Purse {
     const raw = readJson(path) as Record<string, unknown> | undefined;
     const usdc = budgetFromJson(raw?.["usdc"]);
     const hbar = budgetFromJson(raw?.["hbar"]);
+    const now = Date.now();
+    // Both halves of what a restart is allowed to remember, out of one read of one file. See
+    // `readInFlight` and `readSpent` for the tables of what each is allowed to conclude.
+    const file = readPersisted(path);
     const state: PurseState = {
       paused: raw === undefined ? true : raw["paused"] !== false,
       usdc,
       hbar,
       ledger: null,
-      spent: null,
+      spent: readSpent(accountId, now, file),
       mismatch: false,
-      // The one thing on this side of the line that a restart does not throw away — and the only
-      // thing. See readInFlight for what a restart is allowed to conclude.
-      inFlight: readInFlight(path, accountId, { usdc, hbar }, Date.now()),
+      inFlight: readInFlight(path, accountId, { usdc, hbar }, now, file),
     };
     const labels = labelsFromJson(raw?.["labels"]);
     return new Purse(path, state, labels.length > 0 ? labels : labelsFromLegacyReceipts(raw), accountId);
@@ -344,6 +437,15 @@ export class Purse {
     this.#state.ledger = ledger;
     this.#state.mismatch = mismatch;
     this.#absorb(ledger);
+    // The chain is what corrects the figure, so a correction has to outlive the process that heard
+    // it — otherwise a restart drops back to what this daemon counted itself, which is lower.
+    // Best effort: a failed write here costs the raise until the next reading, and the next reading
+    // makes it again. Nothing about the decision in memory waits on the disk.
+    try {
+      this.#write(this.#state.inFlight, this.#state.spent);
+    } catch {
+      // Deliberately nothing. See above.
+    }
     this.#onChange?.();
     return true;
   }
@@ -382,7 +484,7 @@ export class Purse {
   authorize(asset: AssetKey, amount: bigint, validStart: number): Authorization {
     const entry: Authorization = { asset, amount, txId: null, deadline: validStart + AUTHORIZATION_MS };
     const next = [...this.#state.inFlight, entry];
-    this.#write(next);
+    this.#write(next, this.#state.spent);
     this.#state.inFlight = next;
     this.#onChange?.();
     return entry;
@@ -397,7 +499,7 @@ export class Purse {
     entry.txId = txId;
     entry.deadline = validStart + AUTHORIZATION_MS;
     try {
-      this.#write(this.#state.inFlight);
+      this.#write(this.#state.inFlight, this.#state.spent);
     } catch {
       // Deliberately nothing. See above.
     }
@@ -415,12 +517,14 @@ export class Purse {
   // allowance for ten, which is exactly how this was found. The same predicate governs both places.
   settled(entry: Authorization): void {
     const shown = this.#shown(entry);
-    if (!this.#forget(entry)) return;
     const spent = this.#state.spent;
-    if (spent !== null && !shown) {
-      const totals = { ...spent.totals, [entry.asset]: spent.totals[entry.asset] + entry.amount };
-      this.#state.spent = { ...spent, totals };
-    }
+    // Worked out before the entry is forgotten, so that leaving the list and entering the figure is
+    // one change to persist rather than two. See `#write`.
+    const raised =
+      spent === null || shown
+        ? spent
+        : { ...spent, totals: { ...spent.totals, [entry.asset]: spent.totals[entry.asset] + entry.amount } };
+    if (!this.#forget(entry, raised)) return;
     this.#onChange?.();
   }
 
@@ -437,29 +541,51 @@ export class Purse {
     if (this.#forget(entry)) this.#onChange?.();
   }
 
-  #forget(entry: Authorization): boolean {
+  // `spent` is what the figure becomes as this entry leaves the list — the same figure for
+  // `abandon`, which gives nothing back, and a raised one for `settled`. Both move in one write.
+  #forget(entry: Authorization, spent: Spent | null = this.#state.spent): boolean {
     if (!this.#state.inFlight.includes(entry)) return false;
     const next = this.#state.inFlight.filter((row) => row !== entry);
     this.#state.inFlight = next;
+    this.#state.spent = spent;
     // Best effort, and the ordering is the fail-closed one: the list is already short in memory, so
     // a write that fails leaves the *next* daemon holding an entry for the seconds it has left —
-    // a denial, never a second payment.
+    // a denial, never a second payment. It leaves that daemon the *lower* figure too, which is the
+    // same trade in the same direction: the entry it is still holding covers the amount, and the
+    // first reading of the chain raises the figure for good.
     try {
-      this.#write(next);
+      this.#write(next, spent);
     } catch {
       // Deliberately nothing. See above.
     }
     return true;
   }
 
-  #write(entries: readonly Authorization[]): void {
+  // SECURITY: both halves of the day's figure, in one write, on purpose. A payment leaves `entries`
+  // and enters `spent` in the same instant, and writing those separately would leave a window in
+  // which a crash loses it from both — an undercount, which is the direction that spends an
+  // allowance twice. There is one file and one write, so the transition is either taken or not.
+  //
+  // The file now outlives the list in it: an empty `entries` used to mean "delete this", and it no
+  // longer can, because the figure has to survive an idle purse with nothing in the air. It is
+  // removed only when there is nothing left to remember at all.
+  #write(entries: readonly Authorization[], spent: Spent | null): void {
     const path = inFlightPath(this.#path);
-    if (entries.length === 0) {
+    if (entries.length === 0 && spent === null) {
       removeFile(path);
       return;
     }
     const body = {
       accountId: this.#accountId,
+      spent:
+        spent === null
+          ? null
+          : {
+              dayStart: spent.dayStart,
+              // Base units as decimal strings, for the same reason the limits are: bigint has no
+              // JSON of its own, and a float would round money.
+              totals: Object.fromEntries(ASSET_KEYS.map((key) => [key, spent.totals[key].toString()])),
+            },
       entries: entries.map((entry) => ({
         asset: entry.asset,
         amount: entry.amount.toString(),
@@ -599,14 +725,15 @@ export function snapshot(
     // Local midnight, computed rather than stored — it is a question about this machine's
     // timezone, not a number anybody has to keep in sync.
     resetsAt: dayEnd(now),
-    // When the chain last answered *usefully*: not merely when a request came back, but when one
-    // came back with a day in it that spending can be measured against. 0 means it never has, and
-    // the panel says so rather than showing a zero balance.
+    // When the chain last answered *with a day this purse could use*. 0 means it never has, which
+    // is a refusal to pay and not a zero balance.
     //
-    // Gated on the figure and not on the reading, because those two came apart. A walk that stops
-    // at the page bound answers, and `Purse.observe` still refuses to seed a day from it — so the
-    // panel would have said the chain had answered while every payment was denied for the opposite
-    // reason. The claim on screen and the claim in `policy.decide` are now the same claim.
+    // Gated on the figure rather than on a reply having arrived, because those are not the same
+    // thing and the panel is documented on this field. `observe` publishes a reading before
+    // `#absorb` decides whether a day's figure can be seeded from it, so a walk that stopped short
+    // used to leave `ledger` set and `spent` null: the panel drew a balance and said the chain had
+    // answered, while `policy.decide` denied every payment with "the chain has not answered yet".
+    // Two claims about one fact, disagreeing. This is the claim `decide` makes.
     chainAt: state.spent === null ? 0 : (ledger?.at ?? 0),
     // How many payments are signed and not yet answered for. Ordinary rather than exceptional now:
     // payments run alongside each other, so this is a count and not a lane.

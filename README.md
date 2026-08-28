@@ -136,9 +136,10 @@ That was honest and it cost more than it looked:
 figure.** Nothing else can. So it does not need to be told.
 
 ```
-spent today  =  what the chain said when this daemon started
+spent today  =  what this daemon last wrote down for today
              +  every payment of ours the chain has confirmed since
              +  every payment authorised and not yet answered for
+             +  raised, never lowered, by every reading of the chain
 ```
 
 - The amount is committed **on the way to the key**, before anything is signed. `policy.decide`
@@ -180,17 +181,41 @@ worth being exact about.
 
 | | then | now |
 |---|---|---|
-| where it lived | `purse.json`, rewritten on every payment | memory. A restart re-asks the chain |
 | whose it was | nothing on it said | tagged with the account **and** the local day, and discarded rather than carried when either changes — checked again in `policy.ts`, where the decision is |
-| what re-derived it | nothing, ever | the chain seeds it at start-up and at local midnight, and a reading may **raise** it but never lower it |
-| what reached disk | the figure itself | never the figure |
+| what re-derived it | nothing, ever | every reading of the chain corrects it, and a reading may **raise** it but never lower it |
+| where it lived | beside the limits, rewritten on every payment | beside the in-flight list, which is the other half of the same fact and moves with it in one write |
 
-What *is* on disk is the in-flight list, and only that: `{asset, amount, txId, deadline}` per payment
-signed and not yet answered for. It exists for one reason — so that a restart between the signature
-and the chain showing it does not forget what it already authorised and let the same allowance be
-spent twice. That was demonstrated end to end before it was fixed
-(`systemctl restart chip402` inside the indexing window bought a second payment, and
-`Restart=on-failure` does it unattended), and `test/daemon.test.ts` runs the whole attack.
+It is on disk, and that is a deliberate reversal. The figure is *(everything settled today) + 
+(everything in flight)*, and the second half was always durable; only the first was thrown away. That
+is what made a restart walk an entire local day before the purse could pay anything — **unbounded
+work whose size is set by how busy the agent has been.** The one thing that had to finish before the
+purse would open was the one thing a busy agent could make too big to finish. A day of the
+per-request metering this exists for reaches twenty thousand payments without trying.
+
+So the walk is a correction now, not a precondition. It runs at start-up, it may only ever raise the
+figure, and it is allowed to fail.
+
+**What makes it safe to trust is not the file, it is who can write one.** Nothing but this daemon can
+spend against this allowance: the key is sealed to the machine, the signer never leaves `wallet.ts`,
+and `paymentsIn` excludes anything the owner initiated. So an absent figure means this purse has
+spent nothing today rather than that we cannot know. `StateDirectory=0700 chip402:chip402` — the
+agent's uid cannot read that directory, let alone forge a file in it, and root could raise the
+allowance directly rather than bother.
+
+**And the balance is still the chain's alone.** `policy.decide` refuses to pay without a reading, so
+a restored figure gets a purse as far as knowing what it has spent and no further. This is a file
+corrected by the ledger, not a substitute for it.
+
+Beside the figure in that same file is the in-flight list: `{asset, amount, txId, deadline}` per
+payment signed and not yet answered for. It exists so that a restart between the signature and the
+chain showing it does not forget what it already authorised and let the same allowance be spent
+twice. That was demonstrated end to end before it was fixed (`systemctl restart chip402` inside the
+indexing window bought a second payment, and `Restart=on-failure` does it unattended), and
+`test/daemon.test.ts` runs the whole attack.
+
+The two move together in **one write**: a payment leaves the list and enters the figure in the same
+instant, so a crash can never lose it from both — which would be an undercount, and an undercount is
+how one allowance pays for two payments.
 
 **Every entry in that file dies within a little over two minutes of being written.** Nothing in it
 can walk into another day or another account, because nothing in it lives long enough to try.
@@ -203,7 +228,7 @@ Sharing one file would mean sharing one failure mode, and it would have to be th
 |---|---|---|
 | `purse.json` | the limits and `paused` | **refuse to start.** "I do not know the limits" must never become "there are no limits" |
 | `labels.jsonl` | host names for payment rows | **carry on with fewer names.** Losing all of them costs rows that show `0.0.9584959` instead of a hostname, and nothing else |
-| `inflight.json` | what is signed and unanswered | **assume the whole allowance is committed**, for as long as any real entry could have lasted. Damage costs a bounded stretch of denial, never an extra payment |
+| `inflight.json` | today's figure, and what is signed and unanswered | **assume the whole allowance is committed**, for as long as any real entry could have lasted, and **ask the chain for the figure** rather than guessing at one. Damage costs a bounded stretch of denial, never an extra payment |
 
 `labels.jsonl` is append-only and capped at 100,000 entries — one short append per payment rather
 than an atomic rewrite of the limits, so a display nicety can never fail a payment or stop the
@@ -220,7 +245,7 @@ Measured against the public testnet mirror node, not estimated.
 
 | | before | now |
 |---|---|---|
-| idle, per day | ~98 MB, 1,440 polls | **nothing at all** |
+| idle, per day | ~98 MB, 1,440 polls | **96 single-page readings** |
 | a 300-payment day | ~320 MB | **~4 MB** |
 | requests per payment | ~7, two of them page walks | ~3 point lookups of 917 bytes |
 | a day's full reading | 23,072 B + 90 KB/page | 740 B + 40 KB/page |
@@ -234,6 +259,20 @@ The reading is event-driven, and the events are the ones the daemon cannot cause
   last reading was seconds ago.
 - **after paying** — one page, so the payment appears as a row the chain returned. Not awaited, and
   no decision waits on it.
+- **every fifteen minutes** — the one exception, and the one event above that has no human in it.
+
+That last one is there because the list above has a hole in it: every other reading is triggered by
+this machine doing something, and **money arriving is the one thing this machine has no part in**.
+The daemon signs every payment, so it knows every way the balance can go down; nothing tells it when
+the balance goes up. Top the account up from a phone with the panel shut and, without a heartbeat,
+nothing would find out until somebody opened the panel or the day rolled over — and an agent working
+in the meantime would be told the purse is empty.
+
+Fifteen minutes is the worst case that buys, and it is not the old loop wearing a longer interval.
+The old one asked for the whole ledger every sixty seconds; this asks for the same single-page
+reading the panel triggers, so it is 96 of them a day instead of 1,440 full ones. What made the old
+loop expensive was the payload, not the interval — which is worth saying plainly, because the
+interval is what got the blame.
 
 The 740-byte figure is one query parameter: the accounts endpoint bundles a page of recent
 transactions into its answer unless told `transactions=false`, and the daemon was parsing those rows
@@ -360,22 +399,22 @@ The seller picks its own facilitator (`--facilitator`, or `CHIP402_FACILITATOR`)
 
 ## The code
 
-Twelve core files, each with one job, each meant to be read aloud: 1,649 lines of code, 2,974 with
+Twelve core files, each with one job, each meant to be read aloud: 1,747 lines of code, 3,240 with
 the comments. The comments are part of the deliverable — they say *why*, and several of them are
 load-bearing arguments rather than descriptions.
 
 | file | owns | code / total |
 |---|---|---|
-| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also local midnight, the one thing about "today" that is ours | 85 / 195 |
-| `src/chain.ts` | Everything Hedera says, and the only place it is asked. Five facts, none of them ours | 216 / 405 |
-| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement chase | 335 / 571 |
-| `src/purse.ts` | The limits, the kill switch, the day's figure, and the payments still in the air | 325 / 616 |
-| `src/daemon.ts` | Two listeners in one process. The plane is the listener. The reading loop that mostly does not run | 237 / 379 |
+| `src/policy.ts` | **Pure.** The whole decision on one screen: no I/O, no clock of its own, no path to the key. Also local midnight, the one thing about "today" that is ours | 85 / 191 |
+| `src/chain.ts` | Everything Hedera says, and the only place it is asked. Five facts, none of them ours | 255 / 493 |
+| `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement chase | 311 / 545 |
+| `src/purse.ts` | The limits, the kill switch, the day's figure, and the payments still in the air | 377 / 743 |
+| `src/daemon.ts` | Two listeners in one process. The plane is the listener. The reading loop that mostly does not run | 259 / 451 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK — a hostile seller is the normal case | 83 / 132 |
 | `src/safe.ts` | File operations that have to be paranoid, and the two opposite contracts they come in | 107 / 199 |
 | `src/labels.ts` | The one thing chip402 knows that the chain cannot: which host an account id was reached at. Append-only, capped at 100,000 | 67 / 150 |
 | `src/protocol.ts` | The two verb sets, and the line-framed socket protocol | 80 / 132 |
-| `src/networks.ts` | Two networks, two assets each. The mainnet switch, in one place | 72 / 109 |
+| `src/networks.ts` | Two networks, two assets each. The mainnet switch, in one place | 81 / 118 |
 | `src/money.ts` | Decimal strings to base units and back, without a float anywhere | 36 / 61 |
 | `src/ids.ts` | What a Hedera account id and a transaction id look like, in one place | 6 / 25 |
 
@@ -397,7 +436,7 @@ speaking the real endpoints with the real row shapes, so almost nothing here is 
 | `test/policy.test.ts` | The decision table, run once per asset, plus the cross-asset cases. A figure measured for another account is refused. `verified === null` **allows** — an anti-brick case with real teeth |
 | `test/signer.test.ts` | Every denial leaves the stub signer uncalled and nothing committed. A second signature in one payment throws. Payments in flight together cannot exceed the allowance between them |
 | `test/purse.test.ts` | That `purse.json` holds policy and nothing else; that no figure reaches disk; that an in-flight list written for another account is discarded; that damage reads as *committed* rather than free; and that a payment is counted exactly once whichever of the chain's two answers lands first |
-| `test/daemon.test.ts` | Three hundred concurrent payments stop at the allowance and never past it. Twenty run genuinely alongside each other. An idle daemon asks the mirror node nothing. **The restart attack**, end to end |
+| `test/daemon.test.ts` | Three hundred concurrent payments stop at the allowance and never past it. Twenty run genuinely alongside each other. An idle daemon has no poll loop between events. **The restart attack**, end to end |
 | `test/chain.test.ts` | That the walk is a superset of what the sum counts; that ten thousand rows of somebody else's dust cannot bound it; that a walk which stopped short says so |
 | `test/planes.test.ts` | Disjoint verb sets, admin verbs refused on the spend socket, the plane never read from a field, the socket modes under the unit's own umask, and every polkit action |
 | `test/seller.test.ts` | The wire, against sellers we did not write — including one that keeps a signature and never settles |

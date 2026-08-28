@@ -31,6 +31,7 @@ export type NetworkRow = {
   // Read-only, and the only host the daemon talks to that is not the seller. Balances come from
   // here; the daemon never opens a connection to a consensus node.
   readonly mirror: string;
+  readonly mirrors?: readonly string[];
   // The explorer for this network, as a base. A payment row appends `transaction/<id>`; the
   // top-up panel appends `account/<id>`, which is how the address it shows can be checked
   // against a source that is not us.
@@ -77,6 +78,10 @@ export const NETWORKS: Readonly<Record<string, NetworkRow>> = Object.freeze({
     caip2: "hedera:testnet",
     label: "testnet",
     mirror: "https://testnet.mirrornode.hedera.com",
+    mirrors: Object.freeze([
+      "https://testnet.mirrornode.hedera.com",
+      "https://hedera-testnet.arkhia.io/api/v1",
+    ]),
     hashscan: "https://hashscan.io/testnet/",
     live: false,
     assets: Object.freeze({ usdc: Object.freeze(usdc("0.0.429274")), hbar: Object.freeze(hbar()) }),
@@ -85,6 +90,10 @@ export const NETWORKS: Readonly<Record<string, NetworkRow>> = Object.freeze({
     caip2: "hedera:mainnet",
     label: "MAINNET",
     mirror: "https://mainnet-public.mirrornode.hedera.com",
+    mirrors: Object.freeze([
+      "https://mainnet-public.mirrornode.hedera.com",
+      "https://hedera-mainnet.arkhia.io/api/v1",
+    ]),
     hashscan: "https://hashscan.io/mainnet/",
     live: true,
     assets: Object.freeze({ usdc: Object.freeze(usdc("0.0.456858")), hbar: Object.freeze(hbar()) }),

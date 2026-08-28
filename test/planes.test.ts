@@ -309,9 +309,26 @@ test("a definite key mismatch hides the address the panel would ask you to fund"
   assert.match(funding.slice(0, 4000), /evmAddress|qrPath|accountWithChecksum/, "the gated block is not the funding block");
 });
 
-test("the panel cannot reach an admin verb without going through pkexec", () => {
-  // The socket write path takes exactly one verb, and it is the free one.
+test("the panel cannot reach an admin verb or spend money without going through pkexec", () => {
+  // What the panel may write straight down the socket. This used to pin the list at exactly
+  // `pause`, which was the whole set at the time and so could not say which part of it mattered;
+  // adding `purse` — a read the daemon already pushes to this panel unasked — failed it for no
+  // security reason. So the invariant is stated instead of the inventory:
+  //
+  //   - never an admin verb. Those cost a polkit password and go out as `pkexec chip402ctl …`,
+  //     and the daemon would not accept one on this socket anyway. Belt and braces, on purpose:
+  //     the panel asking is meant to be impossible, not merely absent.
+  //   - never `pay`. The daemon *would* honour it — the panel holds the spend socket, which is
+  //     the point of the spend socket — so this is the only line stopping a status widget from
+  //     being able to spend money. It is a guard on us, not on an attacker: anything that can
+  //     write to that socket can already pay without editing this file.
+  //
+  // What is left is the free half of the spend plane: ask what the purse says, and stop it.
   const source = readFileSync(new URL("../ui/Purse.qml", import.meta.url), "utf8");
   const written = [...source.matchAll(/write\(JSON\.stringify\(\{\s*cmd:\s*"([a-z]+)"/g)].map((m) => m[1]!);
-  assert.deepEqual(written, ["pause"], "the panel writes a verb other than pause straight to the socket");
+  assert.ok(written.length > 0, "the panel no longer writes to the socket at all");
+  for (const verb of written) {
+    assert.ok(SPEND_VERBS.includes(verb as never), `the panel writes ${verb}, which is not a spend verb`);
+    assert.notEqual(verb, "pay", "the panel writes `pay` straight to the socket");
+  }
 });

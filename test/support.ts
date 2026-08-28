@@ -129,9 +129,6 @@ export type Mirror = {
   // While true, a recorded payment is held back — the indexing gap between a transaction
   // reaching consensus and the mirror node answering for it.
   indexing: boolean;
-  // While true, every page of transactions comes back full, whatever is actually in it — a day
-  // with more rows in it than any walk will read. Cheaper than recording twenty thousand of them.
-  endless: boolean;
   // Hold the balances endpoint back by this long. `readLedger` fires both of its requests at once,
   // so this is how a test makes one leg of a reading resolve long after the other — which is what
   // lets a read issued early land after a read issued late.
@@ -196,7 +193,6 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     rows: [] as MirrorRow[],
     held: [] as MirrorRow[],
     indexing: false,
-    endless: false,
     accountsDelayMs: 0,
     requests: [] as string[],
   };
@@ -237,25 +233,6 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
 
     if (url.pathname === "/api/v1/transactions") {
       const limit = Number(url.searchParams.get("limit") ?? "25");
-      if (state.endless) {
-        // A page that is always full, dated backwards from whatever the caller asked to be below,
-        // so the walk keeps finding somewhere older to go and never runs out.
-        const before = url.searchParams.getAll("timestamp").find((value) => value.startsWith("lt:"));
-        const top = before === undefined ? Date.now() / 1000 : Number(before.slice(3));
-        const page = Array.from({ length: limit }, (_, i) => ({
-          transaction_id: `0.0.9185802-${Math.floor(top) - i - 1}-000000001`,
-          consensus_timestamp: (top - i - 0.000001).toFixed(9),
-          result: "SUCCESS",
-          name: "CRYPTOTRANSFER",
-          transfers: [] as { account: string; amount: number }[],
-          token_transfers: [
-            { token_id: testnet.assets.usdc.id, account: OUR_ACCOUNT, amount: -1 },
-            { token_id: testnet.assets.usdc.id, account: SELLER, amount: 1 },
-          ],
-        }));
-        send(200, { transactions: page, links: { next: null } });
-        return;
-      }
       const matching = state.rows
         .filter((row) => withinRange(row, url.searchParams) && matchesType(row, url.searchParams, OUR_ACCOUNT))
         .sort((a, b) => Number(b.consensus_timestamp) - Number(a.consensus_timestamp))
@@ -303,12 +280,6 @@ export async function fakeMirror(overrides: Partial<Pick<Mirror, "balances" | "k
     },
     set indexing(value: boolean) {
       state.indexing = value;
-    },
-    get endless() {
-      return state.endless;
-    },
-    set endless(value: boolean) {
-      state.endless = value;
     },
     get accountsDelayMs() {
       return state.accountsDelayMs;
@@ -461,25 +432,27 @@ export function stubWallet(
       );
     },
     async pay(url: string): Promise<PaidResult> {
-      // The same rule the real `payer` follows: read the chain only when this process has no day to
-      // measure against yet.
+      // The same rule the real `payer` follows: read the chain only when this process cannot decide
+      // without it — no balance, no figure for today, or a figure measured for a day that has since
+      // rolled over.
+      //
+      // Duplicated rather than shared, because this stub exists to replace the file that rule lives
+      // in. So it can drift, and it did: when the day's figure moved onto disk, `spent` stopped
+      // being null on a fresh start and this copy stopped asking for the balance, which made the
+      // first payment after every restart a denial. The three daemon tests that caught it are worth
+      // keeping in mind if this line is ever edited again.
       const known = purse.state.spent;
-      if (known === null || known.dayStart !== dayStart(Date.now())) await refreshChain();
+      if (known === null || known.dayStart !== dayStart(Date.now()) || purse.state.ledger === null) {
+        await refreshChain();
+      }
       const seen = { finalUrl: url, x402Version: 2 };
       let receipt: Receipt | null = null;
       let entry: Authorization | null = null;
-      const signer = guard(
-        inner,
-        purse,
-        walletConfig,
-        seen,
-        (charged, authorized) => {
-          receipt = charged;
-          entry = authorized;
-          labels.record(charged.txId, charged.host);
-        },
-        () => refreshChain(1),
-      );
+      const signer = guard(inner, purse, walletConfig, seen, (charged, authorized) => {
+        receipt = charged;
+        entry = authorized;
+        labels.record(charged.txId, charged.host);
+      });
       // Stands in for the 402 round trip: the gap that makes two concurrent payments a race if
       // the daemon does not serialize them.
       await sleep(delayMs);

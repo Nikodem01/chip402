@@ -107,7 +107,6 @@ export function guard(
   config: PolicyConfig,
   seen: Sighting,
   onCharge: (receipt: Receipt, entry: Authorization) => void,
-  reread?: () => Promise<void>,
 ): ClientHederaSigner {
   let signed = false;
   return {
@@ -120,14 +119,14 @@ export function guard(
       // twice the money.
       if (signed) throw new Error(DENIED + "a second signature was asked for in one payment");
 
+      const now = Date.now();
       let amount: bigint;
       try {
         amount = parseUnits(requirements.amount);
       } catch {
         throw new Error(DENIED + "unparseable amount");
       }
-      let now = Date.now();
-      let decision = decide(
+      const decision = decide(
         {
           // The URL and version come from what actually answered, recorded by our own fetch —
           // not from anything the SDK re-derived after following a redirect.
@@ -143,31 +142,6 @@ export function guard(
         config,
         now,
       );
-
-      // The balance we decided against may be minutes or hours old, deliberately — see policy.ts,
-      // where the lower-bound argument is. It is wrong in one direction only, and this is the case
-      // where that direction matters: somebody has just topped the account up and the agent is
-      // being told it is empty. So look once, and decide again. One request, only on this denial,
-      // and only ever once — which is what makes "top it up and carry on" true without a poll loop
-      // running all day for the seconds it is needed.
-      if (!decision.ok && decision.recheck === true && reread !== undefined) {
-        await reread().catch(() => undefined);
-        now = Date.now();
-        decision = decide(
-          {
-            finalUrl: seen.finalUrl,
-            x402Version: seen.x402Version,
-            network: requirements.network,
-            assetId: requirements.asset,
-            amount,
-            payTo: requirements.payTo,
-            feePayer: requirements.extra?.["feePayer"],
-          },
-          purse.state,
-          config,
-          now,
-        );
-      }
       if (!decision.ok) throw new Error(DENIED + decision.reason);
 
       // SECURITY: the amount is committed against the day on the way to the key, not on the way
@@ -352,45 +326,45 @@ export function payer(
   config: PolicyConfig,
   purse: Purse,
   labels: Labels,
-  refreshChain: (maxPages?: number, force?: boolean) => Promise<void>,
+  refreshChain: (maxPages?: number) => Promise<void>,
   limits: Limits = LIMITS,
   patienceMs: number = SETTLE_WAIT_MS,
 ): (url: string, init?: RequestInit) => Promise<PaidResult> {
   const network = config.network;
 
   return async function pay(url: string, init?: RequestInit): Promise<PaidResult> {
-    // The chain is asked here only when this process does not yet have a day to measure against:
-    // the first payment after a start, and the first after local midnight. Every payment in between
-    // decides against a figure this process maintains itself, because it signed everything that
-    // could have moved it. That is the whole difference between a purse that can serve
-    // per-request metering and one that cannot — the mirror node used to be asked twice per
-    // payment, and every answer was a page of rows it had already been told about.
+    // The chain is asked here only when this process cannot decide without it: no balance to
+    // measure against, no figure for today, or a figure measured for a day that has since rolled
+    // over. Every payment in between decides against a figure this process maintains itself,
+    // because it signed everything that could have moved it. That is the whole difference between a
+    // purse that can serve per-request metering and one that cannot — the mirror node used to be
+    // asked twice per payment, and every answer was a page of rows it had already been told about.
+    //
+    // SECURITY: the ledger is named here rather than left implied, and it has to be. Asking about
+    // `spent` alone used to cover both, because the two were only ever null together — one reading
+    // seeded them both. The figure now comes off disk and is there before any reading has happened,
+    // so "this process has a day" stopped implying "this process has a balance". The balance is the
+    // half that can only ever come from the chain, and leaving it implied meant the first payment
+    // after a restart was decided without one.
     const spent = purse.state.spent;
-    if (spent === null || spent.dayStart !== dayStart(Date.now())) await refreshChain();
+    if (spent === null || spent.dayStart !== dayStart(Date.now()) || purse.state.ledger === null) {
+      await refreshChain();
+    }
 
     // Everything below is built per payment and thrown away after, so no state about one
     // seller can leak into the next one.
     const seen: Sighting = { finalUrl: url, x402Version: 0 };
     let charged: Receipt | null = null;
     let authorized: Authorization | null = null;
-    const signer = guard(
-      inner,
-      purse,
-      config,
-      seen,
-      (receipt, entry) => {
-        charged = receipt;
-        authorized = entry;
-        // One short append, the moment the transaction id and the host are both known. This runs
-        // after the signature, so it must not be able to fail a payment that has already been
-        // authorised — every write in labels.ts is best-effort for exactly that reason, and the
-        // store's whole contract is that losing it costs names and nothing else.
-        labels.record(receipt.txId, receipt.host);
-      },
-      // One page, and forced: a reading dropped as "recent enough" would be the reading that
-      // still does not know about the top-up somebody made ten seconds ago.
-      () => refreshChain(1, true),
-    );
+    const signer = guard(inner, purse, config, seen, (receipt, entry) => {
+      charged = receipt;
+      authorized = entry;
+      // One short append, the moment the transaction id and the host are both known. This runs
+      // after the signature, so it must not be able to fail a payment that has already been
+      // authorised — every write in labels.ts is best-effort for exactly that reason, and the
+      // store's whole contract is that losing it costs names and nothing else.
+      labels.record(receipt.txId, receipt.host);
+    });
 
     const usdcAsset = network.assets.usdc;
     const hbarAsset = network.assets.hbar;
@@ -535,8 +509,8 @@ export function openWallet(
   // display was already right. A full reading is never dropped: it is the one that seeds a day.
   let reading: Promise<void> | null = null;
   let readAt = 0;
-  const refreshChain = async (maxPages?: number, force = false): Promise<void> => {
-    if (!force && maxPages !== undefined && Date.now() - readAt < DISPLAY_GAP_MS) return;
+  const refreshChain = async (maxPages?: number): Promise<void> => {
+    if (maxPages !== undefined && Date.now() - readAt < DISPLAY_GAP_MS) return;
     if (reading !== null) return reading;
     const run = (async (): Promise<void> => {
       try {

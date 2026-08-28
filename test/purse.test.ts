@@ -10,9 +10,9 @@ import test from "node:test";
 import { AUTHORIZATION_MS, Purse, snapshot } from "../src/purse.ts";
 import { dayEnd } from "../src/policy.ts";
 import { INDEXING_MARGIN_MS, VALID_DURATION_MS } from "../src/chain.ts";
-import { NOW, OUR_EVM_ADDRESS, OUR_PUBLIC_KEY, OUR_ACCOUNT, fakeMirror, labelStore, ledger, scratch, sleep, testnet } from "./support.ts";
+import { NOW, OUR_EVM_ADDRESS, OUR_PUBLIC_KEY, OUR_ACCOUNT, config, fakeMirror, invoice, labelStore, ledger, scratch, sleep, testnet } from "./support.ts";
 import { refresh } from "../src/wallet.ts";
-import { dayStart } from "../src/policy.ts";
+import { dayStart, decide } from "../src/policy.ts";
 
 function open(dir: string): Purse {
   return Purse.open(join(dir, "purse.json"), OUR_ACCOUNT);
@@ -73,45 +73,58 @@ test("there is no local spending state anywhere in src/", () => {
     const source = readFileSync(new URL(`../src/${name}`, import.meta.url), "utf8");
     assert.doesNotMatch(source, /spentToday|\bannotate\b/, `${name} keeps a spending ledger`);
   }
-  // The day's figure is kept in memory now, deliberately — but nothing about it may reach disk.
-  // `persist` writes purse.json and `#write` writes the in-flight list; those two are the only
-  // writers in the file, and what they write is checked field by field below.
+  // The day's figure is written down, deliberately — but only ever to the in-flight file, beside
+  // the entries it is the other half of, and never to purse.json, which is policy. `persist` writes
+  // purse.json and `#write` writes the other; those two are the only writers in the file, and what
+  // each of them writes is checked field by field below.
   const purse = readFileSync(new URL("../src/purse.ts", import.meta.url), "utf8");
   assert.equal((purse.match(/writeAtomic\(/g) ?? []).length, 2, "purse.ts grew a third thing it writes");
   // Exactly one read of the legacy shape, and it is the label migration.
   assert.equal((purse.match(/"receipts"/g) ?? []).length, 1, "purse.ts touches the old receipts list more than once");
 });
 
-test("nothing restored from disk is a figure, and what is restored expires", () => {
+test("what a restart restores is the day's figure and what is still in the air, and nothing else", () => {
   const dir = scratch();
   const purse = open(dir);
   purse.setLimit("usdc", "allowance", 2_000_000n);
-  purse.observe(ledger({ spent: { usdc: 999_000n, hbar: 0n } }), true);
+  purse.observe(ledger({ spent: { usdc: 999_000n, hbar: 0n } }, Date.now()), true);
   const entry = purse.authorize("usdc", 10_000n, Date.now());
   purse.identify(entry, "0.0.9185802@1800000000.0", Date.now());
 
   const reloaded = open(dir);
   assert.equal(reloaded.state.usdc.allowance, 2_000_000n, "the limit is policy and survives");
-  assert.equal(reloaded.state.ledger, null, "a restarted daemon must ask the chain again");
-  assert.equal(reloaded.state.spent, null, "a restarted daemon must ask the chain what it spent");
   assert.equal(reloaded.state.mismatch, false);
 
-  // The in-flight list does survive — that is the whole point of it — so it is worth saying exactly
-  // what it is allowed to carry, and for how long. What we authorised, in which asset, its id, and
-  // the instant it stops being able to happen. Not what it moved, not whether it did, not a
-  // balance, not a running total, and nothing at all that outlives its own deadline.
+  // The balance is the half of a decision that can only come from the chain, so it is the half a
+  // restart still has to go and ask for. `policy.decide` refuses to pay without one, which is what
+  // keeps this file from becoming a substitute for the ledger rather than a record corrected by it.
+  assert.equal(reloaded.state.ledger, null, "a restarted daemon must ask the chain for the balance again");
+
+  // And the figure is the half a restart may remember. Remembering it is what took the boot walk off
+  // the critical path: it comes back tagged with the account and the local day, and `policy.decide`
+  // checks both again before it will spend against it.
+  assert.equal(reloaded.state.spent?.totals.usdc, 999_000n, "a restart handed the day's spending back");
+  assert.equal(reloaded.state.spent?.accountId, OUR_ACCOUNT);
+  assert.equal(reloaded.state.spent?.dayStart, dayStart(Date.now()));
+
+  // What was in the air stays in the air, carrying what we authorised, in which asset, its id, and
+  // the instant it stops being able to happen — and nothing that outlives its own deadline.
   assert.equal(reloaded.state.inFlight.length, 1, "a restart handed back the allowance");
   assert.equal(reloaded.state.inFlight[0]!.amount, 10_000n);
 
-  // Read off the *file*, not off the object. That distinction is the whole assertion: `readInFlight`
-  // builds a fresh entry whatever it finds, so checking the object's keys proves only that
-  // readInFlight is readInFlight. A field added to what `#write` writes would otherwise reach disk
-  // and survive a restart with the one test that exists to forbid it passing.
+  // Read off the *file*, not off the object. That distinction is the whole assertion: the readers
+  // build fresh values whatever they find, so checking the object's keys proves only that the
+  // readers are the readers. A field added to what `#write` writes would otherwise reach disk and
+  // survive a restart with the one test that exists to bound it passing.
   const written = JSON.parse(readFileSync(join(dir, INFLIGHT), "utf8")) as Record<string, unknown>;
-  assert.deepEqual(Object.keys(written).sort(), ["accountId", "entries"], "the in-flight file grew a field");
+  assert.deepEqual(Object.keys(written).sort(), ["accountId", "entries", "spent"], "the in-flight file grew a field");
+  assert.deepEqual(Object.keys(written["spent"] as object).sort(), ["dayStart", "totals"], "the figure grew a field");
   const rows = written["entries"] as Record<string, unknown>[];
   assert.deepEqual(Object.keys(rows[0]!).sort(), ["amount", "asset", "deadline", "txId"], "an entry grew a field");
-  assert.doesNotMatch(readFileSync(join(dir, INFLIGHT), "utf8"), /balance|total|since|spent/);
+  // The negative half, and it is the one that matters now that a figure is allowed on disk: nothing
+  // the chain is the only source of may be written down. Not a balance, not a counterparty, not the
+  // key check. Those are re-read on every start, never remembered.
+  assert.doesNotMatch(readFileSync(join(dir, INFLIGHT), "utf8"), /balance|payTo|verified|mismatch/);
 });
 
 test("SECURITY: an in-flight list written for another account is not this purse's to honour", () => {
@@ -183,14 +196,22 @@ test("the lock the previous build kept is honoured once and then gone", () => {
   assert.equal(existsSync(join(dir, "settling.json")), false, "the old lock file is still there to be read again");
 });
 
-test("answering for a payment takes it out of the file, and the file with it", () => {
+test("answering for a payment moves it out of the list and into the figure, and never leaves it in neither", () => {
+  // The two halves of one fact, which is why they share a file and a single write. While the payment
+  // is in the air the entry commits the allowance; once the chain has shown it, the figure carries
+  // it instead. Persisting those separately would leave an instant where a crash loses it from both
+  // — an undercount, and an undercount is how one allowance pays for two payments.
   const dir = scratch();
   const purse = open(dir);
   const entry = purse.authorize("usdc", 10_000n, Date.now());
   assert.ok(existsSync(join(dir, INFLIGHT)));
+  assert.equal(purse.state.spent?.totals.usdc, 0n, "the amount entered the figure before the chain answered");
+
   purse.settled(entry);
-  assert.equal(existsSync(join(dir, INFLIGHT)), false, "an answered payment still commits the next daemon's allowance");
-  assert.equal(open(dir).state.inFlight.length, 0);
+
+  const next = open(dir);
+  assert.equal(next.state.inFlight.length, 0, "an answered payment still commits the next daemon's allowance");
+  assert.equal(next.state.spent?.totals.usdc, 10_000n, "an answered payment was forgotten by the next daemon");
 });
 
 test("nothing may be authorised that cannot be written down", () => {
@@ -326,10 +347,55 @@ test("a reading may seed a day or raise it, and may never talk it down", () => {
   purse.observe(ledger({ at: NOW + 2, spent: { usdc: 1_400_000n, hbar: 0n } }), false);
   assert.equal(purse.state.spent?.totals.usdc, 1_400_000n, "a later reading could not raise the day");
 
-  // A partial walk of a day this purse has no figure for is not enough to seed one.
+  // A partial walk may not *replace* a figure. It is not a day's spending, and the reading above
+  // names a different day from the one this purse is measuring.
   const fresh = open(scratch());
+  assert.equal(fresh.state.spent?.totals.usdc, 0n, "a purse with no file on disk has spent nothing today");
   fresh.observe(ledger({ complete: false, spent: { usdc: 900_000n, hbar: 0n } }), false);
-  assert.equal(fresh.state.spent, null, "a day was seeded from a walk that never reached its end");
+  assert.equal(fresh.state.spent?.dayStart, dayStart(Date.now()), "a partial walk replaced the day being measured");
+  assert.equal(fresh.state.spent?.totals.usdc, 0n, "a day was seeded from a walk that never reached its end");
+
+  // And where there is genuinely no figure to raise — a file this purse may not trust, which is the
+  // case the boot walk still exists for — a partial walk may not seed one either.
+  const dir = scratch();
+  open(dir).authorize("usdc", 10_000n, Date.now());
+  const foreign = Purse.open(join(dir, "purse.json"), "0.0.999999");
+  assert.equal(foreign.state.spent, null, "a figure written for another account was adopted");
+  foreign.observe(ledger({ complete: false, spent: { usdc: 900_000n, hbar: 0n } }), false);
+  assert.equal(foreign.state.spent, null, "a day was seeded from a walk that never reached its end");
+});
+
+test("a restored figure is enough to decide against, without a walk that reached the end of the day", () => {
+  // Why the figure is written down at all, as one assertion.
+  //
+  // Its only source used to be a walk of the whole local day, and that walk had to finish before
+  // anything could be paid. So the amount of work standing between a restart and a working purse was
+  // set by how busy the agent had been — and the busier it was, the likelier the walk was to be too
+  // big to finish. A purse for per-request metering could be stopped by being used for per-request
+  // metering.
+  //
+  // Now the figure comes off disk, the reading supplies the balance, and a reading that stopped
+  // short costs nothing but the rows it did not fetch.
+  const dir = scratch();
+  const first = open(dir);
+  first.setPaused(false);
+  first.setLimit("usdc", "allowance", 2_000_000n);
+  first.setLimit("usdc", "maxPayment", 250_000n);
+  first.settled(first.authorize("usdc", 1_000_000n, Date.now()));
+
+  const restarted = open(dir);
+  assert.equal(restarted.state.spent?.totals.usdc, 1_000_000n, "the restart forgot what it had spent");
+  // The only reading it ever gets is one that never reached the end of the day.
+  restarted.observe(ledger({ complete: false, spent: { usdc: 0n, hbar: 0n } }, Date.now()), false);
+  assert.equal(restarted.state.spent?.totals.usdc, 1_000_000n, "a partial reading talked the restored figure down");
+
+  const allowed = decide(invoice({ amount: 250_000n }), restarted.state, config, Date.now());
+  assert.equal(allowed.ok, true, `a restored purse could not pay: ${allowed.ok ? "" : allowed.reason}`);
+
+  // And it is still the *day's* figure being enforced, not a fresh one: what is left is the
+  // allowance less what the previous daemon spent, so the restart bought nothing.
+  const overDay = decide(invoice({ amount: 1_100_000n }), restarted.state, config, Date.now());
+  assert.equal(overDay.ok, false, "a restart handed back the day's allowance");
 });
 
 test("the snapshot the panel sees is the chain's answer, with no key material in it", () => {

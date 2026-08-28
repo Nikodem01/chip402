@@ -33,9 +33,41 @@ export type DaemonOptions = {
 export type Daemon = { spendPath: string; adminPath: string; close: () => Promise<void> };
 
 // The first reading at boot routinely lands before DNS is up, so it is retried this often until it
-// works. There is no interval after that: see the reading loop at the bottom of `start` for why an
-// idle chip402 asks the mirror node nothing at all.
+// works. This is the retry and not a cadence — see the reading schedule at the bottom of `start`
+// for everything that does and does not make an idle chip402 talk to the mirror node.
 const CHAIN_RETRY_MS = 5_000;
+
+// And where that retry stops getting faster. Doubling from five seconds, this is reached in about
+// six attempts. It exists so that a first reading which cannot succeed — a mirror node that is down
+// for the afternoon, a walk too slow to finish inside its budget — costs a request every few
+// minutes rather than one every five seconds for as long as the daemon runs.
+const CHAIN_RETRY_CAP_MS = 5 * 60_000;
+
+// Money arriving is the one thing this process cannot notice by itself: it signs every payment, so
+// it knows every way the balance goes down, and nothing tells it when the balance goes up. Every
+// other reading above is triggered by somebody looking. This is the floor under the case where
+// nobody is — the account topped up from a phone, the panel shut, an agent still working — and
+// fifteen minutes is the worst case that buys.
+//
+// It is not the sixty-second loop this replaced. That one asked for the whole ledger: the account
+// endpoint with its bundled page of transactions, 23,072 bytes measured, plus a full walk of the
+// day. This asks for the same single-page reading the display already takes — 740 bytes for the
+// account and one row per payment made today — so on an ordinary day it is a few kilobytes a
+// quarter of an hour against 98 MB. What made the old loop expensive was the payload and not the
+// interval, which is worth saying because the interval is what got blamed.
+const HEARTBEAT_MS = 15 * 60_000;
+
+// And how often that is *checked*, which is not the same thing. The heartbeat is not a read on a
+// fixed cadence: it looks at how old the last reading is and only asks the chain when nothing else
+// has for a quarter of an hour. So a reading taken for any other reason — a panel opening, a payment
+// settling, somebody asking — pushes the next one out instead of being followed by another a minute
+// later. The tick itself costs a comparison and no I/O.
+//
+// It also makes the next reading a moment the panel can work out for itself, which is what
+// `nextReadAt` in the status frame is: fifteen minutes after the last reading, whatever caused it.
+// A fixed interval could not be stated that way — its phase belongs to whenever the daemon happened
+// to start — so the panel would have had to guess, and a countdown that guesses is worse than none.
+const HEARTBEAT_TICK_MS = 30_000;
 
 // A panel, a shell, an agent or two. Anything past this is a client that has stopped closing its
 // sockets or a process opening them on purpose, and either way the answer is to stop accepting
@@ -111,10 +143,18 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     evmAddress: wallet ? wallet.evmAddress : config.evmAddress,
     verified: wallet ? wallet.verified : null,
   });
-  const statusFrame = (): string => serialize(snapshot(purse, labels, config.network, identity(), Date.now()));
+  // The frame, in one place, because two callers build it and one extra field on only one of them
+  // is how a panel comes to see a different purse depending on whether it asked.
+  const frame = (): Record<string, unknown> => ({
+    ...snapshot(purse, labels, config.network, identity(), Date.now()),
+    nextReadAt: nextReadAt(),
+  });
+  const statusFrame = (): string => serialize(frame());
 
-  // Every change pushes a fresh frame to everyone connected, which is why the panel has no
-  // refresh interval and no polling loop.
+  // Every change pushes a fresh frame to everyone connected, which is why the panel does not poll
+  // to stay current: what is on its screen is what was pushed to it. The only thing it asks for is
+  // a *reading* — on opening, and while somebody is watching the top-up panel — and even that is a
+  // request for the daemon to go and look, not a request for state it is missing.
   purse.watch(() => {
     const frame = statusFrame();
     for (const socket of clients) socket.write(frame);
@@ -142,7 +182,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
         // signal that a reading is worth taking; the answer goes out with what we have and the
         // reading, if one is taken, arrives as a push a moment later.
         look();
-        return serialize({ id, ...snapshot(purse, labels, config.network, identity(), Date.now()) });
+        return serialize({ id, ...frame() });
 
       case "pause":
         purse.setPaused(true);
@@ -294,28 +334,39 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
   //     at          is current. Dropped by the wallet if the last reading was seconds ago.
   //   after paying  one page, so the payment shows up as a row the chain returned. Not awaited,
   //                 and not needed for any decision.
-  //
-  // Idle, that is nothing at all.
+  //   every quarter the floor under all of it — see HEARTBEAT_MS.
+  //     of an hour
   let chainTimer: ReturnType<typeof setTimeout> | undefined;
   let dayTimer: ReturnType<typeof setTimeout> | undefined;
+  let beatTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // The first reading has to be one a day's figure can be seeded from, and two different things
+  // stop it being that. `refresh` throwing is the network or the mirror node. A reading that comes
+  // back and still leaves no figure is a walk that ran out of its time budget before it reached the
+  // end of the day: `Purse.observe` will not seed from a partial walk, so `policy.decide` goes on
+  // denying — with "the chain has not answered yet", which in that state is not even true. The
+  // chain answered. We ran out of time reading it.
+  //
+  // Both are transient and both are retried, and saying so out loud is half the fix: without it the
+  // daemon sat refusing every payment until local midnight with nothing in the journal to explain
+  // itself, and the one message the agent did get pointed at the wrong thing.
+  //
+  // The backoff is for the case that turns out not to be transient after all. A failing walk can
+  // cost thirty seconds and several megabytes, and retrying that every five seconds for ever would
+  // be worse than the silence it replaced.
+  let retryMs = CHAIN_RETRY_MS;
   async function seed(): Promise<void> {
     const again = (why: string): void => {
-      console.error(`chip402: ${why}, retrying — nothing can be paid until the chain answers`);
-      chainTimer = setTimeout(() => void seed(), CHAIN_RETRY_MS);
+      console.error(`chip402: ${why} — nothing can be paid until it does. Retrying in ${retryMs / 1000}s.`);
+      chainTimer = setTimeout(() => void seed(), retryMs);
       chainTimer.unref();
+      retryMs = Math.min(retryMs * 2, CHAIN_RETRY_CAP_MS);
     };
     try {
       await open().refresh();
     } catch (error) {
-      return again(`chain read failed (${error instanceof Error ? error.message : String(error)})`);
+      return again(`the chain read failed (${error instanceof Error ? error.message : String(error)})`);
     }
-    // A reading that did not reach the end of the day is not a day, so `Purse.observe` refuses to
-    // seed a figure from it and `policy.decide` keeps denying — correctly, and silently, which is
-    // the part worth fixing. It does not throw, so without this the daemon would sit refusing every
-    // payment until local midnight with nothing in the journal to say why. Reaching the page bound
-    // means twenty thousand outgoing transactions today, which needs a signature only this daemon
-    // can produce: `type=debit` is what keeps it off the list of things somebody else can arrange.
     if (purse.state.spent === null) return again("the chain read did not reach the end of today");
     // Whatever the last daemon signed and did not stay alive to hear the answer for. Asked once
     // each here and then chased in the background until the chain answers or the deadline passes.
@@ -332,6 +383,25 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     dayTimer.unref();
   }
 
+  // When the daemon will next look of its own accord, and 0 while it has never managed to look at
+  // all. The panel shows it, so it has to be a deadline the daemon actually keeps — see
+  // HEARTBEAT_TICK_MS for why it is measured from the last reading rather than from start-up.
+  function nextReadAt(): number {
+    const last = purse.state.ledger?.at;
+    return last === undefined ? 0 : last + HEARTBEAT_MS;
+  }
+
+  // Nothing until the chain has answered once: until then `seed` owns the asking, with a backoff
+  // this would undercut by trying every half minute alongside it.
+  function heartbeat(): void {
+    const last = purse.state.ledger?.at;
+    if (last !== undefined && Date.now() - last >= HEARTBEAT_MS) look();
+    // Unref'd like the others: a purse with nothing to do is not a reason for the process to stay
+    // alive, and this timer must never be what holds it open.
+    beatTimer = setTimeout(heartbeat, HEARTBEAT_TICK_MS);
+    beatTimer.unref();
+  }
+
   // For the display only, and safe to call as often as anything likes: the wallet drops it if the
   // last reading is recent, and no decision waits on it.
   function look(): void {
@@ -344,6 +414,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
   if (config.accountId) {
     void seed();
     atMidnight();
+    heartbeat();
   }
 
   return {
@@ -352,6 +423,7 @@ export async function start(options: DaemonOptions): Promise<Daemon> {
     close: async () => {
       if (chainTimer) clearTimeout(chainTimer);
       if (dayTimer) clearTimeout(dayTimer);
+      if (beatTimer) clearTimeout(beatTimer);
       for (const socket of clients) socket.destroy();
       await Promise.all([
         new Promise<void>((resolve) => spend.close(() => resolve())),

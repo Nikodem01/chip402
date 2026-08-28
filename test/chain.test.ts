@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { controlsAccount, paymentsIn, readKeyMatch, readLedger, toMirrorId, validStartOf } from "../src/chain.ts";
+import { controlsAccount, paymentsIn, readAccount, readKeyMatch, readLedger, toMirrorId, validStartOf } from "../src/chain.ts";
 import type { AssetKey } from "../src/networks.ts";
 import { dayStart } from "../src/policy.ts";
 import { OUR_ACCOUNT, OUR_EVM_ADDRESS, OUR_PUBLIC_KEY, SELLER, fakeMirror, testnet } from "./support.ts";
@@ -288,31 +288,67 @@ test("a day costs two requests, and one of them is not a page of rows", async (t
   assert.ok(account.includes("transactions=false"), "the account read still drags a page of rows behind it");
 });
 
-test("a reading that stopped at the page bound says so instead of pretending", async (t) => {
-  // The walk is bounded, and the bound is generous because it runs once per daemon start rather
-  // than twice per payment. What matters is that a walk which stopped short cannot be mistaken for
-  // a day: `complete` is false, and `Purse.observe` refuses to seed a figure from it.
+test("a reading that stopped short says so instead of pretending", async (t) => {
+  // A walk that stopped short cannot be mistaken for a day: `complete` is false, and
+  // `Purse.observe` refuses to seed a figure from it. Both ways of stopping short are checked —
+  // the page argument the display read uses, and the time budget, which is the one the daemon can
+  // now reach and retry.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const since = dayStart(Date.now());
   for (let i = 0; i < 150; i++) mirror.record(`0.0.9185802@18000001${String(i).padStart(2, "0")}.0`, "usdc", 1n, since + i);
 
-  const stopped = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since, 1);
-  assert.equal(stopped.complete, false, "a walk that stopped at the bound called itself a day");
-  assert.equal(stopped.payments.length, 100);
+  const onePage = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since, 1);
+  assert.equal(onePage.complete, false, "a walk that stopped after one page called itself a day");
+  assert.equal(onePage.spent.usdc, 100n, "the page it did read is still summed");
+
+  // A budget of zero expires the moment the first full page lands, which is the same path a walk
+  // too slow to finish inside its budget takes — without the test waiting thirty seconds.
+  const outOfTime = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since, undefined, 0);
+  assert.equal(outOfTime.complete, false, "a walk that ran out of time called itself a day");
 
   const whole = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
   assert.equal(whole.complete, true);
-  assert.equal(whole.payments.length, 150);
   assert.equal(whole.spent.usdc, 150n);
+});
+
+test("the day's sum survives the rows being dropped, and the rows kept are the newest", async (t) => {
+  // What lets the page bound be a backstop rather than a limit. Rows are folded into the sum as
+  // each page arrives and then thrown away except for the newest few, so a reading costs the same
+  // whether the day held three payments or thirty thousand. Collecting all of them is what used to
+  // make the walk expensive in proportion to how busy the agent had been — and so what made a tight
+  // page bound necessary, and so what let an ordinary day of metering stop the purse.
+  //
+  // The two things that read the list both want the newest end of it: the panel draws its rows from
+  // the front, and `policy.committed` only asks about payments young enough to still be in flight.
+  const mirror = await fakeMirror();
+  t.after(() => mirror.close());
+  const since = dayStart(Date.now());
+  for (let i = 0; i < 150; i++) mirror.record(`0.0.9185802@18000001${String(i).padStart(2, "0")}.0`, "usdc", 1n, since + i);
+
+  const whole = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
+  assert.equal(whole.spent.usdc, 150n, "the sum lost payments that the row cap dropped");
+  assert.ok(whole.payments.length < 150, "the reading is still carrying every row of the day");
+  assert.ok(whole.payments.length >= 20, "fewer rows kept than the panel draws");
+
+  // Newest first, and the newest row of the day is the last one recorded.
+  assert.equal(whole.payments[0]?.at, since + 149, "the rows kept are not the newest ones");
+  for (let i = 1; i < whole.payments.length; i++) {
+    assert.ok(whole.payments[i - 1]!.at > whole.payments[i]!.at, "the rows came back out of order");
+  }
 });
 
 test("nobody but this daemon can add a row to the question that is asked", async (t) => {
   // Why the bound stopped being something an outsider could reach. Every row `type=debit` keeps is
   // a transaction that took money out of this account, and every one of those needs a signature only
   // this daemon can produce. Money arriving — the thing anyone can send, for nothing on testnet and
-  // about $0.12 a day on mainnet — is not in the answer at all. So the walk is bounded by our own
-  // spending, and the only way to reach the bound is to have made twenty thousand payments today.
+  // about $0.12 a day on mainnet — is not in the answer at all. So the length of the walk is
+  // bounded by our own spending and by nothing anybody else can arrange.
+  //
+  // That is what made it safe to stop treating the page count as a limit. It is a backstop now, set
+  // where no correct run reaches it, and the walk is stopped by a time budget instead — see
+  // MAX_PAGES and WALK_BUDGET_MS. Neither is reachable by an outsider, and this test is the reason
+  // the first of them can be so generous.
   const mirror = await fakeMirror();
   t.after(() => mirror.close());
   const since = dayStart(Date.now());
@@ -370,4 +406,27 @@ test("the import check and the daemon's key check differ on purpose, and only in
     if (daemon !== null) assert.equal(importer, daemon, `they disagree where the daemon is sure: ${name}`);
     else assert.equal(importer, false, `the import is the looser of the two: ${name}`);
   }
+});
+
+test("multi-endpoint failover: falls back to secondary mirror when primary returns 503 or 429", async (t) => {
+  const healthyMirror = await fakeMirror();
+  t.after(() => healthyMirror.close());
+
+  const brokenPrimary = "http://127.0.0.1:1"; // unreachable port
+  const networkWithFailover = {
+    ...testnet,
+    mirror: brokenPrimary,
+    mirrors: [brokenPrimary, healthyMirror.network.mirror],
+  };
+
+  const account = await readAccount(networkWithFailover, OUR_ACCOUNT);
+  assert.equal(account.account, OUR_ACCOUNT);
+
+  // And when all candidate mirrors fail, it throws an error
+  const allBroken = {
+    ...testnet,
+    mirror: brokenPrimary,
+    mirrors: [brokenPrimary, "http://127.0.0.1:2"],
+  };
+  await assert.rejects(() => readAccount(allBroken, OUR_ACCOUNT));
 });

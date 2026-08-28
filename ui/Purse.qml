@@ -3,8 +3,8 @@ import Quickshell
 import Quickshell.Io
 
 // The panel's only connection to the daemon: one unix socket, newline-delimited JSON. The
-// daemon pushes a status frame on connect and after every change, so there is no polling here
-// and no refresh interval to configure.
+// daemon pushes a status frame on connect and after every change, so nothing here polls for
+// state and there is no refresh interval to configure — what arrives is what is drawn.
 Item {
   id: root
 
@@ -50,6 +50,9 @@ Item {
   // daemon will not pay until it does.
   readonly property real confirmedAt: status ? Number(status.chainAt) : 0
   readonly property bool chainAnswered: confirmedAt > 0
+  // When the daemon will look again without being asked. Zero while it never has — the same
+  // condition as `chainAnswered`, because until the chain answers once there is nothing to be due.
+  readonly property real nextReadAt: status ? Number(status.nextReadAt) : 0
   // Before setup has run there is no account, only an address to fund — the panel shows that
   // instead of a purse.
   readonly property bool awaitingFunding: live && accountId === ""
@@ -140,18 +143,49 @@ Item {
     Quickshell.execDetached(["xdg-open", String(status.hashscan) + "account/" + accountId])
   }
 
+  // Deliberately precise in the first minute. The daemon takes a reading whenever the panel is
+  // opened, so by the time anybody reads this line the answer is nearly always a few seconds old —
+  // and a line that said "just now" every single time would be telling the truth in a way that
+  // carries no information and looks stuck. Seconds that tick are the difference between a figure
+  // that is fresh and a panel that is alive.
   function agoText(at) {
     if (!at) return ""
     var seconds = Math.max(0, Math.round((Date.now() - at) / 1000))
-    if (seconds < 90) return qsTr("just now")
+    if (seconds < 3) return qsTr("just now")
+    if (seconds < 90) return qsTr("%1s ago").arg(seconds)
     var minutes = Math.round(seconds / 60)
     return minutes < 60 ? qsTr("%1 min ago").arg(minutes) : qsTr("%1 h ago").arg(Math.round(minutes / 60))
+  }
+
+  // How long until the daemon looks again on its own. A real deadline rather than a guess: it reads
+  // when nothing else has for a quarter of an hour, so the moment is fifteen minutes after the last
+  // reading whatever caused it, and the daemon sends that moment rather than the panel inventing it
+  // from an interval whose phase it cannot know.
+  function untilText(at) {
+    if (!at) return ""
+    var seconds = Math.round((at - Date.now()) / 1000)
+    if (seconds <= 0) return qsTr("checking soon")
+    if (seconds < 60) return qsTr("next in %1s").arg(seconds)
+    var minutes = Math.ceil(seconds / 60)
+    return minutes < 60 ? qsTr("next in %1 min").arg(minutes) : qsTr("next in %1 h").arg(Math.round(minutes / 60))
   }
 
   // The kill switch. One line on the cheap socket, no password, no confirmation — an agent that
   // pauses the purse has only denied itself, so there is nothing to protect here.
   function pause() {
     if (root.linked) link.item.write(JSON.stringify({ cmd: "pause" }) + "\n")
+  }
+
+  // Ask for a reading. `purse` answers with what the daemon already has and takes a fresh reading
+  // alongside, which arrives a moment later as an ordinary push — so this changes nothing on its
+  // own and is safe to call whenever somebody might be looking. The daemon drops a reading taken
+  // seconds after the last one, so calling it often costs nothing either.
+  //
+  // Nothing in this file calls it on a clock. What is on screen is what the daemon pushed, and the
+  // two places that ask — the popup opening, and the seconds somebody spends watching the top-up
+  // panel for money to land — are in Chip.qml, where the reason for asking is visible.
+  function refresh() {
+    if (root.linked) link.item.write(JSON.stringify({ cmd: "purse" }) + "\n")
   }
 
   // Everything privileged goes the other way, through polkit. argv only, never a shell string:

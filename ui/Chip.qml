@@ -25,6 +25,26 @@ Panel {
   property bool limitsOpen: false
   property bool topUpOpen: false
 
+  // A reading was asked for by hand and the answer has not landed. Presentation only, and it lives
+  // here rather than in Purse.qml because Purse.qml is the socket and nothing else. Without it a
+  // press that the daemon drops — it drops a display reading taken seconds after the last one —
+  // looks exactly like a press that did nothing, which is the failure that makes a refresh control
+  // feel broken.
+  property bool checking: false
+  // `agoText` and `untilText` read the clock when they are evaluated, so nothing would make them
+  // recompute between readings and the panel would freeze on whatever they said when it opened.
+  // This is what re-evaluates them, once a second, and only while the popup is open — there is
+  // nothing to redraw behind a closed one.
+  property int ageTick: 0
+  readonly property string chainAge: {
+    root.ageTick;
+    return purse.agoText(purse.confirmedAt)
+  }
+  readonly property string nextCheck: {
+    root.ageTick;
+    return purse.untilText(purse.nextReadAt)
+  }
+
   readonly property var asset: purse.assetOf(root.view)
   readonly property var other: purse.assetOf(root.view === "usdc" ? "hbar" : "usdc")
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -313,6 +333,73 @@ Panel {
             font.bold: true
           }
 
+          // How old every figure below this is, and the way to ask for a fresher one — deliberately
+          // the same control. What a refresh button is actually for is the reassurance that the
+          // number is current, and a timestamp answers that outright where a button only answers it
+          // by implication. It also makes the press legible: pressing a control that shows an age
+          // has an obvious outcome, where pressing one labelled "refresh" and seeing nothing move
+          // is indistinguishable from a panel that is broken.
+          //
+          // The line is not optional decoration. The daemon reads the chain when something happens
+          // rather than on a clock, so a bare "12.40 USDC" could be a minute old or the whole
+          // afternoon, and a figure with no age on it is a claim this panel cannot support.
+          Item {
+            width: parent.width
+            implicitHeight: freshness.implicitHeight
+
+            Row {
+              id: freshness
+              spacing: root.tight
+
+              // The affordance. A pointer cursor is not one: it appears only once you are already
+              // over the text, so it can only confirm a guess nobody had a reason to make. The
+              // glyph is what says the line can be pressed before anybody presses it.
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "↻"
+                color: refreshTap.containsMouse ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: root.checking ? qsTr("checking…") : root.chainAge
+                color: refreshTap.containsMouse ? root.foreground : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              // Kept dim and separate from the part that reacts to the pointer, because it is not
+              // what the press does — pressing asks now, this says when nobody has to.
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: !root.checking && root.nextCheck !== ""
+                textFormat: Text.PlainText
+                text: "· " + root.nextCheck
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            MouseArea {
+              id: refreshTap
+              anchors.fill: parent
+              // Caption text is a small target for a pointer, so the hit area is grown past the
+              // glyphs rather than the type being grown to meet the pointer.
+              anchors.margins: -root.tight
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: {
+                purse.refresh()
+                root.checking = true
+              }
+            }
+          }
+
           Item {
             width: parent.width
             implicitHeight: Style.space(8)
@@ -540,6 +627,48 @@ Panel {
         }
       }
     }
+  }
+
+  // Opening the popup is somebody asking, so it asks. Until this, the panel's only reading was the
+  // one the daemon takes when the socket connects — which happens at login and then not again, so
+  // an account topped up from a phone at nine could still be showing this morning's balance at two
+  // with nothing on screen admitting it.
+  onOpenedChanged: if (root.opened) purse.refresh()
+
+  Timer {
+    interval: 1000
+    running: root.opened && purse.live
+    repeat: true
+    onTriggered: root.ageTick++
+  }
+
+  // While the top-up section is open somebody is standing at the screen waiting for money to
+  // arrive, and money arriving is the one thing the daemon cannot notice by itself. Five seconds
+  // is not a number chosen here: it is the floor the daemon already enforces on display readings,
+  // so anything faster would be dropped and anything slower would be this file inventing a policy.
+  //
+  // Bounded by attention rather than by a deadline. The popup closes when it loses focus and this
+  // stops with it, so there is no window to expire and no timer to get wrong. Excluded before
+  // setup, where the same address is on screen but there is no account to read yet.
+  Timer {
+    interval: 5000
+    running: root.opened && root.topUpOpen && purse.live && !purse.awaitingFunding
+    repeat: true
+    onTriggered: purse.refresh()
+  }
+
+  // A press is answered by a push, so the wait ends when the reading it asked for lands. The
+  // fallback is for the press the daemon drops: no push follows, and without it the label would
+  // sit on "checking…" for ever.
+  Connections {
+    target: purse
+    function onConfirmedAtChanged() { root.checking = false }
+  }
+
+  Timer {
+    interval: 4000
+    running: root.checking
+    onTriggered: root.checking = false
   }
 
   // Presets *and* a free-text amount. The ladder is there because pocket money is chosen

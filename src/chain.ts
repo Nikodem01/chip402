@@ -22,14 +22,52 @@ import { hardenedFetch } from "./fetch.ts";
 import { MIRROR_TX_ID, SDK_TX_ID } from "./ids.ts";
 
 // A hundred rows is the mirror node's own page cap — asked for two hundred, it returns a hundred —
-// so it is measured here rather than assumed. The bound on *pages* is generous because this walk
-// is no longer on the payment path: it runs once when the daemon starts, to learn what a previous
-// one already spent today, and after that the purse counts its own payments and asks the chain
-// about them one transaction id at a time. Twenty thousand outgoing transactions in a single local
-// day is far past anything this is for, and reaching it costs a daemon that will not finish
-// starting rather than a number that is wrong.
+// so it is measured here rather than assumed.
 const PAGE_SIZE = 100;
-const MAX_PAGES = 200;
+
+// How many payment rows a reading carries back. Every row is folded into the day's sum as its page
+// arrives and then dropped; only the newest of them are kept — see `walk`. Two things read the
+// list and both want the newest few: `snapshot` draws PANEL_ROWS of them, and `policy.committed`
+// only ever asks about a payment young enough to still be in flight, which is a little over two
+// minutes. Sixty-four clears both, and it makes the memory a reading costs the same on a quiet day
+// and a frantic one.
+//
+// Collecting every row instead is what made a tight page bound necessary in the first place: the
+// cost of a reading grew with how busy the day had been, so the walk had to be stopped somewhere,
+// so there had to be a somewhere to stop it — and that somewhere turned out to sit inside the range
+// of ordinary use.
+const KEPT_PAYMENTS = 64;
+
+// What actually needs bounding at start-up is the *wait*. Nothing can be paid until the first
+// reading lands, so a walk that does not finish is a purse that does not open, and a page count is
+// a poor stand-in for the seconds that matters: two hundred pages is twenty seconds or two minutes
+// depending on how the mirror node feels this morning.
+//
+// Bounding the seconds instead changes what a short walk *means*, which is the point. A walk that
+// stops here stopped because it ran out of time, and running out of time is transient — the retry
+// in daemon.ts fixes it. A walk that stopped because it hit a page bound was not transient at all:
+// the rows were really there, retrying re-read them, and nothing but local midnight could change
+// the answer. Same symptom, opposite remedy, and only one of them can be retried honestly.
+//
+// A minute rather than something snappier, because this budget is the *only* ceiling left on how
+// busy a day the purse can come back from, and being stingy with it would put back the ceiling the
+// page bound was just taken off. A thirty-thousand-payment day walks in well under this against a
+// healthy mirror node; a mirror node slow enough to miss it is having a bad enough minute that the
+// retry is the right answer anyway. Nothing waits on it but start-up, and start-up already says
+// what it is waiting for.
+const WALK_BUDGET_MS = 60_000;
+
+// And this is a backstop rather than a limit, which is the distinction the old value of two hundred
+// got wrong. Two hundred pages is twenty thousand payments, and twenty thousand payments in a local
+// day is 0.23 a second — a perfectly ordinary day for the per-request metering this purse exists to
+// pay for. So the bound sat inside legitimate use, where an agent doing exactly what it is for
+// could walk the daemon into refusing to pay, and the code called that outcome impossible and so
+// never handled it.
+//
+// A backstop belongs where no correct run reaches it. This is ten million payments in one local
+// day: getting here means the pagination is broken, not that somebody was busy. The budget above is
+// what stops a real walk.
+const MAX_PAGES = 100_000;
 
 // Hedera's own TransactionValidDuration. A signed transaction that has not reached consensus by
 // validStart + this can never reach it. That is a fact about the *chain*.
@@ -69,10 +107,12 @@ export type Ledger = {
   readonly accountId: string;
   readonly since: number;
   readonly at: number;
-  // Did the walk reach the end of the day, or stop at the page bound? Only a complete reading may
-  // seed the day's spending; a partial one may only ever raise it. See Purse.observe.
+  // Did the walk reach the end of the day, or run out of its time budget first? Only a complete
+  // reading may seed the day's spending; a partial one may only ever raise it. See Purse.observe.
   readonly complete: boolean;
   readonly balances: Readonly<Record<AssetKey, bigint>>;
+  // Every payment the walk saw, summed. `payments` below is only the newest KEPT_PAYMENTS of them,
+  // so this is not the sum of that list and must not be re-derived from it.
   readonly spent: Readonly<Record<AssetKey, bigint>>;
   readonly payments: readonly Payment[];
   // Does the chain agree this key controls the account we are configured to pay from? Three
@@ -270,10 +310,30 @@ function mirrorFetch(url: string): Promise<Response> {
   return hardenedFetch(seen)(url);
 }
 
-async function mirrorJson(url: string): Promise<unknown> {
-  const response = await mirrorFetch(url);
-  if (!response.ok) throw new Error(`mirror node said ${response.status}`);
-  return response.json();
+function candidateMirrors(network: NetworkRow): readonly string[] {
+  const primary = network.mirror;
+  const backups = (network.mirrors ?? []).filter((m) => m !== primary);
+  return [primary, ...backups];
+}
+
+async function mirrorJson(network: NetworkRow, path: string): Promise<unknown> {
+  const mirrors = candidateMirrors(network);
+  let lastError: unknown = null;
+  for (const base of mirrors) {
+    const cleanBase = base.replace(/\/+$/, "");
+    const cleanPath = path.startsWith("/") ? path : `/${path}`;
+    try {
+      const response = await mirrorFetch(`${cleanBase}${cleanPath}`);
+      if (response.status === 429 || response.status >= 500) {
+        throw new Error(`mirror node ${cleanBase} said ${response.status}`);
+      }
+      if (!response.ok) throw new Error(`mirror node ${cleanBase} said ${response.status}`);
+      return await response.json();
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 // `transactions=false` is not a nicety. The accounts endpoint bundles a page of recent
@@ -282,19 +342,32 @@ async function mirrorJson(url: string): Promise<unknown> {
 // with the list and 740 without — thirty-one times the bytes, every time, for rows that are parsed
 // and thrown away.
 export async function readAccount(network: NetworkRow, accountId: string): Promise<ChainAccount> {
-  const url = `${network.mirror}/api/v1/accounts/${accountId}?transactions=false`;
-  return (await mirrorJson(url)) as ChainAccount;
+  return (await mirrorJson(network, `/api/v1/accounts/${accountId}?transactions=false`)) as ChainAccount;
 }
 
 // Has this transaction reached the chain at all? Answered for any outcome, not only success: a
 // transaction that reached consensus and failed still cost us nothing and still stops being
 // in flight, which is the only question this asks.
 export async function transactionSeen(network: NetworkRow, txId: string): Promise<boolean> {
-  const response = await mirrorFetch(`${network.mirror}/api/v1/transactions/${toMirrorId(txId)}`);
-  if (response.status === 404) return false;
-  if (!response.ok) throw new Error(`mirror node said ${response.status}`);
-  const body = (await response.json()) as { transactions?: unknown[] };
-  return (body.transactions ?? []).length > 0;
+  const mirrors = candidateMirrors(network);
+  const path = `/api/v1/transactions/${toMirrorId(txId)}`;
+  let lastError: unknown = null;
+  for (const base of mirrors) {
+    const cleanBase = base.replace(/\/+$/, "");
+    try {
+      const response = await mirrorFetch(`${cleanBase}${path}`);
+      if (response.status === 404) return false;
+      if (response.status === 429 || response.status >= 500) {
+        throw new Error(`mirror node ${cleanBase} said ${response.status}`);
+      }
+      if (!response.ok) throw new Error(`mirror node said ${response.status}`);
+      const body = (await response.json()) as { transactions?: unknown[] };
+      return (body.transactions ?? []).length > 0;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 // Everything that took money *out* of this account back to `from`, newest first, and whether the
@@ -317,30 +390,45 @@ async function walk(
   accountId: string,
   from: number,
   maxPages: number,
-): Promise<{ rows: ChainTransaction[]; complete: boolean }> {
+  until: number,
+): Promise<{ payments: Payment[]; spent: Record<AssetKey, bigint>; complete: boolean }> {
   const floor = (from / 1000).toFixed(9);
-  const rows: ChainTransaction[] = [];
+  // Folded as each page lands rather than collected and summed at the end. `paymentsIn` is pure
+  // per-row — no `seen` set, no state carried between rows, by its own design — so summing it a
+  // page at a time gives exactly what summing it over the whole day would, and costs the same
+  // whatever the day held.
+  const kept: Payment[] = [];
+  const spent: Record<AssetKey, bigint> = { usdc: 0n, hbar: 0n };
+  const done = (complete: boolean) => ({ payments: kept, spent, complete });
   let before: string | null = null;
   for (let page = 0; page < maxPages; page++) {
     const query =
       `account.id=${encodeURIComponent(accountId)}&timestamp=gte:${floor}` +
       (before === null ? "" : `&timestamp=lt:${before}`) +
       `&type=debit&order=desc&limit=${PAGE_SIZE}`;
-    const body = (await mirrorJson(`${network.mirror}/api/v1/transactions?${query}`)) as {
+    const body = (await mirrorJson(network, `/api/v1/transactions?${query}`)) as {
       transactions?: ChainTransaction[];
     };
     const page_rows = body.transactions ?? [];
-    rows.push(...page_rows);
-    if (page_rows.length < PAGE_SIZE) return { rows, complete: true };
+    // Newest first, so the rows worth keeping are the ones seen first and the cap needs no sorting.
+    for (const payment of paymentsIn(page_rows, network, accountId, from)) {
+      spent[payment.asset] += payment.amount;
+      if (kept.length < KEPT_PAYMENTS) kept.push(payment);
+    }
+    if (page_rows.length < PAGE_SIZE) return done(true);
     const last = page_rows[page_rows.length - 1]?.consensus_timestamp;
-    if (typeof last !== "string" || last === before) return { rows, complete: true };
+    if (typeof last !== "string" || last === before) return done(true);
+    // Checked after the two ways a walk finishes, so a walk that completes on the same tick its
+    // budget expires is complete rather than a hair short of it.
+    if (Date.now() >= until) return done(false);
     before = last;
   }
   // A full last page is indistinguishable from a full last page with more behind it, so this says
   // "we stopped", not "there is more". What the caller does with it depends on why it asked: the
-  // read at start-up needs the whole day and treats a stop as a failure; the read that keeps the
-  // panel current does not care, because its sum may only ever raise the day's figure.
-  return { rows, complete: false };
+  // read at start-up needs the whole day and treats a stop as a failure worth retrying, which is
+  // honest now that stopping means the clock ran out; the read that keeps the panel current does
+  // not care, because its sum may only ever raise the day's figure.
+  return done(false);
 }
 
 // One read of everything the chain has to say about us: the balances and the key check from the
@@ -358,6 +446,10 @@ export async function readLedger(
   evmAddress: string | null,
   since: number,
   maxPages: number = MAX_PAGES,
+  // Injected for the same reason `maxPages` is: the behaviour on running out of time is now a path
+  // the daemon takes and retries, so it is a path a test has to be able to reach without waiting
+  // its full budget for it.
+  budgetMs: number = WALK_BUDGET_MS,
 ): Promise<Ledger> {
   // SECURITY: stamped before the requests go out, not after they come back. `at` is the only thing
   // policy.ts measures staleness against, so it has to be a claim the rows can support. A read
@@ -370,7 +462,7 @@ export async function readLedger(
   const at = Date.now();
   const [account, walked] = await Promise.all([
     readAccount(network, accountId),
-    walk(network, accountId, since, maxPages),
+    walk(network, accountId, since, maxPages, at + budgetMs),
   ]);
 
   const usdcRow = (account.balance?.tokens ?? []).find((row) => row.token_id === network.assets.usdc.id);
@@ -379,18 +471,14 @@ export async function readLedger(
     hbar: BigInt(account.balance?.balance ?? 0),
   };
 
-  const payments = paymentsIn(walked.rows, network, accountId, since);
-  const spent = { usdc: 0n, hbar: 0n };
-  for (const payment of payments) spent[payment.asset] += payment.amount;
-
   return {
     accountId,
     since,
     at,
     complete: walked.complete,
     balances,
-    spent,
-    payments,
+    spent: walked.spent,
+    payments: walked.payments,
     verified: readKeyMatch(account, publicKeyHex, evmAddress),
   };
 }

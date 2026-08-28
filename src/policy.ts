@@ -34,11 +34,7 @@ export type PolicyConfig = {
   readonly accountId: string;
 };
 
-// `recheck` is set on the one denial a reading of the chain can cause wrongly, and it is wrong in
-// only one direction: the balance we hold is a lower bound, so a top-up we have not read yet makes
-// it too low and never too high. The caller spends one request to look again rather than telling
-// somebody who has just funded the account that it is empty.
-export type Decision = { ok: true; asset: Asset } | { ok: false; reason: string; recheck?: boolean };
+export type Decision = { ok: true; asset: Asset } | { ok: false; reason: string };
 
 // SECURITY: what has been authorised and not yet answered for, in one asset. This is what makes a
 // lock unnecessary: `decide` reads it and the caller raises it with no `await` in between, so any
@@ -188,7 +184,7 @@ export function decide(invoice: Invoice, purse: PurseState, config: PolicyConfig
   // ever makes it pessimistic, which is the direction a spending check may be wrong in.
   const since = spent.totals[asset.key] - ledger.spent[asset.key];
   if (invoice.amount > ledger.balances[asset.key] - since - outstanding) {
-    return { ok: false, reason: `not enough ${asset.symbol} in the purse`, recheck: true };
+    return deny(`not enough ${asset.symbol} in the purse`);
   }
 
   return { ok: true, asset };
