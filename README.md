@@ -44,14 +44,26 @@
 
 ### 1. Install
 
-Requires Arch Linux / Omarchy, Node.js 22+, and `npm`.
+Requires Arch Linux / Omarchy and Node.js 26.7.0+ from the distro (`pacman -S nodejs npm`).
+
+The bar widget is unprivileged — a copy in your plugin directory that can pause and read. The installer is root because it creates a system user that holds the key; agents never get that uid.
 
 ```bash
-git clone https://github.com/Nikodem01/chip402 && cd chip402
+git clone https://github.com/Nikodem01/chip402
+cd chip402
+git checkout v0.1.0
 sudo ./install.sh
 ```
 
-`install.sh` provisions the `chip402` system user, installs verified dependencies (`npm ci --ignore-scripts --omit=dev`), registers systemd services, installs the four polkit actions, configures sudo rules, and links the Omarchy bar widget.
+`install.sh` provisions the `chip402` system user, installs verified dependencies (`npm ci --ignore-scripts --omit=dev`) as the invoking user, registers systemd services, installs the four polkit actions, configures sudo rules, and copies the Omarchy bar widget.
+
+### Uninstall
+
+```bash
+sudo ./install.sh uninstall
+```
+
+Removes the system user, group, daemon, sudoers drop-in, polkit actions, plugin copy, and the TPM-sealed key. The Hedera account remains on chain; this machine will no longer hold the key. Log out for the group change to finish.
 
 ### 2. Setup & Arm
 
@@ -190,7 +202,7 @@ the comments.
 | `src/safe.ts` | File operations that have to be paranoid, and the two opposite contracts they come in | 107 / 199 |
 | `src/wallet.ts` | **The guarded signer** — the enforcement point, the only `createClientHederaSigner` in `src/`, and the settlement chase | 311 / 545 |
 
-- **Entry points**: `bin/chip402.ts` (spend CLI), `bin/chip402ctl.ts` (admin CLI), `bin/mcp.ts` (agent tools).
+- **Entry points**: `bin/chip402.ts` (spend CLI), `bin/chip402ctl.ts` (admin CLI), `bin/chip402ctl.sh` (the root-owned wrapper copied to `/usr/local/bin/chip402ctl`), `bin/mcp.ts` (agent tools).
 - **Desktop UI**: `ui/Chip.qml` (status widget), `ui/Purse.qml` (panel), `ui/ChipIcon.qml` (icon), `ui/manifest.json`, and `ui/chip402.policy`.
 - **Labels Store**: Local host mappings in `labels.jsonl` are kept generously (100,000 rows) and capped at 100,000 to prevent unbounded growth without touching spending policy.
 
@@ -202,7 +214,7 @@ the comments.
 npm test
 ```
 
-All 226 unit and integration tests run offline against an in-process Hedera mirror node:
+All 234 unit and integration tests run offline against an in-process Hedera mirror node:
 
 - `test/policy.test.ts`: Decision table verification and cross-asset rules.
 - `test/signer.test.ts`: Key isolation, refusal guarantees, and signature safety.
@@ -211,6 +223,7 @@ All 226 unit and integration tests run offline against an in-process Hedera mirr
 - `test/planes.test.ts`: Unix socket privilege separation and Polkit authorization rules.
 - `test/mcp.test.ts`: Out-of-process MCP agent integration and prompt injection boundaries.
 - `test/readme.test.ts`: Automated consistency checks verifying README assertions against codebase metrics.
+- `test/install.test.ts`: Installer privilege, provenance, uninstall, and README pin checks.
 
 ---
 
