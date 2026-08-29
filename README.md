@@ -214,7 +214,7 @@ the comments.
 npm test
 ```
 
-All 234 unit and integration tests run offline against an in-process Hedera mirror node:
+All 236 unit and integration tests run offline against an in-process Hedera mirror node:
 
 - `test/policy.test.ts`: Decision table verification and cross-asset rules.
 - `test/signer.test.ts`: Key isolation, refusal guarantees, and signature safety.

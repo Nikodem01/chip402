@@ -2,6 +2,7 @@
 // because running it as root belongs to a live machine, not to `npm test`.
 
 import { readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
@@ -42,6 +43,8 @@ test("uninstall removes every path the installer created, including the sealed k
     assert.ok(fn.includes(path), `uninstall never mentions ${path}`);
   }
   assert.doesNotMatch(fn, /userdel -r/, "userdel -r follows a home we do not control; delete known paths first");
+  assert.match(fn, /getent group chip402/, "uninstall only looks at SUDO_USER for the plugin copy");
+  assert.match(fn, /accountId/, "uninstall never names the on-chain account it is about to orphan");
 });
 
 test("the installer never uses a login shell to find node or npm", () => {
@@ -60,11 +63,31 @@ test("npm ci runs as the invoking user, not as root", () => {
     /^\s*\( cd "\$DEPS" && "\$NODE_SRC" "\$NPM_CLI" ci/m,
     "the old root npm ci line is still there",
   );
+  const ciAt = installer.indexOf(`"$NPM_CLI" ci --ignore-scripts`);
+  const rootAt = installer.indexOf('chown -R root:root "$DEPS"');
+  const copyAt = installer.indexOf('cp -r "$DEPS/node_modules"');
+  assert.ok(ciAt >= 0 && rootAt > ciAt, "DEPS is not re-rooted after npm ci");
+  assert.ok(copyAt > rootAt, "node_modules is copied while still owned by SUDO_USER");
 });
 
 test("a node binary under /home is refused, even via CHIP402_NODE", () => {
   assert.match(installer, /\/home\/\*/, "install.sh does not refuse a user-local node");
+  assert.match(installer, /\/root\/\*/, "a root-owned version manager is not refused");
+  assert.match(installer, /\/\.local\/\*/, "install.sh does not refuse ~/.local");
   assert.match(installer, /CHIP402_NODE/, "the override is gone rather than constrained");
+  const resolveAt = installer.indexOf("readlink -f \"$NODE_SRC\"");
+  const refuseAt = installer.indexOf("/home/*");
+  assert.ok(resolveAt >= 0 && refuseAt > resolveAt, "the /home check runs before the path is resolved");
+  assert.match(installer, /\/usr\/bin\/node/, "install.sh does not prefer the distro binary");
+});
+
+test("the installed tree is world-readable so uid chip402 can load it", () => {
+  assert.match(installer, /chmod -R u=rwX,go=rX "\$LIB"/, "umask 077 would leave the daemon unable to read node_modules");
+});
+
+test("install.sh is valid bash", () => {
+  const result = spawnSync("bash", ["-n", join(root, "install.sh")], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test("chip402ctl is a file in the tree, copied, not generated at install time", () => {

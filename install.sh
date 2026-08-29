@@ -22,6 +22,7 @@ uninstall() {
   echo "This removes the chip402 system user, the daemon, and the TPM-sealed key."
   if [[ -f /etc/chip402/config.json ]]; then
     echo "The Hedera account in /etc/chip402/config.json will still exist on chain; this machine will no longer hold the key."
+    grep -E '"accountId"' /etc/chip402/config.json || true
   fi
 
   systemctl disable --now chip402 2>/dev/null || true
@@ -33,14 +34,20 @@ uninstall() {
   rm -f /etc/sudoers.d/chip402
   rm -f /usr/share/polkit-1/actions/dev.chip402.policy
 
-  local home
-  home="$(owner_home || true)"
-  if [[ -n "$OWNER" ]]; then
-    gpasswd -d "$OWNER" chip402 2>/dev/null || true
+  # Humans in the group, before we delete it. OWNER may be empty (a root shell); the group
+  # list is who actually received membership and the plugin copy.
+  local members="" user uh
+  if getent group chip402 >/dev/null 2>&1; then
+    members=$(getent group chip402 | cut -d: -f4 | tr ',' ' ')
   fi
-  if [[ -n "$home" ]]; then
-    rm -rf "$home/.config/omarchy/plugins/chip402"
-  fi
+  for user in $members $OWNER; do
+    [[ -n "$user" && "$user" != "chip402" ]] || continue
+    gpasswd -d "$user" chip402 2>/dev/null || true
+    uh=$(getent passwd "$user" | cut -d: -f6 || true)
+    if [[ -n "$uh" && "$uh" != / && "$uh" != /var/lib/chip402 ]]; then
+      rm -rf "$uh/.config/omarchy/plugins/chip402"
+    fi
+  done
 
   rm -rf /var/lib/chip402 /etc/chip402 /run/chip402
 
@@ -48,7 +55,7 @@ uninstall() {
     userdel chip402
   fi
   if getent group chip402 >/dev/null 2>&1; then
-    groupdel chip402
+    groupdel chip402 || true
   fi
 
   echo
@@ -67,12 +74,18 @@ OWNER_HOME="$(owner_home)"
 
 # The daemon runs as another uid with ProtectHome=yes, so it cannot use a node that lives in
 # $HOME. We copy a *system* node into $LIB rather than promoting a version-manager install.
-# CHIP402_NODE overrides, but a path under /home or ~/.local is refused — that is the footgun.
-NODE_SRC="${CHIP402_NODE:-$(command -v node || true)}"
+# CHIP402_NODE overrides, but a path under /home, /root, or ~/.local is refused — that is the footgun.
+if [[ -n "${CHIP402_NODE:-}" ]]; then
+  NODE_SRC="$CHIP402_NODE"
+elif [[ -x /usr/bin/node ]]; then
+  NODE_SRC=/usr/bin/node
+else
+  NODE_SRC="$(command -v node || true)"
+fi
 NODE_SRC="$(readlink -f "$NODE_SRC" 2>/dev/null || true)"
 [[ -x "$NODE_SRC" ]] || { echo "node not found; install the distro package (pacman -S nodejs npm) or set CHIP402_NODE to a system binary"; exit 1; }
 case "$NODE_SRC" in
-  /home/*|*/.local/*)
+  /home/*|/root/*|*/.local/*|*/.nvm/*)
     echo "refusing $NODE_SRC — the daemon must not run a user-local node."
     echo "  pacman -S nodejs npm, or set CHIP402_NODE to a binary outside /home."
     exit 1
@@ -116,6 +129,8 @@ cp "$HERE/package.json" "$HERE/package-lock.json" "$DEPS/"
 chown -R "$OWNER":"$OWNER" "$DEPS"
 echo "installing dependencies from the lockfile..."
 ( cd "$DEPS" && runuser -u "$OWNER" -- env HOME="$OWNER_HOME" "$NODE_SRC" "$NPM_CLI" ci --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null )
+# Re-root immediately so a same-uid agent cannot swap node_modules before we copy it into $LIB.
+chown -R root:root "$DEPS"
 
 # --- the uid boundary -------------------------------------------------------------------------
 # A system user with no login shell and no home in /home. This is what makes the key unreadable
@@ -141,7 +156,10 @@ cp -r "$HERE/src" "$HERE/bin" "$HERE/package.json" "$HERE/package-lock.json" "$L
 cp -r "$DEPS/node_modules" "$LIB/"
 install -o root -g root -m 0755 "$NODE_SRC" "$LIB/node"
 chown -R root:root "$LIB"
-chmod -R go-w "$LIB"
+# uid chip402 is neither owner nor group. World-read is how it loads the tree; umask 077
+# on the invoking user (or on the git checkout) would otherwise leave src/ and node_modules
+# unreadable and the daemon dead on ExecStart.
+chmod -R u=rwX,go=rX "$LIB"
 
 # --- the only thing sudo and polkit will run --------------------------------------------------
 # SECURITY: root-owned. If the admin binary were a script in my home, an agent would rewrite it
