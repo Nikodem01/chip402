@@ -52,22 +52,20 @@ test("the installer never uses a login shell to find node or npm", () => {
   assert.doesNotMatch(installer, /su\s+-l/, "su -l is the same login-shell smell");
 });
 
-test("npm ci runs as the invoking user, not as root", () => {
-  assert.match(
-    installer,
-    /runuser -u "\$OWNER" -- env HOME="\$OWNER_HOME" "\$NODE_SRC" "\$NPM_CLI" ci --ignore-scripts/,
-    "the lockfile install is not dropped to SUDO_USER",
-  );
-  assert.doesNotMatch(
-    installer,
-    /^\s*\( cd "\$DEPS" && "\$NODE_SRC" "\$NPM_CLI" ci/m,
-    "the old root npm ci line is still there",
-  );
+test("npm ci runs as the chip402 uid, not as the agent and not as root", () => {
+  const useraddAt = installer.indexOf("useradd --system");
   const ciAt = installer.indexOf(`"$NPM_CLI" ci --ignore-scripts`);
   const rootAt = installer.indexOf('chown -R root:root "$DEPS"');
   const copyAt = installer.indexOf('cp -r "$DEPS/node_modules"');
+  assert.ok(useraddAt >= 0 && ciAt > useraddAt, "npm ci runs before the chip402 uid exists");
+  assert.match(
+    installer,
+    /runuser -u chip402 -- env HOME="\$DEPS" "\$NODE_SRC" "\$NPM_CLI" ci --ignore-scripts/,
+    "npm ci is still the invoking user's process — a same-uid agent can rewrite DEPS during it",
+  );
+  assert.doesNotMatch(installer, /runuser -u "\$OWNER".*ci --ignore-scripts/);
   assert.ok(ciAt >= 0 && rootAt > ciAt, "DEPS is not re-rooted after npm ci");
-  assert.ok(copyAt > rootAt, "node_modules is copied while still owned by SUDO_USER");
+  assert.ok(copyAt > rootAt, "node_modules is copied while still owned by the build uid");
 });
 
 test("a node binary under /home is refused, even via CHIP402_NODE", () => {

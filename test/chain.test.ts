@@ -338,6 +338,24 @@ test("the day's sum survives the rows being dropped, and the rows kept are the n
   }
 });
 
+test("a payment young enough to still be in flight is kept past the row cap", async (t) => {
+  // `#shown` only looks at `ledger.payments`. A complete one-page day of 65–100 payments would
+  // fold all of them into `spent` and then drop the oldest of that page from `payments`, so
+  // `settled` would add a payment the walk had already summed. Keep anything still inside the
+  // authorisation window, which is the only population `#shown` is asked about.
+  const mirror = await fakeMirror();
+  t.after(() => mirror.close());
+  const since = dayStart(Date.now());
+  const now = Date.now();
+  for (let i = 0; i < 80; i++) {
+    mirror.record(`0.0.9185802@18000002${String(i).padStart(2, "0")}.0`, "usdc", 1n, now - 1_000 - i);
+  }
+  const ledger = await readLedger(mirror.network, OUR_ACCOUNT, OUR_PUBLIC_KEY, OUR_EVM_ADDRESS, since);
+  assert.equal(ledger.complete, true);
+  assert.equal(ledger.spent.usdc, 80n);
+  assert.equal(ledger.payments.length, 80, "an in-flight-aged payment was dropped from the list `#shown` reads");
+});
+
 test("nobody but this daemon can add a row to the question that is asked", async (t) => {
   // Why the bound stopped being something an outsider could reach. Every row `type=debit` keeps is
   // a transaction that took money out of this account, and every one of those needs a signature only

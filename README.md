@@ -184,12 +184,12 @@ chip402 pay http://127.0.0.1:4403/secret
 
 ## 💻 The Code
 
-Twelve core files, each with one job, each meant to be read aloud: 1,747 lines of code, 3,240 with
+Twelve core files, each with one job, each meant to be read aloud: 1,749 lines of code, 3,245 with
 the comments.
 
 | file | owns | code / total |
 |---|---|---|
-| `src/chain.ts` | Everything Hedera says, and the only place it is asked. Five facts, none of them ours | 255 / 493 |
+| `src/chain.ts` | Everything Hedera says, and the only place it is asked. Five facts, none of them ours | 257 / 498 |
 | `src/daemon.ts` | Two listeners in one process. The plane is the listener. The reading loop that mostly does not run | 259 / 451 |
 | `src/fetch.ts` | The hardened fetch handed to the SDK — a hostile seller is the normal case | 83 / 132 |
 | `src/ids.ts` | What a Hedera account id and a transaction id look like, in one place | 6 / 25 |
@@ -214,7 +214,7 @@ the comments.
 npm test
 ```
 
-All 236 unit and integration tests run offline against an in-process Hedera mirror node:
+All 237 unit and integration tests run offline against an in-process Hedera mirror node:
 
 - `test/policy.test.ts`: Decision table verification and cross-asset rules.
 - `test/signer.test.ts`: Key isolation, refusal guarantees, and signature safety.

@@ -413,7 +413,12 @@ async function walk(
     // Newest first, so the rows worth keeping are the ones seen first and the cap needs no sorting.
     for (const payment of paymentsIn(page_rows, network, accountId, from)) {
       spent[payment.asset] += payment.amount;
-      if (kept.length < KEPT_PAYMENTS) kept.push(payment);
+      // `policy.committed` / `Purse.#shown` only see `payments`, not the folded sum. A payment
+      // still inside the authorisation window has to stay on that list even past KEPT_PAYMENTS,
+      // or `settled` will add an amount the walk already counted.
+      if (kept.length < KEPT_PAYMENTS || Date.now() - payment.at < VALID_DURATION_MS + INDEXING_MARGIN_MS) {
+        kept.push(payment);
+      }
     }
     if (page_rows.length < PAGE_SIZE) return done(true);
     const last = page_rows[page_rows.length - 1]?.consensus_timestamp;

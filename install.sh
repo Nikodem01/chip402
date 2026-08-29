@@ -105,9 +105,10 @@ fi
 #   --ignore-scripts no package gets to run code on this machine during install
 #   --omit=dev       typescript is not shipped to a service that holds a key.
 #
-# npm itself is not run as root. The resolved node and npm-cli.js are handed to SUDO_USER
-# with HOME set to theirs, so a bug in npm is not a root network client. CHIP402_NPM
-# overrides, and must be the path to npm-cli.js.
+# npm itself is not run as root, and not as the agent. The resolved node and npm-cli.js are
+# handed to the chip402 uid with HOME inside DEPS, so a bug in npm is not a root network
+# client and a same-uid agent cannot rewrite the tree during ci. CHIP402_NPM overrides, and
+# must be the path to npm-cli.js.
 [[ -f "$HERE/package-lock.json" ]] || { echo "package-lock.json is missing — this tree is not installable"; exit 1; }
 NPM_CLI="${CHIP402_NPM:-}"
 if [[ -z "$NPM_CLI" ]]; then
@@ -123,24 +124,28 @@ fi
 NPM_CLI="$(readlink -f "$NPM_CLI" 2>/dev/null || true)"
 [[ -f "$NPM_CLI" ]] || { echo "npm-cli.js not found; install npm (pacman -S npm) or set CHIP402_NPM"; exit 1; }
 
-DEPS="$(mktemp -d)"
-trap 'rm -rf "$DEPS"' EXIT
-cp "$HERE/package.json" "$HERE/package-lock.json" "$DEPS/"
-chown -R "$OWNER":"$OWNER" "$DEPS"
-echo "installing dependencies from the lockfile..."
-( cd "$DEPS" && runuser -u "$OWNER" -- env HOME="$OWNER_HOME" "$NODE_SRC" "$NPM_CLI" ci --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null )
-# Re-root immediately so a same-uid agent cannot swap node_modules before we copy it into $LIB.
-chown -R root:root "$DEPS"
-
 # --- the uid boundary -------------------------------------------------------------------------
 # A system user with no login shell and no home in /home. This is what makes the key unreadable
 # by anything running as me, which is the only boundary here that needs no judgment at runtime.
+# Created before npm ci so the lockfile tree is never owned by the agent uid — a same-uid
+# process could otherwise rewrite node_modules while ci is running.
 if ! id -u chip402 >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/chip402 --shell /usr/bin/nologin chip402
 fi
 # ...and the capability I am granting myself: membership of that group is what lets my shells and
 # my agents reach the spend socket. Everything past this line is about what that capability may do.
 usermod -aG chip402 "$OWNER"
+
+DEPS="$(mktemp -d)"
+trap 'rm -rf "$DEPS"' EXIT
+cp "$HERE/package.json" "$HERE/package-lock.json" "$DEPS/"
+chown -R chip402:chip402 "$DEPS"
+echo "installing dependencies from the lockfile..."
+# HOME and the npm cache both live inside DEPS, which the agent cannot write. chip402 is not
+# root and has no login shell; the only network it gets here is the registry fetch.
+( cd "$DEPS" && runuser -u chip402 -- env HOME="$DEPS" "$NODE_SRC" "$NPM_CLI" ci --ignore-scripts --omit=dev --no-audit --no-fund >/dev/null )
+# Re-root before copy so the tree is immutable on the way into $LIB.
+chown -R root:root "$DEPS"
 
 install -d -o chip402 -g chip402 -m 0700 /var/lib/chip402
 install -d -o root -g root -m 0755 /etc/chip402
